@@ -424,3 +424,100 @@ async def test_unshare_unknown_skill_returns_deleted_false(client):
     body = resp.json()
     assert body["deleted"] is False
     assert body["queued_nodes"] == 0
+
+
+async def test_connections_unknown_skill_404(client):
+    tenant_id, headers = get_test_auth()
+    tag = _uid()
+    resp = await client.get(
+        f"/api/v1/skills/no-such-{tag}/connections?tenant_id={tenant_id}",
+        headers=headers,
+    )
+    assert resp.status_code == 404
+
+
+async def test_connections_publish_only_returns_audit_no_commands(client):
+    """A publish-only share has one audit row and zero install commands."""
+    tenant_id, headers = get_test_auth()
+    tag = _uid()
+    fleet = f"fleet-{tag}"
+    name = f"conn-pub-{tag}"
+
+    await _heartbeat(client, tenant_id, headers, f"node-{tag}", fleet)
+    share_resp = await _share(client, tenant_id, headers, name=name, target_fleet_id=fleet)
+    assert share_resp.status_code == 200, share_resp.text
+    skill_id = share_resp.json()["skill_id"]
+
+    resp = await client.get(
+        f"/api/v1/skills/{name}/connections?tenant_id={tenant_id}",
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+
+    assert body["skill"]["id"] == skill_id
+    assert body["skill"]["doc_id"] == name
+    assert body["skill"]["data"]["name"] == name
+    assert body["skill"]["data"]["target_fleet_id"] == fleet
+
+    share_audits = [a for a in body["audit"] if a["action"] == "skill_share"]
+    assert len(share_audits) == 1
+    assert share_audits[0]["detail"]["install_on_fleet"] is False
+
+    assert body["commands"] == []
+
+
+async def test_connections_install_on_fleet_returns_install_commands(client):
+    """install_on_fleet=true skill has install_skill commands per node."""
+    tenant_id, headers = get_test_auth()
+    tag = _uid()
+    fleet = f"fleet-{tag}"
+    name = f"conn-fleet-{tag}"
+
+    hb_a = await _heartbeat(client, tenant_id, headers, f"node-a-{tag}", fleet)
+    hb_b = await _heartbeat(client, tenant_id, headers, f"node-b-{tag}", fleet)
+    expected_nodes = {hb_a["node_id"], hb_b["node_id"]}
+
+    await _share(
+        client, tenant_id, headers, name=name, target_fleet_id=fleet, install_on_fleet=True
+    )
+
+    resp = await client.get(
+        f"/api/v1/skills/{name}/connections?tenant_id={tenant_id}",
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+
+    installs = [c for c in body["commands"] if c["command"] == "install_skill"]
+    assert len(installs) == 2
+    assert {c["node_id"] for c in installs} == expected_nodes
+    for c in installs:
+        assert c["status"] == "pending"
+        assert c["payload"]["name"] == name
+
+
+async def test_connections_isolated_by_tenant(client):
+    """A skill in tenant A is not visible to tenant B's connections endpoint."""
+    tenant_a, headers_a = get_test_auth()
+    tenant_b, headers_b = get_test_auth(tenant_id=f"tenant-other-{_uid()}")
+    tag = _uid()
+    fleet = f"fleet-{tag}"
+    name = f"conn-iso-{tag}"
+
+    await _heartbeat(client, tenant_a, headers_a, f"node-{tag}", fleet)
+    await _share(client, tenant_a, headers_a, name=name, target_fleet_id=fleet)
+
+    # Same tenant: visible.
+    resp_a = await client.get(
+        f"/api/v1/skills/{name}/connections?tenant_id={tenant_a}",
+        headers=headers_a,
+    )
+    assert resp_a.status_code == 200
+
+    # Other tenant: 404 (skill doesn't exist for them).
+    resp_b = await client.get(
+        f"/api/v1/skills/{name}/connections?tenant_id={tenant_b}",
+        headers=headers_b,
+    )
+    assert resp_b.status_code == 404

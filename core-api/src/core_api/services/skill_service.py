@@ -33,7 +33,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from core_api.clients.storage_client import get_storage_client
-from core_api.repositories import document_repo
+from core_api.repositories import audit_repo, document_repo, fleet_repo
 
 logger = logging.getLogger(__name__)
 
@@ -367,6 +367,79 @@ def _doc_to_summary(doc, similarity: float | None = None) -> dict[str, Any]:
     if similarity is not None:
         out["similarity"] = round(float(similarity), 4)
     return out
+
+
+async def get_skill_connections(
+    *,
+    db: AsyncSession,
+    tenant_id: str,
+    name: str,
+) -> dict[str, Any] | None:
+    """Return a skill's share/install activity from data we already record.
+
+    Joins three sources for the named skill:
+    - the ``documents`` row itself (collection=``skills``, doc_id=``name``);
+    - ``audit_log`` rows where ``resource_type='skill'`` and
+      ``resource_id`` matches the skill document's UUID;
+    - ``fleet_commands`` rows for ``install_skill`` / ``uninstall_skill``
+      whose payload's ``skill_doc_id`` matches the skill's UUID.
+
+    Returns ``None`` when no skill with that ``name`` exists for the
+    tenant. Pull/query reads are not currently logged anywhere, so the
+    "consumer" side of sharing is intentionally absent.
+    """
+    skill = await document_repo.get_by_doc_id(
+        db, tenant_id=tenant_id, collection=SKILLS_COLLECTION, doc_id=name
+    )
+    if skill is None:
+        return None
+
+    audit_rows = await audit_repo.list_by_resource(
+        db,
+        tenant_id=tenant_id,
+        resource_type="skill",
+        resource_id=skill.id,
+    )
+    cmd_rows = await fleet_repo.list_commands_by_skill_doc_id(
+        db,
+        tenant_id=tenant_id,
+        skill_doc_id=str(skill.id),
+        commands=(INSTALL_SKILL_COMMAND, UNINSTALL_SKILL_COMMAND),
+    )
+
+    return {
+        "skill": {
+            "id": str(skill.id),
+            "doc_id": skill.doc_id,
+            "fleet_id": skill.fleet_id,
+            "data": skill.data or {},
+            "created_at": skill.created_at.isoformat() if skill.created_at else None,
+            "updated_at": skill.updated_at.isoformat() if skill.updated_at else None,
+        },
+        "audit": [
+            {
+                "id": str(row.id),
+                "action": row.action,
+                "agent_id": row.agent_id,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+                "detail": row.detail or {},
+            }
+            for row in audit_rows
+        ],
+        "commands": [
+            {
+                "id": str(row.id),
+                "node_id": str(row.node_id),
+                "command": row.command,
+                "status": row.status,
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+                "acked_at": row.acked_at.isoformat() if row.acked_at else None,
+                "completed_at": row.completed_at.isoformat() if row.completed_at else None,
+                "payload": row.payload or {},
+            }
+            for row in cmd_rows
+        ],
+    }
 
 
 def _doc_to_summary_dict(d: dict) -> dict[str, Any]:

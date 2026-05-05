@@ -18,7 +18,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from core_api.auth import AuthContext, get_auth_context
 from core_api.db.session import get_db
 from core_api.services.audit_service import log_action
-from core_api.services.skill_service import list_skills, share_skill, unshare_skill
+from core_api.services.skill_service import (
+    get_skill_connections,
+    list_skills,
+    share_skill,
+    unshare_skill,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -76,6 +81,12 @@ class SkillUnshareResponse(BaseModel):
     node_ids: list[str]
 
 
+class SkillConnectionsResponse(BaseModel):
+    skill: dict
+    audit: list[dict]
+    commands: list[dict]
+
+
 @router.post("/skills/share", response_model=SkillShareResponse)
 async def share_skill_endpoint(
     body: SkillShareRequest,
@@ -114,6 +125,7 @@ async def share_skill_endpoint(
     await log_action(
         db,
         tenant_id=tenant_id,
+        agent_id=auth.agent_id or body.author_agent_id,
         action="skill_share",
         resource_type="skill",
         resource_id=result["skill_id"],
@@ -179,6 +191,7 @@ async def unshare_skill_endpoint(
     await log_action(
         db,
         tenant_id=tenant_id or "",
+        agent_id=auth.agent_id,
         action="skill_unshare",
         resource_type="skill",
         detail={
@@ -227,3 +240,37 @@ async def list_skills_endpoint(
         offset=offset,
     )
     return [SkillSummary(**s) for s in summaries]
+
+
+@router.get("/skills/{name}/connections", response_model=SkillConnectionsResponse)
+async def get_skill_connections_endpoint(
+    name: str,
+    tenant_id: str | None = Query(default=None),
+    auth: AuthContext = Depends(get_auth_context),
+    db: AsyncSession = Depends(get_db),
+) -> SkillConnectionsResponse:
+    """Return a skill's share/install activity (author side only).
+
+    Surfaces only data we already record:
+
+    - the ``documents`` row for the skill (author_agent_id,
+      target_fleet_id, target_agent_ids in ``data``);
+    - ``audit_log`` entries for ``skill_share`` / ``skill_unshare``;
+    - ``fleet_commands`` for ``install_skill`` / ``uninstall_skill``
+      targeting this skill, with their per-node status.
+
+    Pull/query reads (``GET /skills?query=…``, ``memclaw_doc op=query``,
+    ``/documents/query``) are not currently logged and so do not appear
+    in the response.
+    """
+    if tenant_id:
+        auth.enforce_tenant(tenant_id)
+    elif not auth.is_admin:
+        if not auth.tenant_id:
+            raise HTTPException(status_code=400, detail="tenant_id is required")
+        tenant_id = auth.tenant_id
+
+    result = await get_skill_connections(db=db, tenant_id=tenant_id or "", name=name)
+    if result is None:
+        raise HTTPException(status_code=404, detail="skill not found")
+    return SkillConnectionsResponse(**result)

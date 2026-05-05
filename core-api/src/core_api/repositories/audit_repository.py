@@ -55,3 +55,25 @@ class AuditRepository:
             q = q.where(AuditLog.created_at > since)
         result = await db.execute(q)
         return list(result.scalars().all())
+
+    async def list_by_resource(
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        resource_type: str,
+        resource_id: UUID,
+        limit: int = 200,
+    ) -> list[AuditLog]:
+        q = (
+            select(AuditLog)
+            .where(
+                AuditLog.tenant_id == tenant_id,
+                AuditLog.resource_type == resource_type,
+                AuditLog.resource_id == resource_id,
+            )
+            .order_by(AuditLog.created_at.desc())
+            .limit(limit)
+        )
+        result = await db.execute(q)
+        return list(result.scalars().all())

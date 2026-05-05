@@ -124,6 +124,7 @@ async def upsert_document(
     await log_action(
         db,
         tenant_id=body.tenant_id,
+        agent_id=auth.agent_id,
         action="doc_upsert",
         resource_type="document",
         resource_id=doc.get("id"),
@@ -240,6 +241,7 @@ async def delete_document(
     await log_action(
         db,
         tenant_id=tenant_id,
+        agent_id=auth.agent_id,
         action="doc_delete",
         resource_type="document",
         detail={"collection": collection, "doc_id": doc_id},

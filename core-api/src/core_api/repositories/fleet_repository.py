@@ -172,3 +172,27 @@ class FleetRepository:
         if not node_ids:
             return
         await db.execute(FleetCommand.__table__.delete().where(FleetCommand.node_id.in_(node_ids)))
+
+    async def list_commands_by_skill_doc_id(
+        self,
+        db: AsyncSession,
+        *,
+        tenant_id: str,
+        skill_doc_id: str,
+        commands: Sequence[str],
+        limit: int = 500,
+    ) -> Sequence[FleetCommand]:
+        # payload->>'skill_doc_id' is the install_skill / uninstall_skill key
+        # set in skill_service.share_skill / unshare_skill.
+        stmt = (
+            select(FleetCommand)
+            .where(
+                FleetCommand.tenant_id == tenant_id,
+                FleetCommand.command.in_(commands),
+                FleetCommand.payload["skill_doc_id"].astext == skill_doc_id,
+            )
+            .order_by(FleetCommand.created_at.desc())
+            .limit(limit)
+        )
+        result = await db.execute(stmt)
+        return result.scalars().all()
