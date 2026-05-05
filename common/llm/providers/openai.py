@@ -28,8 +28,24 @@ from common.llm.constants import (
     OPENAI_HTTPX_MAX_KEEPALIVE_CONNECTIONS,
     OPENAI_REQUEST_TIMEOUT_SECONDS,
 )
+from common.llm.providers._shape_error import ProviderResponseShapeError
 
 logger = logging.getLogger(__name__)
+
+
+# CAURA-651: same hazard as VertexResponseShapeError /
+# GeminiResponseShapeError — OpenAI's structured-output mode doesn't
+# universally constrain the top-level shape (especially via
+# OpenAI-compatible endpoints), so a list (or other non-dict) can
+# leak through and cause downstream ``.get(...)`` to raise bare
+# AttributeError.
+class OpenAIResponseShapeError(ProviderResponseShapeError):
+    def __init__(self, content: str, parsed_type: str) -> None:
+        super().__init__("OpenAI", content, parsed_type)
+
+    def __reduce__(self) -> tuple:
+        # See VertexResponseShapeError.__reduce__ for rationale.
+        return (type(self), (self.args[1], self.args[2]))
 
 
 class OpenAILLMProvider:
@@ -119,7 +135,10 @@ class OpenAILLMProvider:
         content = response.choices[0].message.content
         if not content:
             raise ValueError(f"OpenAI returned empty content for model {self._model}")
-        return json.loads(content)
+        parsed = json.loads(content)
+        if not isinstance(parsed, dict):
+            raise OpenAIResponseShapeError(content, type(parsed).__name__)
+        return parsed
 
     async def complete_text(
         self,

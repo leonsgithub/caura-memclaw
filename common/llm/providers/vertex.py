@@ -16,7 +16,30 @@ import json
 import logging
 import time
 
+from common.llm.providers._shape_error import ProviderResponseShapeError
+
 logger = logging.getLogger(__name__)
+
+
+# CAURA-651: Gemini (via Vertex) occasionally returns a JSON array at
+# the top level even with ``response_mime_type="application/json"`` set
+# — typically on prompts that ask for "a list of" something where the
+# model misinterprets the schema. Downstream consumers expect a dict
+# and call ``.get(...)``, raising bare ``AttributeError: 'list' object
+# has no attribute 'get'`` and silently falling through to the FakeLLM
+# fallback. Surface this as a typed error with the actual response
+# captured so log-based forensics can identify the schema-miss class.
+class VertexResponseShapeError(ProviderResponseShapeError):
+    def __init__(self, content: str, parsed_type: str) -> None:
+        super().__init__("Vertex", content, parsed_type)
+
+    def __reduce__(self) -> tuple:
+        # Base sets ``self.args = (provider, content, parsed_type)``
+        # but this subclass takes only ``(content, parsed_type)`` —
+        # drop the hardcoded provider arg so pickle round-trips
+        # cleanly (matters for pytest-xdist + any multiprocessing
+        # exception serialisation).
+        return (type(self), (self.args[1], self.args[2]))
 
 
 class VertexLLMProvider:
@@ -67,7 +90,24 @@ class VertexLLMProvider:
         )
         llm_ms = int((time.perf_counter() - t0) * 1000)
         logger.info("Vertex complete_json (%s) took %dms", self._model, llm_ms)
-        return json.loads(response.text)
+        # Guard ``response.text`` access the same way Gemini does: a
+        # safety-blocked response can set ``.text`` to ``None`` (or
+        # raise ``ValueError`` on access), and ``json.loads(None)``
+        # would surface as a bare ``TypeError`` that's harder to
+        # diagnose than the structured ValueError this branch raises.
+        try:
+            text = response.text or ""
+        except ValueError as exc:
+            raise ValueError(
+                f"Vertex model {self._model} returned no usable content (possible safety block): {exc}"
+            ) from exc
+        if not text:
+            raise ValueError(f"Vertex returned empty content for model {self._model}")
+        parsed = json.loads(text)
+        if not isinstance(parsed, dict):
+            # CAURA-651: see ``VertexResponseShapeError`` above.
+            raise VertexResponseShapeError(text, type(parsed).__name__)
+        return parsed
 
     def _complete_text_sync(
         self,
