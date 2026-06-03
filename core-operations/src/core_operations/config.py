@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Literal
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -52,14 +53,23 @@ class Settings(BaseSettings):
     # cycle (cost) or different schedule (off-peak). Default daily;
     # the consumer-side dedup gate filters double-fires within 23h.
     lifecycle_pipeline_interval_seconds: float = 24 * 3600
-    # Insights discovery (focus='discover') cadence. Separate knob
-    # because it's opt-in per-org (``auto_insights_enabled``, default
-    # off) and individual operators may want a longer cycle than the
-    # crystallize/entity-link pair. The consumer's activity gate also
-    # short-circuits to a no-op when no non-insight memories landed
-    # since the last run, so re-firing more aggressively is mostly
-    # harmless. Daily default.
-    lifecycle_insights_interval_seconds: float = 24 * 3600
+    # Insights discovery (focus='discover') schedule. Unlike the other
+    # lifecycle ops — which run on a fixed interval measured from service
+    # boot and so drift with each redeploy — insights is wall-clock
+    # aligned to a fixed UTC hour, so it lands in a predictable off-peak
+    # window regardless of when core-operations last started. Default
+    # 02:00 UTC. It's opt-in per-org (``auto_insights_enabled``, default
+    # off) and the consumer's activity gate further no-ops ticks where no
+    # non-insight memories landed since the last run, so a once-a-day
+    # fire is plenty.
+    lifecycle_insights_run_at_hour: int = 2
+
+    @field_validator("lifecycle_insights_run_at_hour")
+    @classmethod
+    def _validate_insights_hour(cls, v: int) -> int:
+        if not 0 <= v <= 23:
+            raise ValueError("lifecycle_insights_run_at_hour must be in 0..23 (UTC hour)")
+        return v
 
 
 settings = Settings()  # type: ignore[call-arg]

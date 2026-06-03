@@ -26,7 +26,7 @@ from fastapi import FastAPI, HTTPException
 
 from common.structlog_config import configure_logging
 from core_operations.config import settings
-from core_operations.scheduler import scheduler
+from core_operations.scheduler import scheduler, seconds_until_next_utc_hour
 from core_operations.tasks import (
     run_archive_expired_tick,
     run_archive_stale_tick,
@@ -68,10 +68,17 @@ def _register_scheduled_tasks() -> None:
         settings.lifecycle_pipeline_interval_seconds,
         run_entity_link_tick,
     )
+    # Insights is the one lifecycle op pinned to a wall-clock hour rather
+    # than a boot-relative interval: it runs a fixed off-peak nightly slot
+    # (``lifecycle_insights_run_at_hour``, default 02:00 UTC) via
+    # delay_provider, so it never fires at startup and never drifts. The
+    # interval arg below is the nominal daily period (documentation only;
+    # the delay_provider drives the actual firing).
     scheduler.register(
         "lifecycle-insights",
-        settings.lifecycle_insights_interval_seconds,
+        24 * 3600,
         run_insights_tick,
+        delay_provider=lambda: seconds_until_next_utc_hour(settings.lifecycle_insights_run_at_hour),
     )
 
 

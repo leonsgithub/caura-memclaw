@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import UTC, datetime
 
 import pytest
 
-from core_operations.scheduler import Scheduler
+from core_operations.scheduler import Scheduler, seconds_until_next_utc_hour
 
 
 @pytest.mark.asyncio
@@ -106,9 +107,9 @@ async def test_double_start_with_no_tasks_is_still_a_no_op_on_second_call(caplog
     with caplog.at_level("WARNING"):
         await s.start()
     await s.stop()
-    assert any(
-        "scheduler already started" in rec.message for rec in caplog.records
-    ), "expected the duplicate-start warning even with zero tasks registered"
+    assert any("scheduler already started" in rec.message for rec in caplog.records), (
+        "expected the duplicate-start warning even with zero tasks registered"
+    )
 
 
 @pytest.mark.asyncio
@@ -180,6 +181,111 @@ async def test_register_after_stop_still_raises():
         s.register("second", interval_seconds=10, fn=tick)
 
 
+# --- wall-clock alignment ----------------------------------------------
+
+
+def test_seconds_until_next_utc_hour_same_day():
+    now = datetime(2026, 6, 3, 0, 0, 0, tzinfo=UTC)
+    # next 02:00 is 2h out
+    assert seconds_until_next_utc_hour(2, now=now) == 2 * 3600
+
+
+def test_seconds_until_next_utc_hour_rolls_to_tomorrow_when_past():
+    now = datetime(2026, 6, 3, 5, 30, 0, tzinfo=UTC)
+    # 02:00 already passed today → tomorrow 02:00 == 20.5h out
+    expected = (24 - 5.5 + 2) * 3600
+    assert seconds_until_next_utc_hour(2, now=now) == expected
+
+
+def test_seconds_until_next_utc_hour_exact_boundary_rolls_forward():
+    # Exactly on the target → next occurrence is a full day out, never 0.
+    now = datetime(2026, 6, 3, 2, 0, 0, tzinfo=UTC)
+    assert seconds_until_next_utc_hour(2, now=now) == 24 * 3600
+
+
+def test_seconds_until_next_utc_hour_always_positive_and_bounded():
+    now = datetime(2026, 6, 3, 1, 59, 59, tzinfo=UTC)
+    s = seconds_until_next_utc_hour(2, now=now)
+    assert 0 < s <= 24 * 3600
+    assert s == 1.0
+
+
+def test_seconds_until_next_utc_hour_rejects_out_of_range():
+    base = datetime(2026, 6, 3, 0, 0, 0, tzinfo=UTC)
+    with pytest.raises(ValueError, match=r"0\.\.23"):
+        seconds_until_next_utc_hour(24, now=base)
+    with pytest.raises(ValueError, match=r"0\.\.23"):
+        seconds_until_next_utc_hour(-1, now=base)
+
+
+@pytest.mark.asyncio
+async def test_aligned_task_does_not_fire_immediately_at_startup():
+    s = Scheduler()
+    calls = 0
+
+    async def tick():
+        nonlocal calls
+        calls += 1
+
+    # delay_provider returns a long sleep, so within the test window the
+    # aligned task should NOT have run even once (unlike interval mode,
+    # which fires at the top of the loop).
+    s.register("nightly", interval_seconds=24 * 3600, fn=tick, delay_provider=lambda: 100.0)
+    await s.start()
+    await asyncio.sleep(0.05)
+    await s.stop()
+    assert calls == 0, "aligned task must wait for delay_provider, not fire at boot"
+
+
+@pytest.mark.asyncio
+async def test_aligned_task_sleeps_then_runs_each_cycle():
+    s = Scheduler()
+    fired = asyncio.Event()
+    calls = 0
+    delay_calls = 0
+
+    def delay():
+        nonlocal delay_calls
+        delay_calls += 1
+        return 0.01
+
+    async def tick():
+        nonlocal calls
+        calls += 1
+        if calls >= 2:
+            fired.set()
+
+    s.register("nightly", interval_seconds=24 * 3600, fn=tick, delay_provider=delay)
+    await s.start()
+    await asyncio.wait_for(fired.wait(), timeout=2.0)
+    await s.stop()
+    assert calls >= 2
+    # delay_provider is recomputed before every run (drift-free): one
+    # delay() call per tick (+ possibly one in-flight for the next cycle).
+    assert delay_calls >= calls
+
+
+@pytest.mark.asyncio
+async def test_aligned_failing_tick_recovers_without_killing_loop():
+    s = Scheduler()
+    recovered = asyncio.Event()
+    calls = 0
+
+    async def tick():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("boom")
+        if calls >= 2:
+            recovered.set()
+
+    s.register("nightly", interval_seconds=24 * 3600, fn=tick, delay_provider=lambda: 0.01)
+    await s.start()
+    await asyncio.wait_for(recovered.wait(), timeout=2.0)
+    await s.stop()
+    assert calls >= 2
+
+
 @pytest.mark.asyncio
 async def test_cancel_during_sleep_logs_cancelled(caplog):
     s = Scheduler()
@@ -196,6 +302,6 @@ async def test_cancel_during_sleep_logs_cancelled(caplog):
     await asyncio.sleep(0.01)
     with caplog.at_level("INFO"):
         await s.stop()
-    assert any(
-        "scheduled task cancelled" in rec.message for rec in caplog.records
-    ), "expected the CancelledError handler to log on shutdown"
+    assert any("scheduled task cancelled" in rec.message for rec in caplog.records), (
+        "expected the CancelledError handler to log on shutdown"
+    )
