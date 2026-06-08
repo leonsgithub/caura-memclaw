@@ -7,6 +7,7 @@ subscribers in the same process share the same bus instance.
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 from typing import Any
@@ -14,6 +15,8 @@ from typing import Any
 from common.events.base import EventBus
 from common.events.inprocess import InProcessEventBus
 from common.events.pubsub import PubSubEventBus
+
+logger = logging.getLogger(__name__)
 
 _bus: EventBus | None = None
 _lock = threading.Lock()
@@ -46,7 +49,33 @@ def get_event_bus() -> EventBus:
                     "EVENT_BUS_BACKEND=pubsub requires GCP_PROJECT_ID (or "
                     "EVENT_BUS_PROJECT_ID) and EVENT_BUS_SUBSCRIPTION_PREFIX"
                 )
-            kwargs: dict[str, Any] = {}
+            # Environment identity for the cross-env fan-out guard. Two
+            # environments sharing one GCP project also share its topic
+            # namespace, so Pub/Sub delivers every published message to
+            # *both* envs' subscriptions; the bus uses this to stamp
+            # outgoing messages and drop foreign copies (see
+            # ``PubSubEventBus`` docstring). Dedicated ``EVENT_BUS_ENV``
+            # takes precedence so the bus identity can be decoupled from
+            # the broader ``ENVIRONMENT`` if needed; falling back to
+            # ``ENVIRONMENT`` means existing deployments (already set to a
+            # per-environment value) get the guard with no infra change.
+            # Strip before the fallback so a whitespace-only EVENT_BUS_ENV
+            # (truthy) doesn't short-circuit the ``or`` and block the
+            # ENVIRONMENT fallback; empty collapses to None (guard disabled).
+            event_bus_env = os.getenv("EVENT_BUS_ENV", "").strip()
+            env = event_bus_env or os.getenv("ENVIRONMENT", "").strip() or None
+            if not env:
+                # Fail-soft: the guard stays disabled (every message is
+                # treated as same-env, i.e. today's behaviour). Warn so a
+                # misconfigured multi-env deploy is visible rather than
+                # silently leaking across environments.
+                logger.warning(
+                    "EVENT_BUS_BACKEND=pubsub but neither EVENT_BUS_ENV nor "
+                    "ENVIRONMENT is set — the cross-environment fan-out guard "
+                    "is DISABLED; messages from sibling environments sharing "
+                    "this project's topics will not be dropped."
+                )
+            kwargs: dict[str, Any] = {"env": env}
             raw_max = os.getenv("EVENT_BUS_PUBSUB_MAX_MESSAGES")
             if raw_max:
                 try:
