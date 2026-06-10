@@ -168,3 +168,45 @@ def compute_reliability(success_count: int, failure_count: int) -> float:
     it. This is the value ``record`` (PM-03) writes back.
     """
     return (success_count + 1) / (success_count + failure_count + 2)
+
+
+async def bump_skill_telemetry(
+    skill_doc_id: str,
+    tenant_id: str,
+    outcome_type: str,
+    *,
+    now_iso: str,
+) -> dict[str, Any] | None:
+    """Increment a Forge-minted skill's telemetry block on a procedure outcome.
+
+    This is the concrete implementation of the Skill Factory's deferred
+    "Phase-4 outcome loop" (skill-factory-implementation-plan.md §3 telemetry,
+    §15 Phase 4): every ``memclaw_procedure_record`` against a procedure that
+    links back to a skill (``skill_doc_id``) moves the parent skill's
+    ``fires_total`` / ``fires_success`` / ``fires_failure`` / ``last_fired_at``.
+
+    Read-modify-write of the whole ``documents.data`` jsonb so no sibling
+    field is lost. Goes through the storage documents surface directly — it
+    only touches the ``telemetry`` sub-object, never ``status``, so the
+    skill-lifecycle RBAC on status transitions is not engaged. Returns the
+    updated telemetry dict, or ``None`` if the skill doc no longer exists
+    (tolerated — a deleted skill simply has nowhere to count).
+    """
+    sc = get_storage_client()
+    doc = await sc.get_document(
+        tenant_id=tenant_id, collection="skills", doc_id=skill_doc_id
+    )
+    if doc is None:
+        return None
+    data = dict(doc.get("data") or {})
+    tel = dict(data.get("telemetry") or {})
+    tel["fires_total"] = int(tel.get("fires_total", 0)) + 1
+    if outcome_type == "success":
+        tel["fires_success"] = int(tel.get("fires_success", 0)) + 1
+    else:
+        tel["fires_failure"] = int(tel.get("fires_failure", 0)) + 1
+    tel["last_fired_at"] = now_iso
+    data["telemetry"] = tel
+    doc["data"] = data
+    await sc.upsert_document(doc)
+    return tel

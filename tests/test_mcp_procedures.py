@@ -22,6 +22,7 @@ class FakeStorage:
 
     def __init__(self) -> None:
         self.procs: dict[str, dict] = {}
+        self.docs: dict[str, dict] = {}  # keyed by (collection, doc_id)
 
     async def create_procedure(self, data: dict) -> dict:
         pid = uuid.uuid4().hex
@@ -58,6 +59,25 @@ class FakeStorage:
     async def update_procedure_stats(self, pid: str, patch: dict) -> dict:
         self.procs[pid]["stats"].update(patch)
         return self.procs[pid]["stats"]
+
+    # Documents surface (skills telemetry, PM-05)
+    def add_skill(self, tenant_id: str, doc_id: str, data: dict | None = None) -> None:
+        self.docs[("skills", doc_id)] = {
+            "tenant_id": tenant_id,
+            "collection": "skills",
+            "doc_id": doc_id,
+            "data": data or {"name": doc_id, "status": "candidate"},
+        }
+
+    async def get_document(self, tenant_id, collection, doc_id):
+        doc = self.docs.get((collection, doc_id))
+        if doc is None or doc["tenant_id"] != tenant_id:
+            return None
+        return doc
+
+    async def upsert_document(self, data: dict) -> dict:
+        self.docs[(data["collection"], data["doc_id"])] = data
+        return data
 
 
 @pytest.fixture
@@ -172,3 +192,77 @@ async def test_record_unknown_procedure_returns_not_found(proc_env):
     )
     env = parse_envelope(out)
     assert env.get("error", {}).get("code") == "NOT_FOUND"
+
+
+# ── PM-05: skill telemetry write-back ─────────────────────────────
+
+
+async def _write_linked_proc(storage, tenant, skill_doc_id="forge/deploy-eu-west"):
+    """Create a procedure and link it to a skill doc the storage knows about."""
+    storage.add_skill(tenant, skill_doc_id)
+    created = parse_envelope(await _write_proc())
+    # Link it post-hoc (write tool does not take skill_doc_id; Forge bridge does).
+    storage.procs[created["id"]]["skill_doc_id"] = skill_doc_id
+    return created["id"], skill_doc_id
+
+
+@pytest.mark.asyncio
+async def test_record_bumps_linked_skill_telemetry(proc_env):
+    storage, tenant = proc_env["storage"], proc_env["tenant"]
+    pid, skill_doc_id = await _write_linked_proc(storage, tenant)
+
+    out = parse_envelope(
+        await mcp_server.memclaw_procedure_record(
+            procedure_id=pid, outcome_type="success"
+        )
+    )
+    # Response carries the linkage + telemetry.
+    assert out["skill_doc_id"] == skill_doc_id
+    assert out["skill_telemetry"]["fires_total"] == 1
+    assert out["skill_telemetry"]["fires_success"] == 1
+    assert out["skill_telemetry"]["last_fired_at"]
+
+    # Persisted on the skill doc itself.
+    tel = storage.docs[("skills", skill_doc_id)]["data"]["telemetry"]
+    assert tel["fires_total"] == 1
+
+    # A failure increments total + failure, not success.
+    out2 = parse_envelope(
+        await mcp_server.memclaw_procedure_record(
+            procedure_id=pid, outcome_type="failure"
+        )
+    )
+    assert out2["skill_telemetry"]["fires_total"] == 2
+    assert out2["skill_telemetry"]["fires_failure"] == 1
+    assert out2["skill_telemetry"]["fires_success"] == 1
+
+
+@pytest.mark.asyncio
+async def test_record_without_skill_link_has_no_telemetry(proc_env):
+    """A procedure with no skill_doc_id records cleanly, no telemetry side-effect."""
+    created = parse_envelope(await _write_proc())
+    out = parse_envelope(
+        await mcp_server.memclaw_procedure_record(
+            procedure_id=created["id"], outcome_type="success"
+        )
+    )
+    assert out["skill_doc_id"] is None
+    assert out["skill_telemetry"] is None
+    assert proc_env["storage"].docs == {}
+
+
+@pytest.mark.asyncio
+async def test_record_tolerates_missing_skill_doc(proc_env):
+    """Linked skill deleted out from under the procedure → record still succeeds."""
+    storage = proc_env["storage"]
+    created = parse_envelope(await _write_proc())
+    # Link to a skill that does NOT exist in storage.
+    storage.procs[created["id"]]["skill_doc_id"] = "forge/ghost"
+
+    out = parse_envelope(
+        await mcp_server.memclaw_procedure_record(
+            procedure_id=created["id"], outcome_type="success"
+        )
+    )
+    assert out["reliability_score"] > 0.5  # stats still updated
+    assert out["skill_telemetry"] is None  # nowhere to count, tolerated

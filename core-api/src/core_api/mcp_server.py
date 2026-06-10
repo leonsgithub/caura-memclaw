@@ -2263,6 +2263,38 @@ async def memclaw_procedure_record(
             }
         )
         updated = await sc.update_procedure_stats(procedure_id, patch)
+
+        # PM-05: close the loop into the Skill Factory's deferred Phase-4
+        # telemetry. When this procedure was minted from a skill, mirror the
+        # outcome onto the parent skill's telemetry block. Failure-isolated —
+        # a telemetry hiccup must not fail the stats write that already
+        # committed. A procedure that just quarantined is flagged for
+        # lifecycle review via a log signal (no forced, RBAC-gated status
+        # transition from this low-trust path).
+        skill_doc_id = proc.get("skill_doc_id")
+        skill_telemetry = None
+        if skill_doc_id:
+            try:
+                from core_api.services.procedure_service import bump_skill_telemetry
+
+                skill_telemetry = await bump_skill_telemetry(
+                    skill_doc_id, tenant_id, outcome_type, now_iso=now_iso
+                )
+                if quarantined:
+                    logger.info(
+                        "procedure %s quarantined — flagging linked skill %s for "
+                        "lifecycle review (tenant=%s)",
+                        procedure_id,
+                        skill_doc_id,
+                        tenant_id,
+                    )
+            except Exception:
+                logger.exception(
+                    "procedure_record: skill telemetry write-back failed for "
+                    "skill_doc_id=%s — stats update unaffected",
+                    skill_doc_id,
+                )
+
         return _with_latency(
             json.dumps(
                 {
@@ -2272,6 +2304,8 @@ async def memclaw_procedure_record(
                     "reliability_score": reliability,
                     "is_quarantined": quarantined,
                     "stats": updated,
+                    "skill_doc_id": skill_doc_id,
+                    "skill_telemetry": skill_telemetry,
                 },
                 indent=2,
                 default=str,
