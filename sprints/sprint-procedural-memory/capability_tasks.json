@@ -1,0 +1,452 @@
+{
+  "planId": "SPRINT-PROCEDURAL-MEMORY-PLAN",
+  "sprintGoal": "Add a dedicated procedural-memory domain to MemClaw that brings Brain's runtime suggest → rank-by-reliability → record-outcome loop, wired INTO the existing Skill Factory / Forge rather than duplicating its mining. Five phases: (PM-01) procedures storage domain + migration 023; (PM-02) core-api storage client + ranker-backed procedure_service; (PM-03) MCP tools memclaw_procedure_suggest/record/write — the runtime loop; (PM-04) Forge bridge so mined skills emit runtime-suggestable structured procedures; (PM-05) close the loop into the Skill Factory's deferred Phase-4 telemetry. Brain's training/curriculum/autotuner subsystem is explicitly OUT of scope — Forge already performs trajectory mining.",
+  "correlationId": "SPRINT-PROCEDURAL-MEMORY",
+  "createdAt": "2026-06-10T00:00:00Z",
+  "createdBy": "claude-code",
+  "workItems": [
+    {
+      "id": "PM-01",
+      "kind": "software.implementation",
+      "objective": "Create the procedures storage domain in core-storage-api: alembic migration 023 with two tables (procedures, procedure_stats) re-keyed to MemClaw tenancy, the SQLAlchemy model, and a CRUD + reliability-update router. Tables mirror Brain's src/models/schema.py Procedure/ProcedureStats but use tenant_id/fleet_id/agent_id TEXT keys like common/models/memory.py, embedding Vector(VECTOR_DIM), and a nullable skill_doc_id linking a procedure to the skills document it was minted from.",
+      "acceptanceCriteria": [
+        "Migration file core-storage-api/src/core_storage_api/database/migrations/versions/023_procedures.py exists; `alembic upgrade head` creates both tables and `alembic downgrade -1` drops them cleanly",
+        "procedures table has columns: id, tenant_id, fleet_id, agent_id, name, pattern_signature, tools_sequence (JSONB), context_features (JSONB), embedding (vector), reasoning_guide, risk_level, is_canonical, precedence, skill_doc_id (nullable), visibility, status, created_at, updated_at",
+        "procedure_stats table has columns: id, procedure_id (unique FK CASCADE), success_count, failure_count, last_success_at, last_failure_at, reliability_score (default 0.5), is_quarantined (default false)",
+        "common/models/procedure.py defines both models and is registered in common/models/__init__.py",
+        "core-storage-api router exposes create / get / list (tenant-scoped) / update-stats endpoints following routers/memories.py shape",
+        "A storage-layer test creates a procedure, fetches it, updates stats, and asserts reliability_score changed"
+      ],
+      "state": "todo",
+      "priority": 100,
+      "dependencies": [],
+      "requiredCapabilities": [
+        "filesystem.write",
+        "database.migration"
+      ],
+      "executionPolicy": {
+        "maxAttempts": 2,
+        "timeoutSeconds": 1800,
+        "requiresHumanApproval": false,
+        "allowedSideEffects": [
+          "local_filesystem_write",
+          "database_schema_change"
+        ],
+        "networkAccess": "none",
+        "retryPolicy": {
+          "strategy": "exponential_backoff",
+          "retryOn": [
+            "transient_error",
+            "timeout"
+          ]
+        }
+      },
+      "risk": {
+        "level": "low",
+        "reasons": [
+          "Additive only — two new tables + new model + new router; no existing table or model is altered",
+          "Full rollback: `alembic downgrade -1` drops both tables; new files deleted restores tree exactly"
+        ]
+      },
+      "resourceLocks": [
+        {
+          "resource": "core-storage-api:migrations",
+          "mode": "write"
+        }
+      ],
+      "version": 1,
+      "attempt": 0,
+      "parentId": null,
+      "artifacts": [],
+      "failure": null,
+      "payload": {
+        "port_from": [
+          "/home/leon/dev/procedural_memory_mcp/src/models/schema.py (Procedure L65-126, ProcedureStats L129-160)"
+        ],
+        "model_after": [
+          "common/models/memory.py (tenancy + Vector(VECTOR_DIM) + JSONB pattern)",
+          "core-storage-api/src/core_storage_api/routers/memories.py (router shape)",
+          "core-storage-api/src/core_storage_api/database/migrations/versions/021_session_traces.py (migration style)"
+        ],
+        "next_migration_number": "023 (latest on disk is 022_skills_backfill_source_status)",
+        "validation_commands": [
+          "cd core-storage-api && alembic upgrade head",
+          "cd core-storage-api && alembic downgrade -1 && alembic upgrade head",
+          "pytest core-storage-api/tests -k procedure -q"
+        ]
+      }
+    },
+    {
+      "id": "PM-02",
+      "kind": "software.implementation",
+      "objective": "Add the core-api procedure layer: storage-client methods to reach the PM-01 endpoints, and a procedure_service that ports Brain's ProcedureRanker (context-feature overlap + reliability ranking) while reusing MemClaw's existing embedding provider for the semantic half of the score. Do NOT port Brain's training/weights.py autotuner.",
+      "acceptanceCriteria": [
+        "core-api/src/core_api/clients/storage_client.py gains create_procedure, search_procedures, get_procedure, update_procedure_stats mirroring the create_memory/_post/_get patterns (L366+)",
+        "core-api/src/core_api/services/procedure_service.py implements ranking: semantic similarity (MemClaw embedder, same one memory_service.py uses) combined with Brain's _context_overlap and reliability_score; quarantined procedures are excluded",
+        "No import of or dependency on procedural_memory_mcp at runtime — logic is reimplemented against MemClaw infra",
+        "Unit test: 3 seeded procedures with differing reliability_score are returned in the expected order for a given context_features query, and a quarantined one is omitted"
+      ],
+      "state": "todo",
+      "priority": 90,
+      "dependencies": [
+        "PM-01"
+      ],
+      "requiredCapabilities": [
+        "filesystem.write"
+      ],
+      "executionPolicy": {
+        "maxAttempts": 2,
+        "timeoutSeconds": 1800,
+        "requiresHumanApproval": false,
+        "allowedSideEffects": [
+          "local_filesystem_write"
+        ],
+        "networkAccess": "none",
+        "retryPolicy": {
+          "strategy": "exponential_backoff",
+          "retryOn": [
+            "transient_error",
+            "timeout"
+          ]
+        }
+      },
+      "risk": {
+        "level": "low",
+        "reasons": [
+          "New service + additive client methods; no existing service behavior changed",
+          "Rollback: delete procedure_service.py and revert storage_client.py additions"
+        ]
+      },
+      "resourceLocks": [
+        {
+          "resource": "core-api:services",
+          "mode": "write"
+        }
+      ],
+      "version": 1,
+      "attempt": 0,
+      "parentId": null,
+      "artifacts": [],
+      "failure": null,
+      "payload": {
+        "port_from": [
+          "/home/leon/dev/procedural_memory_mcp/src/retrieval/ranker.py (ProcedureRanker._context_overlap, _construct_query, reliability ranking)"
+        ],
+        "reuse": [
+          "core-api/src/core_api/services/memory_service.py embedding provider + _get_or_cache_embedding pattern (L2615)",
+          "core-api/src/core_api/clients/storage_client.py create_memory L366, _post L308, _get L280"
+        ],
+        "do_not_port": [
+          "procedural_memory_mcp/src/training/weights.py (autotuner — Phase 4 / out of scope)"
+        ],
+        "validation_commands": [
+          "pytest core-api/tests -k procedure_service -q"
+        ]
+      }
+    },
+    {
+      "id": "PM-03",
+      "kind": "software.feature",
+      "objective": "Expose the runtime procedural loop as MCP tools: memclaw_procedure_suggest (returns ranked procedures + a request_id), memclaw_procedure_record (updates reliability + quarantine from an outcome), and memclaw_procedure_write (explicit procedure capture). Each tool = a handler in core-api mcp_server.py + a ToolSpec module under core-api tools/. Reuse existing auth/trust/scope helpers; mirror memclaw_evolve's three-phase DB-session pattern on the record path.",
+      "acceptanceCriteria": [
+        "memclaw_procedure_suggest(context_features, task, limit) returns ranked procedures and a request_id; trust_required=0; reuses _check_auth/_get_tenant/_get_agent_id/scope filtering",
+        "memclaw_procedure_record(request_id, outcome_type, latency_ms, validation_passed) updates procedure_stats; trust_required=1; uses the three-phase session pattern (no DB session held across non-DB work) like memclaw_evolve (mcp_server.py L2003-2097)",
+        "memclaw_procedure_write captures an explicit procedure (name, tools_sequence, context_features) and persists via storage_client",
+        "Each tool has a tools/memclaw_procedure_*.py spec registered via register() + mcp_register() and appears in the MCP tool list",
+        "End-to-end: suggest → request_id; record success x3 raises reliability_score; record failure xN flips is_quarantined; a quarantined procedure no longer appears in subsequent suggest"
+      ],
+      "state": "todo",
+      "priority": 90,
+      "dependencies": [
+        "PM-02"
+      ],
+      "requiredCapabilities": [
+        "filesystem.write"
+      ],
+      "executionPolicy": {
+        "maxAttempts": 2,
+        "timeoutSeconds": 1800,
+        "requiresHumanApproval": false,
+        "allowedSideEffects": [
+          "local_filesystem_write"
+        ],
+        "networkAccess": "none",
+        "retryPolicy": {
+          "strategy": "exponential_backoff",
+          "retryOn": [
+            "transient_error",
+            "timeout"
+          ]
+        }
+      },
+      "risk": {
+        "level": "medium",
+        "reasons": [
+          "Adds new MCP surface area — must respect existing trust/scope gating to avoid a low-trust write path",
+          "Rollback: remove the three handlers + three spec modules; SoT registration (mcp_server.py L2568 `from core_api import tools`) auto-drops them"
+        ]
+      },
+      "resourceLocks": [
+        {
+          "resource": "core-api:mcp_server",
+          "mode": "write"
+        }
+      ],
+      "version": 1,
+      "attempt": 0,
+      "parentId": null,
+      "artifacts": [],
+      "failure": null,
+      "payload": {
+        "port_from": [
+          "/home/leon/dev/procedural_memory_mcp/src/server.py (suggest_procedures L749, _persist_suggestion_signal L674, record_outcome L781)"
+        ],
+        "model_after": [
+          "core-api/src/core_api/mcp_server.py memclaw_evolve L1942-2102 (three-phase session pattern + trust gates)",
+          "core-api/src/core_api/tools/memclaw_evolve.py (ToolSpec + register + mcp_register)"
+        ],
+        "reuse_helpers": [
+          "mcp_server.py _check_auth, _check_write_scope, _get_tenant, _get_agent_id, _with_latency, _mcp_session"
+        ],
+        "validation_commands": [
+          "pytest core-api/tests -k 'procedure and mcp' -q"
+        ]
+      }
+    },
+    {
+      "id": "PM-04",
+      "kind": "software.feature",
+      "objective": "Bridge Forge to the procedures domain: when Forge mints a skill candidate from a session-trace cluster, also emit a linked structured procedure. Extract the ordered tool-call sequence from the trace member memories into tools_sequence, derive context_features from entity_ids + goal_phrase, set skill_doc_id to the minted skill, align status to the skill's lifecycle state, and seed procedure_stats from the trace outcome_label. This makes mined skills runtime-suggestable, not only installable.",
+      "acceptanceCriteria": [
+        "The Forge skill-minting path writes a procedures row with non-empty tools_sequence and skill_doc_id set to the minted skill's doc_id",
+        "context_features are derived from session_traces.entity_ids + goal_phrase; procedure status mirrors the skill lifecycle status",
+        "procedure_stats seed from trace outcome_label: success → reliability>0.5, failure → <0.5, unknown → 0.5",
+        "scripts/forge_dry_run.py over seeded success+failure traces produces a linked procedure that memclaw_procedure_suggest subsequently surfaces",
+        "No change to Forge's existing skill output shape — procedure emission is additive and guarded so a failure to emit does not block skill minting"
+      ],
+      "state": "todo",
+      "priority": 70,
+      "dependencies": [
+        "PM-03"
+      ],
+      "requiredCapabilities": [
+        "filesystem.write"
+      ],
+      "executionPolicy": {
+        "maxAttempts": 2,
+        "timeoutSeconds": 2400,
+        "requiresHumanApproval": false,
+        "allowedSideEffects": [
+          "local_filesystem_write"
+        ],
+        "networkAccess": "none",
+        "retryPolicy": {
+          "strategy": "exponential_backoff",
+          "retryOn": [
+            "transient_error",
+            "timeout"
+          ]
+        }
+      },
+      "risk": {
+        "level": "medium",
+        "reasons": [
+          "Touches the live Forge minting path — must be additive + guarded so procedure emission cannot break skill minting",
+          "Rollback: gate behind a config flag (default off) or revert the emission hook; minted skills are unaffected"
+        ]
+      },
+      "resourceLocks": [
+        {
+          "resource": "core-api:forge",
+          "mode": "write"
+        }
+      ],
+      "version": 1,
+      "attempt": 0,
+      "parentId": null,
+      "artifacts": [],
+      "failure": null,
+      "payload": {
+        "investigate_first": [
+          "core-api/src/core_api/services/skill_lifecycle.py + session_trace.py (Forge entry points referenced by commits #293/#311 / #311 lifecycle cron fanout)",
+          "core-storage-api migration 021_session_traces.py (memory_ids, entity_ids, signals_summary, goal_phrase, outcome_label)"
+        ],
+        "concept_from": [
+          "/home/leon/dev/procedural_memory_mcp/scripts/failure_analyzer.py (trajectory → procedure extraction — concept only; Forge replaces the mining)"
+        ],
+        "evidence_required": [
+          "forge_dry_run.py output showing a procedures row created with tools_sequence + reliability seeded from trace outcomes",
+          "A subsequent memclaw_procedure_suggest call that returns the Forge-minted procedure"
+        ],
+        "validation_commands": [
+          "python scripts/forge_dry_run.py --limit 5",
+          "pytest core-api/tests -k forge -q"
+        ]
+      }
+    },
+    {
+      "id": "PM-05",
+      "kind": "software.feature",
+      "objective": "Close the loop into the Skill Factory's deferred Phase-4 telemetry: memclaw_procedure_record also increments the linked skill doc's telemetry block (fires_total/fires_success/fires_failure/last_fired_at). Optionally feed low reliability back into the skill lifecycle as a stale/quarantine review signal via existing skill_lifecycle.py transitions.",
+      "acceptanceCriteria": [
+        "Recording an outcome against a procedure with a non-null skill_doc_id updates BOTH procedure_stats AND the parent skill document's telemetry block",
+        "telemetry.fires_total/fires_success/fires_failure/last_fired_at move correctly for success and failure outcomes",
+        "A procedure that flips is_quarantined marks its parent skill as a lifecycle-review candidate (or logs the signal) without directly forcing an admin-only status transition",
+        "Procedures with null skill_doc_id (explicitly captured, no skill) record cleanly with no telemetry side-effect"
+      ],
+      "state": "todo",
+      "priority": 60,
+      "dependencies": [
+        "PM-04"
+      ],
+      "requiredCapabilities": [
+        "filesystem.write"
+      ],
+      "executionPolicy": {
+        "maxAttempts": 2,
+        "timeoutSeconds": 1800,
+        "requiresHumanApproval": false,
+        "allowedSideEffects": [
+          "local_filesystem_write"
+        ],
+        "networkAccess": "none",
+        "retryPolicy": {
+          "strategy": "exponential_backoff",
+          "retryOn": [
+            "transient_error",
+            "timeout"
+          ]
+        }
+      },
+      "risk": {
+        "level": "medium",
+        "reasons": [
+          "Writes to the skills document telemetry — must respect skill_lifecycle RBAC (active/candidate are protected statuses); telemetry update must not trip status RBAC",
+          "Rollback: remove the telemetry write-back from memclaw_procedure_record; procedure_stats remain authoritative"
+        ]
+      },
+      "resourceLocks": [
+        {
+          "resource": "core-api:skill_lifecycle",
+          "mode": "write"
+        }
+      ],
+      "version": 1,
+      "attempt": 0,
+      "parentId": null,
+      "artifacts": [],
+      "failure": null,
+      "payload": {
+        "spec_reference": [
+          "docs/live-memory-pitch/skill-factory-implementation-plan.md §3 telemetry block (lines 152-159), §15 Phase 4 (outcome loop closes + telemetry)"
+        ],
+        "model_after": [
+          "core-api/src/core_api/services/skill_lifecycle.py (ALLOWED_STATUSES, ADMIN_ONLY_STATUSES, transitions)"
+        ],
+        "validation_commands": [
+          "pytest core-api/tests -k 'telemetry or skill_lifecycle' -q"
+        ]
+      }
+    },
+    {
+      "id": "PM-Z01",
+      "kind": "process.signoff",
+      "objective": "Write SPRINT-PROCEDURAL-MEMORY_SIGNOFF.md recording task outcomes, file changes, verification evidence, and carried-forward items; resolve the open deployment-target question (fork vs internal branch) and record the decision.",
+      "acceptanceCriteria": [
+        "File exists at sprints/sprint-procedural-memory/SPRINT-PROCEDURAL-MEMORY_SIGNOFF.md",
+        "Task status table covers PM-01..PM-05 with DONE/PARTIAL/PENDING/BLOCKED",
+        "Verification section includes alembic + pytest output and the forge_dry_run end-to-end evidence",
+        "Records the deploy-target decision (fork of caura-ai/caura-memclaw vs internal branch) and PR target",
+        "Sprint close summary states whether the objective (runtime procedural loop wired into Forge) was achieved",
+        "Lists any carried-forward items (e.g. routing-weight learning) with reason"
+      ],
+      "state": "todo",
+      "priority": 10,
+      "dependencies": [
+        "PM-01",
+        "PM-02",
+        "PM-03",
+        "PM-04",
+        "PM-05"
+      ],
+      "requiredCapabilities": [
+        "filesystem.write"
+      ],
+      "executionPolicy": {
+        "maxAttempts": 1,
+        "timeoutSeconds": 900,
+        "requiresHumanApproval": false,
+        "allowedSideEffects": [
+          "local_filesystem_write"
+        ],
+        "networkAccess": "none",
+        "retryPolicy": {
+          "strategy": "none",
+          "retryOn": []
+        }
+      },
+      "risk": {
+        "level": "low",
+        "reasons": [
+          "Documentation only — no behavior change",
+          "Rollback: N/A"
+        ]
+      },
+      "resourceLocks": [],
+      "version": 1,
+      "attempt": 0,
+      "parentId": null,
+      "artifacts": [],
+      "failure": null,
+      "payload": {
+        "implementation_notes": [
+          "Include: task status table, changes-by-file, verification output, definition-of-done checklist, blocked/carried-forward table, sprint close summary",
+          "Resolve the open question from the plan: where this lands (fork vs internal branch) before any push"
+        ],
+        "evidence_required": [
+          "SPRINT-PROCEDURAL-MEMORY_SIGNOFF.md committed"
+        ]
+      }
+    }
+  ],
+  "validation": {
+    "status": "valid",
+    "errors": [],
+    "warnings": [
+      "PM-04/PM-05 reference Forge internals (skill_lifecycle.py, session_trace.py) whose exact minting entry point must be confirmed by reading the code first — commits #293 (Skill Factory phases 0-2) and #311 (Forge lifecycle cron fanout) are the anchors; payload.investigate_first lists the files to trace before editing",
+      "Brain's training/curriculum/autotuner + TrainingRecord are intentionally OUT of scope — do NOT port them; Forge already performs trajectory mining and re-porting would duplicate it",
+      "Reuse MemClaw's embedding provider and DB layer — do NOT port procedural_memory_mcp/src/db or src/vector; importing Brain at runtime is forbidden",
+      "VECTOR_DIM must come from common.constants (the dim MemClaw is configured for); do not hardcode 768 from Brain — Brain uses 768 (nomic) but MemClaw default differs (bge-m3 / OpenAI)",
+      "Deployment is code-only this sprint: MemClaw is NOT currently installed on 192.168.1.53 (verified — no dir/image/compose/listening port). Decide deploy target in PM-Z01 before any push",
+      "PM-03 must keep the procedure write/record path behind the same trust gates as memclaw_evolve (record trust>=1) to avoid a low-trust write surface"
+    ]
+  },
+  "metrics": {
+    "totalWorkItems": 6,
+    "estimatedDurationDays": 5,
+    "criticalPathWorkItems": [
+      "PM-01",
+      "PM-02",
+      "PM-03",
+      "PM-04",
+      "PM-05",
+      "PM-Z01"
+    ],
+    "highRiskWorkItems": [],
+    "mediumRiskWorkItems": [
+      "PM-03",
+      "PM-04",
+      "PM-05"
+    ],
+    "parallelWorkstreams": [
+      "PM-01 → PM-02 → PM-03 is the strict spine (each builds on the prior)",
+      "PM-04 (Forge bridge) and PM-05 (telemetry write-back) both depend on PM-03 but PM-05 depends on PM-04 for the linked-skill path; documentation/eval can start once PM-03 lands",
+      "PM-Z01 signoff depends on all PM-01..PM-05"
+    ],
+    "deferredToNextSprint": [
+      "Routing-weight learning / autotuner (Brain training subsystem) — only if wanted later",
+      "Deployment + host wiring of the procedural-memory-enabled MemClaw build",
+      "OpenClaw plugin surfacing of memclaw_procedure_* tools"
+    ]
+  }
+}

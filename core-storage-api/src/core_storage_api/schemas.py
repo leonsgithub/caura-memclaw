@@ -212,6 +212,38 @@ BACKGROUND_TASK_FIELDS: list[str] = [
     "created_at",
 ]
 
+PROCEDURE_FIELDS: list[str] = [
+    "id",
+    "tenant_id",
+    "fleet_id",
+    "agent_id",
+    "name",
+    "pattern_signature",
+    "tools_sequence",
+    "context_features",
+    "embedding",
+    "reasoning_guide",
+    "risk_level",
+    "is_canonical",
+    "precedence",
+    "skill_doc_id",
+    "visibility",
+    "status",
+    "created_at",
+    "updated_at",
+]
+
+PROCEDURE_STATS_FIELDS: list[str] = [
+    "procedure_id",
+    "success_count",
+    "failure_count",
+    "last_success_at",
+    "last_failure_at",
+    "reliability_score",
+    "is_quarantined",
+    "updated_at",
+]
+
 
 # ---------------------------------------------------------------------------
 # Pydantic request schemas for complex query endpoints

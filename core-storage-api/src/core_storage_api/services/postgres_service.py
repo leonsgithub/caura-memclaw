@@ -55,6 +55,8 @@ from common.models import (
     LifecycleAudit,
     Memory,
     MemoryEntityLink,
+    Procedure,
+    ProcedureStats,
     Relation,
 )
 from core_storage_api.observability import db_measure
@@ -1961,6 +1963,106 @@ class PostgresService:
                 )
             )
             return result or 0
+
+    # ------------------------------------------------------------------
+    # P) Procedural memory (PM-01) — procedures + procedure_stats
+    # ------------------------------------------------------------------
+
+    async def procedure_add(self, data: dict) -> Procedure:
+        """Insert a procedure plus its 1:1 stats row.
+
+        ``stats`` keys (``reliability_score``, ``success_count``,
+        ``failure_count``, ``is_quarantined``) may be supplied nested under
+        ``data['stats']`` so the Forge bridge (PM-04) can seed reliability
+        from a trace outcome at mint time. Absent → server defaults
+        (reliability 0.5, counts 0).
+        """
+        stats_seed = data.pop("stats", None) or {}
+        async with get_session() as session:
+            procedure = Procedure(**self._filter_fields(Procedure, data))
+            session.add(procedure)
+            await session.flush()
+            stats = ProcedureStats(
+                procedure_id=procedure.id,
+                **self._filter_fields(ProcedureStats, stats_seed),
+            )
+            session.add(stats)
+            await session.flush()
+            # Eager-load the relationship for the caller's serialisation.
+            procedure.stats = stats
+            return procedure
+
+    async def procedure_get_by_id(self, procedure_id: UUID) -> Procedure | None:
+        with db_measure():
+            async with get_read_session() as session:
+                return await session.get(Procedure, procedure_id)
+
+    async def procedure_get_stats(
+        self, procedure_id: UUID
+    ) -> ProcedureStats | None:
+        with db_measure():
+            async with get_read_session() as session:
+                return await session.get(ProcedureStats, procedure_id)
+
+    async def procedure_list_for_tenant(
+        self,
+        tenant_id: str,
+        *,
+        fleet_id: str | None = None,
+        include_quarantined: bool = False,
+        limit: int = 200,
+    ) -> list[tuple[Procedure, ProcedureStats | None]]:
+        """List a tenant's procedures with their stats, newest first.
+
+        Quarantined procedures are excluded by default — the ranker in
+        core-api never wants them. ``fleet_id`` narrows to a fleet when
+        supplied; ``None`` returns all the tenant's procedures regardless
+        of fleet.
+        """
+        async with get_read_session() as session:
+            stmt = (
+                select(Procedure, ProcedureStats)
+                .outerjoin(
+                    ProcedureStats,
+                    ProcedureStats.procedure_id == Procedure.id,
+                )
+                .where(Procedure.tenant_id == tenant_id)
+            )
+            if fleet_id is not None:
+                stmt = stmt.where(Procedure.fleet_id == fleet_id)
+            if not include_quarantined:
+                stmt = stmt.where(
+                    or_(
+                        ProcedureStats.is_quarantined.is_(False),
+                        ProcedureStats.is_quarantined.is_(None),
+                    )
+                )
+            stmt = stmt.order_by(Procedure.created_at.desc()).limit(limit)
+            result = await session.execute(stmt)
+            return [(row[0], row[1]) for row in result.all()]
+
+    async def procedure_update_stats(
+        self, procedure_id: UUID, patch: dict
+    ) -> ProcedureStats | None:
+        """Apply a stats patch (counters / reliability / quarantine).
+
+        Reliability recomputation lives in core-api's procedure_service;
+        this is the dumb persistence sink. ``updated_at`` is always
+        bumped. Returns the updated row, or ``None`` if the procedure has
+        no stats row (should not happen — ``procedure_add`` always
+        creates one).
+        """
+        async with get_session() as session:
+            stats = await session.get(ProcedureStats, procedure_id)
+            if stats is None:
+                return None
+            for key, value in self._filter_fields(ProcedureStats, patch).items():
+                if key == "procedure_id":
+                    continue
+                setattr(stats, key, value)
+            stats.updated_at = datetime.now(UTC)
+            await session.flush()
+            return stats
 
     # ------------------------------------------------------------------
     # F) Crystallizer hygiene
