@@ -147,6 +147,22 @@ def _make_candidate_writer():
     return _write
 
 
+def _make_procedure_emitter():
+    """Persist the PM-04 structured procedure linked to a Forge skill.
+
+    Posts to the procedures storage surface via the same HTTP client. Kept
+    separate from ``candidate_writer`` so a procedure-write failure is
+    isolated inside ``run_forge_distill``'s guard and never unwinds the
+    skill mint.
+    """
+    sc = get_storage_client()
+
+    async def _emit(procedure: dict[str, Any]) -> None:
+        await sc.create_procedure(procedure)
+
+    return _emit
+
+
 def _make_status_checker():
     """Existence check used to skip writes against already-active /
     rejected / quarantined docs. Returns the live ``data.status`` or
@@ -230,6 +246,7 @@ async def run_forge_cron_tick(
     poison_checker = _make_poison_checker(db)
     candidate_writer = _make_candidate_writer()
     status_checker = _make_status_checker()
+    procedure_emitter = _make_procedure_emitter()
 
     forge_result = await run_forge_distill(
         db,
@@ -243,6 +260,7 @@ async def run_forge_cron_tick(
         poison_checker=poison_checker,
         candidate_writer=candidate_writer,
         status_checker=status_checker,
+        procedure_emitter=procedure_emitter,
         config=cfg,
     )
 

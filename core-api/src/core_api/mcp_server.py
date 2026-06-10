@@ -13,6 +13,7 @@ import json
 import logging
 import re
 import time
+import uuid
 from typing import Annotated, cast
 from uuid import UUID, uuid4
 
@@ -2099,6 +2100,286 @@ async def memclaw_evolve(
         return _with_latency(_error_response(code_for_status(e.status_code), str(e.detail)), t0)
     except Exception as e:
         logger.exception("Unhandled error in memclaw_evolve")
+        return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# memclaw_procedure_suggest / _record / _write — Procedural Memory (PM-03)
+# ──────────────────────────────────────────────────────────────────────
+#
+# The runtime procedural loop ported from Brain (procedural_memory_mcp),
+# layered on MemClaw's storage + embeddings:
+#   suggest  → rank-by-reliability candidates + a request_id (read, trust 0)
+#   record   → move reliability stats / quarantine from an outcome (write, ≥1)
+#   write    → explicitly capture a procedure (write, ≥1)
+#
+# Correlation note: ``record`` keys on ``procedure_id`` (which the agent
+# took from a prior ``suggest`` result), not on ``request_id``. request_id
+# is returned by suggest and accepted by record for telemetry/log
+# correlation only — keeping stats updates idempotent on the procedure
+# itself avoids a server-side suggestion-signal store (Brain used a
+# training_record row for this; MemClaw's Forge owns trajectory capture).
+
+# A procedure quarantines once it has enough evidence AND a low score —
+# mirrors Brain's reliability-floor skip, made explicit via the
+# ``is_quarantined`` flag the ranker filters on.
+_PROC_QUARANTINE_MIN_ATTEMPTS = 3
+_PROC_QUARANTINE_RELIABILITY = 0.3
+_PROC_OUTCOME_TYPES = ("success", "failure")
+
+
+async def memclaw_procedure_suggest(
+    context_features: Annotated[
+        dict, Field(description="Current task context (framework, region, library, …).")
+    ],
+    task: Annotated[
+        str | None, Field(description="Short natural-language goal for the task.")
+    ] = None,
+    fleet_id: Annotated[
+        str | None, Field(description="Restrict to a fleet's procedures.")
+    ] = None,
+    limit: Annotated[int, Field(description="Max suggestions (1-20).")] = 5,
+    agent_id: Annotated[str, Field(description="Caller agent.")] = "mcp-agent",
+) -> str:
+    """Suggest reliability-ranked tool-call procedures for the current context.
+
+    Returns a ``request_id`` plus ranked procedures (each with ``id``,
+    ``name``, ``tools_sequence``, ``score``, and a score ``breakdown``).
+    Follow one, then close the loop with ``memclaw_procedure_record`` using
+    that procedure's ``id``. Read-only; quarantined procedures are excluded.
+    """
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    tenant_id = _get_tenant()
+    limit = max(1, min(int(limit), 20))
+    try:
+        from core_api.services.procedure_service import rank_procedures
+
+        ranked = await rank_procedures(
+            tenant_id,
+            context_features or {},
+            task=task,
+            fleet_id=fleet_id,
+            limit=limit,
+        )
+        request_id = uuid.uuid4().hex
+        suggestions = [
+            {
+                "id": r["procedure"].get("id"),
+                "name": r["procedure"].get("name"),
+                "tools_sequence": r["procedure"].get("tools_sequence"),
+                "reasoning_guide": r["procedure"].get("reasoning_guide"),
+                "skill_doc_id": r["procedure"].get("skill_doc_id"),
+                "score": round(r["score"], 4),
+                "breakdown": {k: round(v, 4) for k, v in r["breakdown"].items()},
+            }
+            for r in ranked
+        ]
+        return _with_latency(
+            json.dumps(
+                {"request_id": request_id, "count": len(suggestions), "procedures": suggestions},
+                indent=2,
+                default=str,
+            ),
+            t0,
+        )
+    except Exception as e:
+        logger.exception("Unhandled error in memclaw_procedure_suggest")
+        return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
+
+
+async def memclaw_procedure_record(
+    procedure_id: Annotated[
+        str, Field(description="The procedure's id, from a memclaw_procedure_suggest result.")
+    ],
+    outcome_type: Annotated[str, Field(description="success | failure.")],
+    request_id: Annotated[
+        str | None, Field(description="request_id from suggest (telemetry correlation).")
+    ] = None,
+    latency_ms: Annotated[int | None, Field(description="Observed latency, optional.")] = None,
+    validation_passed: Annotated[
+        bool | None, Field(description="Whether output validation passed, optional.")
+    ] = None,
+    agent_id: Annotated[str, Field(description="Caller agent.")] = "mcp-agent",
+) -> str:
+    """Record an outcome against a procedure: move reliability + quarantine.
+
+    Increments the success/failure counter, recomputes ``reliability_score``
+    (Laplace-smoothed), stamps ``last_success_at`` / ``last_failure_at``, and
+    flips ``is_quarantined`` once a procedure has ≥3 attempts and a score
+    below 0.3 — after which the ranker stops suggesting it. Trust ≥ 1.
+    """
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    if err := _check_write_scope():
+        return err
+    agent_id = _get_agent_id() or agent_id
+    if refuse := _refuse_default_agent_on_gateway(agent_id):
+        return _with_latency(refuse, t0)
+    if outcome_type not in _PROC_OUTCOME_TYPES:
+        return _with_latency(
+            _error_response(
+                "INVALID_ARGUMENTS",
+                f"Invalid outcome_type '{outcome_type}'. Must be one of: {', '.join(_PROC_OUTCOME_TYPES)}",
+            ),
+            t0,
+        )
+    tenant_id = _get_tenant()
+    try:
+        from datetime import UTC, datetime
+
+        from core_api.services.procedure_service import compute_reliability
+
+        sc = get_storage_client()
+        proc = await sc.get_procedure(procedure_id)
+        if proc is None or proc.get("tenant_id") != tenant_id:
+            return _with_latency(
+                _error_response("NOT_FOUND", f"Procedure '{procedure_id}' not found."), t0
+            )
+        stats = proc.get("stats") or {}
+        success = int(stats.get("success_count", 0))
+        failure = int(stats.get("failure_count", 0))
+        now_iso = datetime.now(UTC).isoformat()
+        patch: dict = {}
+        if outcome_type == "success":
+            success += 1
+            patch["last_success_at"] = now_iso
+        else:
+            failure += 1
+            patch["last_failure_at"] = now_iso
+        reliability = compute_reliability(success, failure)
+        quarantined = (
+            success + failure >= _PROC_QUARANTINE_MIN_ATTEMPTS
+            and reliability < _PROC_QUARANTINE_RELIABILITY
+        )
+        patch.update(
+            {
+                "success_count": success,
+                "failure_count": failure,
+                "reliability_score": reliability,
+                "is_quarantined": quarantined,
+            }
+        )
+        updated = await sc.update_procedure_stats(procedure_id, patch)
+
+        # PM-05: close the loop into the Skill Factory's deferred Phase-4
+        # telemetry. When this procedure was minted from a skill, mirror the
+        # outcome onto the parent skill's telemetry block. Failure-isolated —
+        # a telemetry hiccup must not fail the stats write that already
+        # committed. A procedure that just quarantined is flagged for
+        # lifecycle review via a log signal (no forced, RBAC-gated status
+        # transition from this low-trust path).
+        skill_doc_id = proc.get("skill_doc_id")
+        skill_telemetry = None
+        if skill_doc_id:
+            try:
+                from core_api.services.procedure_service import bump_skill_telemetry
+
+                skill_telemetry = await bump_skill_telemetry(
+                    skill_doc_id, tenant_id, outcome_type, now_iso=now_iso
+                )
+                if quarantined:
+                    logger.info(
+                        "procedure %s quarantined — flagging linked skill %s for "
+                        "lifecycle review (tenant=%s)",
+                        procedure_id,
+                        skill_doc_id,
+                        tenant_id,
+                    )
+            except Exception:
+                logger.exception(
+                    "procedure_record: skill telemetry write-back failed for "
+                    "skill_doc_id=%s — stats update unaffected",
+                    skill_doc_id,
+                )
+
+        return _with_latency(
+            json.dumps(
+                {
+                    "procedure_id": procedure_id,
+                    "request_id": request_id,
+                    "outcome_type": outcome_type,
+                    "reliability_score": reliability,
+                    "is_quarantined": quarantined,
+                    "stats": updated,
+                    "skill_doc_id": skill_doc_id,
+                    "skill_telemetry": skill_telemetry,
+                },
+                indent=2,
+                default=str,
+            ),
+            t0,
+        )
+    except Exception as e:
+        logger.exception("Unhandled error in memclaw_procedure_record")
+        return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
+
+
+async def memclaw_procedure_write(
+    name: Annotated[str, Field(description="Human-readable procedure name.")],
+    tools_sequence: Annotated[
+        list, Field(description="Ordered tool-call identifiers the procedure performs.")
+    ],
+    context_features: Annotated[
+        dict, Field(description="Context this procedure applies to (framework, region, …).")
+    ],
+    pattern_signature: Annotated[
+        str | None, Field(description="Stable signature for dedup; derived from name if omitted.")
+    ] = None,
+    reasoning_guide: Annotated[
+        str | None, Field(description="Optional teacher strategy summary.")
+    ] = None,
+    risk_level: Annotated[str, Field(description="low | medium | high.")] = "low",
+    fleet_id: Annotated[str | None, Field(description="Fleet scope, optional.")] = None,
+    agent_id: Annotated[str, Field(description="Caller agent.")] = "mcp-agent",
+) -> str:
+    """Explicitly capture a procedure (tool-call sequence + context).
+
+    Embeds the procedure's descriptive text with MemClaw's embedder so it is
+    semantically suggestable, then persists it with a fresh stats row
+    (reliability 0.5). Trust ≥ 1. For Forge-mined procedures see PM-04.
+    """
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    if err := _check_write_scope():
+        return err
+    agent_id = _get_agent_id() or agent_id
+    if refuse := _refuse_default_agent_on_gateway(agent_id):
+        return _with_latency(refuse, t0)
+    if risk_level not in ("low", "medium", "high"):
+        return _with_latency(
+            _error_response("INVALID_ARGUMENTS", "risk_level must be low|medium|high."), t0
+        )
+    tenant_id = _get_tenant()
+    try:
+        from common.embedding import get_query_embedding
+        from core_api.services.procedure_service import _construct_query
+
+        sig = pattern_signature or name.strip().lower().replace(" ", ":")[:200]
+        embed_text = _construct_query(name, context_features or {})
+        embedding = await get_query_embedding(embed_text) if embed_text.strip() else None
+
+        sc = get_storage_client()
+        created = await sc.create_procedure(
+            {
+                "tenant_id": tenant_id,
+                "fleet_id": fleet_id,
+                "agent_id": agent_id,
+                "name": name,
+                "pattern_signature": sig,
+                "tools_sequence": tools_sequence,
+                "context_features": context_features or {},
+                "embedding": embedding,
+                "reasoning_guide": reasoning_guide,
+                "risk_level": risk_level,
+            }
+        )
+        return _with_latency(json.dumps(created, indent=2, default=str), t0)
+    except Exception as e:
+        logger.exception("Unhandled error in memclaw_procedure_write")
         return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
 
 

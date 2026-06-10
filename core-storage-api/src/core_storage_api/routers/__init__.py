@@ -10,6 +10,7 @@ from core_storage_api.routers.keystones import router as keystones_router
 from core_storage_api.routers.lifecycle_audit import router as lifecycle_audit_router
 from core_storage_api.routers.memories import router as memories_router
 from core_storage_api.routers.preview import router as preview_router
+from core_storage_api.routers.procedures import router as procedures_router
 from core_storage_api.routers.purge import router as purge_router
 from core_storage_api.routers.reports import router as reports_router
 from core_storage_api.routers.tasks import router as tasks_router
@@ -28,6 +29,7 @@ __all__ = [
     "lifecycle_audit_router",
     "memories_router",
     "preview_router",
+    "procedures_router",
     "purge_router",
     "reports_router",
     "tasks_router",

@@ -38,6 +38,7 @@ from core_storage_api.routers import (
     lifecycle_audit_router,
     memories_router,
     preview_router,
+    procedures_router,
     purge_router,
     reports_router,
     tasks_router,
@@ -123,6 +124,7 @@ def create_app() -> FastAPI:
     app.include_router(tasks_router, prefix=prefix)
     app.include_router(idempotency_router, prefix=prefix)
     app.include_router(lifecycle_audit_router, prefix=prefix)
+    app.include_router(procedures_router, prefix=prefix)
     app.include_router(purge_router, prefix=prefix)
     # CAURA-696: per-tenant row counts for the deletion-preview panel.
     # Mirrors ``purge``'s VPC-only trust model: no router-level auth,

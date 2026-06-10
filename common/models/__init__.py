@@ -11,6 +11,7 @@ from common.models.fleet import FleetCommand, FleetNode
 from common.models.idempotency import IdempotencyResponse
 from common.models.lifecycle_audit import LifecycleAudit
 from common.models.memory import Memory
+from common.models.procedure import Procedure, ProcedureStats
 
 __all__ = [
     "Agent",
@@ -27,5 +28,7 @@ __all__ = [
     "LifecycleAudit",
     "Memory",
     "MemoryEntityLink",
+    "Procedure",
+    "ProcedureStats",
     "Relation",
 ]
