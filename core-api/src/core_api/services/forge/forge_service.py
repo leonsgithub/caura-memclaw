@@ -53,6 +53,10 @@ from core_api.services.forge.fingerprint import (
     ClusterFingerprintInputs,
     compute_fingerprint,
 )
+from core_api.services.forge.procedure_bridge import (
+    ProcedureEmitter,
+    build_procedure_from_cluster,
+)
 from core_api.services.forge.sentinel_scan import scan_skill_doc
 from core_api.services.session_trace import (
     SessionTraceRow,
@@ -180,6 +184,7 @@ async def run_forge_distill(
     poison_checker: PoisonChecker,
     candidate_writer: CandidateWriter,
     status_checker: StatusChecker | None = None,
+    procedure_emitter: ProcedureEmitter | None = None,
     config: ForgeConfig | None = None,
 ) -> ForgeRunResult:
     """One Forge tick. Idempotent against ``session_traces`` (writes
@@ -329,6 +334,25 @@ async def run_forge_distill(
             )
             skipped_io_error += 1
             continue
+        # PM-04: emit a runtime-suggestable procedure linked to this skill.
+        # Additive + failure-isolated — the skill is already persisted, so a
+        # bridge failure here must NOT abort the tick or unwind the mint.
+        if procedure_emitter is not None:
+            try:
+                proc_payload = build_procedure_from_cluster(
+                    cluster_traces,
+                    candidate_doc,
+                    tenant_id=tenant_id,
+                    fleet_id=fleet_id,
+                )
+                await procedure_emitter(proc_payload)
+            except Exception:
+                logger.exception(
+                    "forge: procedure_emitter raised for slug=%s — skill mint "
+                    "unaffected, skipping procedure",
+                    candidate_doc.get("data", {}).get("slug"),
+                )
+
         # Append the FULL doc_id (``forge/<slug>``), not the bare slug —
         # ``candidate_doc_ids`` is the handle callers (CLI summary,
         # eval harness, Phase 2 inbox query) use to look the row up
