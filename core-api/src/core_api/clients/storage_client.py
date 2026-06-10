@@ -800,6 +800,44 @@ class CoreStorageClient:
         )
 
     # =====================================================================
+    # Procedures (Procedural Memory PM-02)
+    # =====================================================================
+
+    async def create_procedure(self, data: dict) -> dict:
+        return await self._post("/procedures", data)  # type: ignore[return-value]
+
+    async def get_procedure(self, procedure_id: str) -> dict | None:
+        return await self._get(f"/procedures/{procedure_id}")
+
+    async def list_procedures(
+        self,
+        tenant_id: str,
+        *,
+        fleet_id: str | None = None,
+        include_quarantined: bool = False,
+        limit: int = 200,
+    ) -> list[dict]:
+        """List a tenant's procedures (with nested stats), newest first.
+
+        Quarantined procedures are excluded unless ``include_quarantined``.
+        The core-api ranker pulls the candidate set through here, then
+        ranks in-process — storage does no scoring.
+        """
+        params: dict[str, Any] = {
+            "tenant_id": tenant_id,
+            "include_quarantined": include_quarantined,
+            "limit": limit,
+        }
+        if fleet_id is not None:
+            params["fleet_id"] = fleet_id
+        return await self._get_list("/procedures", **params)
+
+    async def update_procedure_stats(
+        self, procedure_id: str, data: dict
+    ) -> dict | None:
+        return await self._patch(f"/procedures/{procedure_id}/stats", data)
+
+    # =====================================================================
     # Entities
     # =====================================================================
 
