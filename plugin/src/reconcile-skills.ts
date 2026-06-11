@@ -14,14 +14,24 @@
  * - **Self-healing**: missed heartbeats catch up on the next tick.
  *   No queue, no "lost install command" failure mode.
  * - **Idempotent**: re-running is a no-op when disk already matches.
- * - **Pull-everything-visible** (locked in 2026-05-05): tenant + fleet
- *   visibility scoping happens at the catalog query layer, so the
- *   reconciler doesn't need its own opt-in flag. Skills the agent's
- *   fleet can see → on disk; can't see → not on disk.
+ * - **Server-gated catalog**: the reconciler pulls from
+ *   ``/skills/installable``, which applies ALL policy server-side —
+ *   tenant + fleet visibility AND (for Skill-Factory-opted-in tenants)
+ *   the active-only lifecycle gate. So the reconciler carries no opt-in
+ *   flag and no status filter: skills the server returns → on disk;
+ *   anything it withholds (a sibling fleet's skill, or a candidate /
+ *   staged / quarantined skill on an opted-in tenant) → never on disk.
+ *   This is the SAME gate the MCP pull surface enforces (PR #315), so
+ *   push (this reconciler) and pull (memclaw_doc) agree on what an agent
+ *   may see. A skill flipping active→rejected/quarantined drops out of
+ *   the catalog and is removed from disk on the next tick (step 4).
  *
- * Failure mode: fail open. If the catalog query throws (network,
- * server, schema), the reconciler logs and returns; existing on-disk
- * skills are preserved untouched. The heartbeat loop continues.
+ * Failure mode: fail open. If the catalog query throws or the server
+ * returns non-2xx (network, server, schema, or the fail-closed 503 the
+ * install surface raises during a settings outage), the reconciler logs
+ * and returns; existing on-disk skills are preserved untouched and
+ * nothing new is written — so an outage can never push a non-active
+ * skill to disk. The heartbeat loop continues.
  */
 
 import {
@@ -48,8 +58,16 @@ interface CatalogDoc {
   data?: Record<string, unknown>;
 }
 
-interface ReconcileSummary {
+export interface ReconcileSummary {
   catalogCount: number;
+  // The converged catalog-active skills now materialised on disk (the
+  // desired set this tick). Unlike ``added``/``removed`` — which are
+  // per-tick DELTAS, empty once a node is steady-state — ``installed`` is
+  // the standing truth: "these active skills are present on this node
+  // right now." Surfaced on the heartbeat so an operator can confirm an
+  // approved/active skill actually landed on the fleet. Excludes the
+  // bundled ``memclaw`` onboarding skill (reported via ``protected``).
+  installed: string[];
   added: string[];
   removed: string[];
   skipped: string[];   // catalog entries with bad shape (no doc_id / no content)
@@ -63,6 +81,7 @@ interface ReconcileSummary {
 export async function reconcileSkills(): Promise<ReconcileSummary> {
   const summary: ReconcileSummary = {
     catalogCount: 0,
+    installed: [],
     added: [],
     removed: [],
     skipped: [],
@@ -75,18 +94,20 @@ export async function reconcileSkills(): Promise<ReconcileSummary> {
     return summary;
   }
 
-  // 1. Fetch the catalog. Visibility filtering (fleet_id) happens
-  //    server-side; we just pass our local fleet binding through.
+  // 1. Fetch the installable catalog. ALL policy — tenant + fleet
+  //    visibility AND the active-only Skill-Factory gate (for opted-in
+  //    tenants) — is applied server-side by ``/skills/installable``; we
+  //    just pass our tenant + fleet binding through. The endpoint
+  //    cannot be widened by the client (no caller ``where``), so a node
+  //    can never pull a non-active skill.
   let catalog: CatalogDoc[];
   try {
     const resp = (await apiCall(
       "POST",
-      "/documents/query",
+      "/skills/installable",
       {
         tenant_id: MEMCLAW_TENANT_ID,
-        collection: "skills",
         fleet_id: MEMCLAW_FLEET_ID || undefined,
-        where: {},
         limit: 1000,
       },
     )) as { documents?: CatalogDoc[] } | CatalogDoc[];
@@ -179,6 +200,22 @@ export async function reconcileSkills(): Promise<ReconcileSummary> {
       logError(`reconcileSkills: rm failed for ${slug}`, e);
     }
   }
+
+  // Track CONFIRMED on-disk state for ``summary.installed``. Seed with
+  // skills that are BOTH already on disk AND catalog-active this tick
+  // (``onDisk ∩ desired``); the write loop then adds each fresh
+  // successful write. Intersecting with ``desired`` — rather than
+  // ``onDisk`` minus successful removals — is what makes this correct in
+  // every case:
+  //   • same-content skill skipped by the no-op-match branch below:
+  //     in onDisk ∩ desired → kept (it's genuinely present);
+  //   • new install: not on disk → added only on a successful write;
+  //   • cleanly removed orphan: not in desired → excluded;
+  //   • FAILED removal of a deactivated skill (rmSync threw, so it's
+  //     absent from summary.removed but still on disk): not in desired
+  //     → excluded, so a stale skill is never reported as installed.
+  const desiredSlugs = new Set(desired.keys());
+  const installedSet = new Set([...onDisk].filter((s) => desiredSlugs.has(s)));
   for (const [slug, content] of desired) {
     const dir = join(skillsRoot, slug);
     const target = join(dir, "SKILL.md");
@@ -195,6 +232,7 @@ export async function reconcileSkills(): Promise<ReconcileSummary> {
     try {
       mkdirSync(dir, { recursive: true });
       writeFileSync(target, content, "utf-8");
+      installedSet.add(slug);
       summary.added.push(slug);
       console.log(
         `[memclaw] Reconciler ${onDisk.has(slug) ? "updated" : "pulled"} skill: ${slug}`,
@@ -203,6 +241,17 @@ export async function reconcileSkills(): Promise<ReconcileSummary> {
       logError(`reconcileSkills: write failed for ${slug}`, e);
     }
   }
+
+  // The standing on-disk truth: skills CONFIRMED present on disk this
+  // tick (sorted for a stable heartbeat payload / diff), excluding the
+  // bundled ``memclaw`` onboarding skill (reported via ``protected``).
+  // Built from confirmed writes + already-present survivors, NOT from
+  // ``desired`` — so a skill whose write failed above is correctly
+  // absent. Reported even when ``added``/``removed`` are empty (steady
+  // state) so an operator always sees what's live, not just what changed.
+  summary.installed = [...installedSet]
+    .filter((s) => !PROTECTED_SKILLS.has(s))
+    .sort();
 
   return summary;
 }

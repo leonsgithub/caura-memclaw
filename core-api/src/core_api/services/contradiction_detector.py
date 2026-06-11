@@ -13,6 +13,7 @@ Multi-provider support:
 import asyncio
 import logging
 import time
+import uuid as _uuid
 from datetime import datetime
 from uuid import UUID
 
@@ -724,12 +725,25 @@ the SAME real-world subject. Different subjects -> NOT a contradiction,
 even if the predicates look opposite or the statements look semantically
 similar.
 
-CRITICAL: Resolved entities below are AUTHORITATIVE. If the subjects in
-the two RESOLVED-ENTITIES blocks are different entity rows (different
-canonical names or different entity IDs), same_subject MUST be false
-regardless of how similar the raw statement text looks. If the subjects
-are the SAME canonical entity row, treat same_subject as true even if
-the statement text refers to it by alias / role / pronoun.
+CRITICAL: Resolved entities below are AUTHORITATIVE. The subject of
+each statement has ALREADY been resolved to a specific entity row
+(identified by ``entity_id``) by upstream entity extraction. Your job
+is NOT to re-do that resolution from raw text; your job is to use the
+resolved entities as ground truth and decide whether the two
+statements' CLAIMS about those entities are mutually exclusive.
+
+  * If the two RESOLVED-ENTITIES blocks have a subject-role entity with
+    the SAME ``entity_id``, the subjects ARE the same real-world entity.
+    same_subject MUST be true. Surface text qualifiers ("from X", "at
+    Y", "the Z", possessives, role modifiers, employer / team / location
+    prefixes) are additional context about that ONE subject, NOT
+    evidence of different subjects.
+
+  * If the two RESOLVED-ENTITIES blocks have a subject-role entity with
+    DIFFERENT ``entity_id`` values, the subjects are different entity
+    rows. same_subject MUST be false, regardless of surface name
+    similarity. (Set non_conflict_reason="same_name_distinct_subject"
+    when the canonical names happen to match.)
 
 Statement A (NEW): {new_content}
 RESOLVED ENTITIES for Statement A:
@@ -745,14 +759,32 @@ Follow these steps in order:
    with role="subject" (or the canonical subject if no role is marked).
    Use its canonical name.
 2. Identify subject_b: same from Statement B's resolved entities.
-3. Decide same_subject. Set true ONLY when subject_a and subject_b are
-   the same resolved entity (same canonical name AND same entity_type).
-   Set false when:
-     - the resolved subjects are different entity rows
-     - either side has no resolved subject (degenerate input — this
-       prompt should not have been invoked, but if it is, prefer false)
-     - the canonical names match but entity_types differ (two
-       different real-world things that happen to share a name)
+3. Decide same_subject MECHANICALLY by comparing the subject entities'
+   ``entity_id`` values (not their surface text). Check the GUARD rules
+   first; only fall through to the equality rules if no guard fires.
+     - entity_id starts with "<none-" on either side -> same_subject=false
+       (entity has no stable identifier; do not infer identity even if
+       canonical names happen to match or the two sides happen to
+       render the same "<none-..." sentinel string)
+     - either side missing a subject-role entity -> same_subject=false
+       (degenerate input — this prompt should not have been invoked,
+       but if it is, prefer false)
+     - same canonical name but different entity_type -> same_subject=false
+       (two different real-world things that happen to share a name)
+     - subject_a.entity_id == subject_b.entity_id ->  same_subject=true
+     - subject_a.entity_id != subject_b.entity_id ->  same_subject=false
+   Worked examples:
+     (a) Statement A subject: entity_id=ABC123 canonical_name="Priya"
+         Statement B subject: entity_id=ABC123 canonical_name="Priya"
+         -> same_subject=true even if Statement A says "Priya from
+         AcmeCorp" and Statement B says "Priya from BetaIndustries".
+         The employer text is additional context about the one resolved
+         Priya, not evidence of a different Priya.
+     (b) Statement A subject: entity_id=ABC123 canonical_name="Priya"
+         Statement B subject: entity_id=XYZ789 canonical_name="Priya"
+         -> same_subject=false. Two distinct resolved entities that
+         happen to share a canonical name; this is the
+         ``same_name_distinct_subject`` non-conflict reason.
 4. Decide non_conflict_reason. Even when same_subject is true, certain
    shapes describe two claims that BOTH hold and so are NOT a
    contradiction. Pick at most one value; pick "none" when the two
@@ -1037,6 +1069,38 @@ _ENTITY_CONTEXT_NAME_MAX_CHARS = 100
 # it can.
 _ENTITY_LINKS_PREFLIGHT_MAX_CANDIDATES = 20
 
+# CAURA-134 — timeout budget (seconds) for the parallel
+# ``_fetch_entity_context`` gather in both Path C entry points
+# (retraction and forward-overlap detection). Raised from 5s -> 30s
+# after CAURA-132 forensic logs showed the 5s ceiling silently firing
+# on dev v2.14.0 with accumulated tenant state, causing
+# ``contexts_fetched`` to stay False and ALL candidates to fall back
+# to the base LLM judge. The fallback bypasses CAURA-131's entity-
+# aware wiring and CAURA-133's entity-aware prompt — i.e. the priya-
+# class silence was being driven by this timeout, not by a weak
+# prompt.
+#
+# 30s is safe because Path C runs in a fire-and-forget background
+# task after the write has already returned 201; the timeout only
+# bounds the background task's wall-clock, not user-perceived
+# latency. The two storage round-trips per memory (one batch +
+# per-link gather) complete in ~50-200ms p95 in the working
+# trials we observed; 30s is comfortably above any reasonable
+# per-tenant accumulated-state cost while still cancelling truly
+# hung tasks.
+_CONTEXT_FETCH_TIMEOUT_SECONDS = 30.0
+
+# CAURA-133 — process-scoped prefix for the missing-entity_id sentinel
+# emitted by ``_format_entity_context``. A real entity_id (always a
+# UUID written by the entity-extraction worker) cannot accidentally
+# collide with this prefix, so any rendered ``entity_id: <none-...>``
+# in the prompt is unambiguously a "no resolved identity" signal. The
+# random hex segment is generated once per process at import time —
+# its purpose is to make the sentinel format distinctive vs any real
+# value, NOT to disambiguate within-process cross-side calls (rule 3
+# of the prompt's same_subject step handles that override).
+_NONE_ID_PREFIX = f"<none-{_uuid.uuid4().hex[:8]}"
+
 # CAURA-131 — absolute upper bound on the TOTAL candidate count we'll
 # issue parallel entity-context fetches for (fall-through PLUS A1 #17-
 # matched candidates). The fall-through cap above bounds the L3.4
@@ -1082,11 +1146,36 @@ def _format_entity_context(entities: list[dict]) -> str:
         return "(none resolved)"
     capped = entities[:_ENTITY_CONTEXT_MAX_ENTITIES]
     lines: list[str] = []
-    for e in capped:
+    for i, e in enumerate(capped):
         name = (e.get("canonical_name") or e.get("name") or "<unknown>")[:_ENTITY_CONTEXT_NAME_MAX_CHARS]
         etype = e.get("entity_type") or "<unknown>"
         role = e.get("role") or "<unspecified>"
-        lines.append(f'- "{name}" (type: {etype}, role: {role})')
+        # CAURA-133 — render ``entity_id`` so the LLM can perform the
+        # mechanical ``subject_a.entity_id == subject_b.entity_id``
+        # comparison the prompt instructs. Without this, the prompt
+        # tells the model to compare a field the rendered context never
+        # surfaces, and the LLM falls back to name-matching — exactly
+        # the priya-silence regression CAURA-133 targets.
+        #
+        # Two layers protect the missing-entity_id case:
+        #   (1) WITHIN-side disambiguation: each missing-id row in THIS
+        #       call gets a per-row suffix (``-{i}>``) so two missing
+        #       rows in the same context block never render the same
+        #       sentinel. ``_NONE_ID_PREFIX`` adds a process-scoped
+        #       hex segment so the sentinel can never collide with a
+        #       real entity_id (real ids are UUIDs written by the
+        #       entity-extraction worker).
+        #   (2) CROSS-side disambiguation: the prompt's same_subject
+        #       step has an explicit rule that any ``<none-``-prefixed
+        #       entity_id forces ``same_subject=false`` regardless of
+        #       whether the two sides happen to render the same
+        #       sentinel string. This is the load-bearing override for
+        #       the case where both ``_format_entity_context`` calls in
+        #       a single judge invocation produce ``<none-{prefix}-0>``
+        #       for their first missing row — string-equality alone
+        #       can't tell them apart.
+        entity_id = e.get("entity_id") or f"{_NONE_ID_PREFIX}-{i}>"
+        lines.append(f'- "{name}" (type: {etype}, role: {role}, entity_id: {entity_id})')
     return "\n".join(lines)
 
 
@@ -1339,23 +1428,37 @@ async def _attempt_path_c_retraction(
     # (degenerate inputs / extractor failure).
     # Wrap the fetch in ``asyncio.wait_for`` so a hung storage
     # round-trip cannot block Path C indefinitely (mirrors the LLM
-    # call's cancellation boundary below). 5s budget is ample for two
-    # parallel storage calls (~50-200ms p95 in practice); on failure
-    # (timeout, network, storage error), treat as "no context, leave
-    # Path A alone" rather than retrying.
+    # call's cancellation boundary below). On failure (timeout,
+    # network, storage error), treat as "no context, leave Path A
+    # alone" rather than retrying. See ``_CONTEXT_FETCH_TIMEOUT_SECONDS``
+    # for the timeout rationale (CAURA-134).
     try:
         new_entities, old_entities = await asyncio.wait_for(
             asyncio.gather(
                 _fetch_entity_context(sc, str(new_memory.get("id"))),
                 _fetch_entity_context(sc, str(candidate.get("id"))),
             ),
-            timeout=5.0,
+            timeout=_CONTEXT_FETCH_TIMEOUT_SECONDS,
         )
     except Exception as e:
+        # CAURA-134 — include exception class name in the log. The
+        # default str(e) is empty for ``asyncio.TimeoutError``, which
+        # made the old "failed: . Path A's verdict stands." message
+        # un-diagnosable; the class name disambiguates timeouts from
+        # network errors from malformed responses.
+        #
+        # No symmetric INFO line here: the retraction path has no
+        # success-side ``context_fetched`` INFO to mirror (unlike the
+        # detection path, which emits one on the happy path for GCP
+        # metric parity). A redundant failure-only INFO would skew
+        # any retraction-path success/failure counter built from
+        # ``context_fetched`` / ``context_fetch_failed`` pairs.
         logger.warning(
-            "Path C entity-context fetch failed for memory %s candidate %s: %s. Path A's verdict stands.",
+            "PATH_C_RETRACTION context_fetch_failed memory=%s candidate=%s "
+            "exc_type=%s exc=%s. Path A's verdict stands.",
             new_memory.get("id"),
             candidate.get("id"),
+            type(e).__name__,
             e,
         )
         return False
@@ -1378,10 +1481,15 @@ async def _attempt_path_c_retraction(
             timeout=10.0,
         )
     except (TimeoutError, Exception) as e:
+        # CAURA-134 — include the exception class name and use the
+        # grep-friendly ``PATH_C_RETRACTION judge_failed`` prefix.
+        # str(e) is empty for ``asyncio.TimeoutError``, which was the
+        # silent failure mode masked by the prior log shape.
         logger.warning(
-            "Path C retraction judge failed for memory %s candidate %s: %s",
+            "PATH_C_RETRACTION judge_failed memory=%s candidate=%s exc_type=%s exc=%s",
             new_memory.get("id"),
             candidate.get("id"),
+            type(e).__name__,
             e,
         )
         return False
@@ -1635,7 +1743,7 @@ async def detect_contradictions_by_entities_async(
                         _fetch_entity_context(sc, str(memory_id)),
                         *(_fetch_entity_context(sc, str(c.get("id"))) for c in candidates),
                     ),
-                    timeout=5.0,
+                    timeout=_CONTEXT_FETCH_TIMEOUT_SECONDS,
                 )
                 new_ctx = fetched[0]
                 for c, ctx in zip(candidates, fetched[1:], strict=False):
@@ -1657,11 +1765,34 @@ async def detect_contradictions_by_entities_async(
                 # decide via the base prompt. Conservative against
                 # losing real contradictions on a transient storage
                 # hiccup.
+                #
+                # CAURA-134 — WARNING in grep-friendly ``key=value``
+                # form (matching the retraction path's
+                # ``PATH_C_RETRACTION context_fetch_failed`` WARNING),
+                # always including ``type(e).__name__`` (default
+                # ``str(e)`` is empty for ``asyncio.TimeoutError`` —
+                # the dominant production failure mode — and the
+                # original log shape rendered as an un-diagnosable
+                # "failed: . Falling through to base LLM judge.").
+                #
+                # WARNING-only (no symmetric INFO mirror). A separate
+                # failure-side INFO at the same severity-floor as the
+                # success-side ``PATH_C_DETECTION context_fetched``
+                # would double-count failures in any GCP log-based
+                # metric using the default ``severity>=INFO`` filter
+                # (which matches WARNING too), distorting any
+                # success/failure ratio built on the
+                # ``PATH_C_DETECTION context_fetch`` text prefix. A
+                # metric that needs paired success/failure counters
+                # should define two filters at different severities,
+                # not match both at INFO+.
                 logger.warning(
-                    "Path C entity-links context fetch failed for memory %s: %s. "
-                    "Falling through to base LLM judge.",
+                    "PATH_C_DETECTION context_fetch_failed memory=%s exc_type=%s "
+                    "exc=%s candidates=%d. Falling through to base LLM judge.",
                     memory_id,
+                    type(e).__name__,
                     e,
+                    len(candidates),
                 )
 
         # L3.4 preflight (CAURA-130) — when the legacy A1 #17 gate fell
