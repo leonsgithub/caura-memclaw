@@ -570,7 +570,7 @@ def _storage_error_envelope(e: httpx.HTTPStatusError, t0: float) -> str | CallTo
 
 async def memclaw_recall(
     query: Annotated[str, Field(description="NL query.")],
-    agent_id: Annotated[str, Field(description="Caller agent.")] = "mcp-agent",
+    agent_id: Annotated[str, Field(description="Caller agent.")] = _DEFAULT_AGENT_ID,
     filter_agent_id: Annotated[str | None, Field(description="Filter by author.")] = None,
     memory_type: Annotated[str | None, Field(description="Filter by type.")] = None,
     status: Annotated[str | None, Field(description="Filter by status.")] = None,
@@ -709,7 +709,7 @@ async def memclaw_write(
     items: Annotated[
         list[dict] | None, Field(description="Batch of objects, ≤100; each needs 'content'.")
     ] = None,
-    agent_id: Annotated[str, Field(description="Caller agent.")] = "mcp-agent",
+    agent_id: Annotated[str, Field(description="Caller agent.")] = _DEFAULT_AGENT_ID,
     fleet_id: Annotated[str | None, Field(description="Fleet scope.")] = None,
     visibility: Annotated[str | None, Field(description="scope_team|scope_org|scope_agent.")] = None,
     memory_type: Annotated[str | None, Field(description="Type (single only).")] = None,
@@ -890,7 +890,7 @@ async def memclaw_manage(
     title: Annotated[str | None, Field(description="op=update.")] = None,
     metadata: Annotated[dict | None, Field(description="op=update.")] = None,
     source_uri: Annotated[str | None, Field(description="op=update.")] = None,
-    agent_id: Annotated[str, Field(description="Caller agent.")] = "mcp-agent",
+    agent_id: Annotated[str, Field(description="Caller agent.")] = _DEFAULT_AGENT_ID,
 ) -> str:
     """Per-memory lifecycle: read | update | transition | delete | bulk_delete | lineage.
 
@@ -1230,7 +1230,7 @@ async def memclaw_entity_get(
 
 
 async def memclaw_tune(
-    agent_id: Annotated[str, Field(description="Caller agent.")] = "mcp-agent",
+    agent_id: Annotated[str, Field(description="Caller agent.")] = _DEFAULT_AGENT_ID,
     top_k: Annotated[int | None, Field(description="1-20.")] = None,
     min_similarity: Annotated[float | None, Field(description="0.1-0.9.")] = None,
     fts_weight: Annotated[float | None, Field(description="0=semantic, 1=keyword.")] = None,
@@ -1431,7 +1431,7 @@ async def memclaw_doc(
     order: Annotated[str, Field(description="op=query: asc|desc.")] = "asc",
     limit: Annotated[int, Field(description="op=query.")] = 20,
     offset: Annotated[int, Field(description="op=query.")] = 0,
-    agent_id: Annotated[str, Field(description="Caller agent.")] = "mcp-agent",
+    agent_id: Annotated[str, Field(description="Caller agent.")] = _DEFAULT_AGENT_ID,
     fleet_id: Annotated[
         str | None,
         Field(description="op=write; optional scoping filter for op=list_collections|search."),
@@ -2049,7 +2049,7 @@ async def memclaw_doc(
 
 
 async def memclaw_list(
-    agent_id: Annotated[str, Field(description="Caller agent.")] = "mcp-agent",
+    agent_id: Annotated[str, Field(description="Caller agent.")] = _DEFAULT_AGENT_ID,
     scope: Annotated[
         str,
         Field(
@@ -2258,7 +2258,7 @@ async def memclaw_stats(
         ),
     ] = "agent",
     fleet_id: Annotated[str | None, Field(description="Filter by fleet.")] = None,
-    agent_id: Annotated[str, Field(description="Caller agent.")] = "mcp-agent",
+    agent_id: Annotated[str, Field(description="Caller agent.")] = _DEFAULT_AGENT_ID,
     memory_type: Annotated[str | None, Field(description="Filter by type.")] = None,
     status: Annotated[str | None, Field(description="Filter by status.")] = None,
     include_deleted: Annotated[
@@ -2371,7 +2371,7 @@ async def memclaw_insights(
     ],
     scope: Annotated[str, Field(description="agent|fleet|all.")] = "agent",
     fleet_id: Annotated[str | None, Field(description="Required when scope='fleet'.")] = None,
-    agent_id: Annotated[str, Field(description="Caller agent.")] = "mcp-agent",
+    agent_id: Annotated[str, Field(description="Caller agent.")] = _DEFAULT_AGENT_ID,
 ) -> str:
     """Analyze the memory store for patterns, contradictions, stale knowledge,
     or unexpected clusters; persist findings as ``insight`` memories.
@@ -2525,7 +2525,7 @@ async def memclaw_evolve(
         Field(description="Memory UUIDs that influenced the action."),
     ] = None,
     scope: Annotated[str, Field(description="agent|fleet|all.")] = "agent",
-    agent_id: Annotated[str, Field(description="Caller agent.")] = "mcp-agent",
+    agent_id: Annotated[str, Field(description="Caller agent.")] = _DEFAULT_AGENT_ID,
     fleet_id: Annotated[str | None, Field(description="Required when scope='fleet'.")] = None,
 ) -> str:
     """Record a real-world outcome against the memories that influenced the
@@ -2723,7 +2723,7 @@ async def memclaw_procedure_suggest(
         str | None, Field(description="Restrict to a fleet's procedures.")
     ] = None,
     limit: Annotated[int, Field(description="Max suggestions (1-20).")] = 5,
-    agent_id: Annotated[str, Field(description="Caller agent.")] = "mcp-agent",
+    agent_id: Annotated[str, Field(description="Caller agent.")] = _DEFAULT_AGENT_ID,
 ) -> str:
     """Suggest reliability-ranked tool-call procedures for the current context.
 
@@ -2785,7 +2785,7 @@ async def memclaw_procedure_record(
     validation_passed: Annotated[
         bool | None, Field(description="Whether output validation passed, optional.")
     ] = None,
-    agent_id: Annotated[str, Field(description="Caller agent.")] = "mcp-agent",
+    agent_id: Annotated[str, Field(description="Caller agent.")] = _DEFAULT_AGENT_ID,
 ) -> str:
     """Record an outcome against a procedure: move reliability + quarantine.
 
@@ -2917,7 +2917,7 @@ async def memclaw_procedure_write(
     ] = None,
     risk_level: Annotated[str, Field(description="low | medium | high.")] = "low",
     fleet_id: Annotated[str | None, Field(description="Fleet scope, optional.")] = None,
-    agent_id: Annotated[str, Field(description="Caller agent.")] = "mcp-agent",
+    agent_id: Annotated[str, Field(description="Caller agent.")] = _DEFAULT_AGENT_ID,
 ) -> str:
     """Explicitly capture a procedure (tool-call sequence + context).
 
@@ -2993,7 +2993,7 @@ async def memclaw_procedure_write(
 
 
 async def memclaw_keystones(
-    agent_id: Annotated[str, Field(description="Caller agent.")] = "mcp-agent",
+    agent_id: Annotated[str, Field(description="Caller agent.")] = _DEFAULT_AGENT_ID,
     fleet_id: Annotated[
         str | None,
         Field(description="Scope filter; supply to include fleet- and agent-scoped rules."),
