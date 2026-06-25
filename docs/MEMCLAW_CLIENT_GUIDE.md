@@ -25,6 +25,13 @@ agents. This guide onboards three clients — **Claude Code**, **Hermes**, and
 **The one rule that matters for multi-agent use:** each client must carry its
 own stable identity, or every agent's memories pile into one namespace.
 
+> **Identity alone is not isolation.** `agent_id` sets ownership, but the default
+> write visibility `scope_team` is tenant-wide in standalone and is readable by
+> *every* agent — so distinct `agent_id`s still see each other's `scope_team`
+> memories. To actually partition namespaces, either write `visibility:
+> "scope_agent"` (private to one `agent_id`) or group by `fleet_id`. See
+> **§2b** for the two concrete patterns. This section is just about *who you are*.
+
 Two ways to set identity, strongest first:
 
 1. **Identity headers (recommended — set once per client, guaranteed).** In
@@ -289,14 +296,58 @@ do this automatically:
   `fleet_id`; `memclaw_list` / `memclaw_stats` / `memclaw_write` take a single
   `fleet_id`. Passing the wrong one is rejected.
 
-### Simpler alternative (no provenance)
+### Simplest model — `agent_id` = repo, `scope_agent` writes (no fleets)
 
-If you don't care *who* wrote a memory, set **`agent_id = "<repo>"`** for every
-agent and skip fleets entirely — a plain `recall` then shares within the repo
-automatically (no `scope=fleet`, no trust-2 step). Cost: you can't tell
-`claude-vm1` from `hermes-vmC`, and procedure reliability is tracked per-repo
-instead of per-agent. Still a per-call body arg (the repo is dynamic), so it
-isn't any less work to pass than `fleet_id`.
+If you don't care *who* wrote a memory and just want **same repo shares /
+different repo isolated** with the fewest moving parts, drop fleets entirely and
+make the repo the identity:
+
+- **Write:** `agent_id = "<repo>"`, `visibility = "scope_agent"`
+- **Read:** plain `recall` / `list` / `stats` with `agent_id = "<repo>"`
+  (default `scope=agent` — no `scope`/`fleet_id`/`fleet_ids` needed)
+
+> **`visibility: "scope_agent"` is mandatory here, not optional.** The default
+> `scope_team` is tenant-wide in standalone and **leaks across every `agent_id`**
+> — so without `scope_agent` a different repo would still see your memories.
+> Verified: with `scope_agent`, `agent_id="acme"` reads share across machines and
+> `agent_id="beta"` sees none of them; with the default `scope_team`, `beta` saw
+> `acme`'s memory.
+
+Trade-offs vs. the fleet model above: no provenance (every VM on `acme` is just
+`acme` — you can't tell `claude` from `hermes`), and procedure reliability is
+tracked per-repo, not per-agent. No trust-2 step, no `scope=fleet` discipline.
+
+`agent_id` is dynamic (the repo changes), so it's a **per-call body arg**, not a
+header — wire it once per client:
+
+- **Claude** — `CLAUDE.md` (repo or user rule):
+
+  > **MemClaw repo-identity convention.** Compute `REPO` = basename of
+  > `git remote get-url origin` (fall back to the repo folder name). On every
+  > `memclaw_*` call pass `agent_id: REPO`. On `memclaw_write` also pass
+  > `visibility: "scope_agent"`. Don't pass `fleet_id` or `scope`.
+
+- **Hermes**:
+
+  ```python
+  import subprocess, os
+
+  def repo_slug(path="."):
+      try:
+          url = subprocess.check_output(
+              ["git", "-C", path, "remote", "get-url", "origin"], text=True).strip()
+          return os.path.splitext(os.path.basename(url))[0]   # ".../acme.git" -> "acme"
+      except Exception:
+          return os.path.basename(os.path.abspath(path))
+
+  REPO = repo_slug()
+
+  def call(tool, args):
+      args["agent_id"] = REPO
+      if tool == "memclaw_write":
+          args.setdefault("visibility", "scope_agent")
+      # ... POST (no identity headers needed for this model) ...
+  ```
 
 ---
 
