@@ -22,12 +22,22 @@ agents. This guide onboards three clients — **Claude Code**, **Hermes**, and
 | Health | `GET http://192.168.1.53:8000/api/v1/health` |
 | Tools | 15 (12 memory + 3 procedural-memory) |
 
-**The one rule that matters for multi-agent use:** every client must pass its own
-stable `agent_id` on every call. If you omit it, calls fall back to this
-deployment's seeded default (`memclaw-caura-memclaw-c8624d-406` — set via
-`MEMCLAW_DEFAULT_AGENT_ID`, format `memclaw-<folder>-<host-hash>-<rand>`), so
-Claude, Hermes and OpenCode would all collide into that one identity. Pass your
-own id to stay separate.
+**The one rule that matters for multi-agent use:** each client must carry its
+own stable identity, or every agent's memories pile into one namespace.
+
+Two ways to set identity, strongest first:
+
+1. **Identity headers (recommended — set once per client, guaranteed).** In
+   standalone mode (no gateway secret) the server honours
+   `X-Tenant-ID: default` + `X-Agent-ID: <your-id>` request headers, and the
+   header **overrides** any body arg. Put these in each client's MCP config once
+   and you never think about it again — it doesn't depend on the model
+   remembering to pass anything. (Verified live.)
+2. **Body `agent_id` arg (fallback).** If headers aren't set, identity comes from
+   the `agent_id` argument on each tool call. If that's *also* omitted it lands
+   in the deployment-wide seeded default
+   (`memclaw-caura-memclaw-c8624d-406`, from `MEMCLAW_DEFAULT_AGENT_ID`) — i.e.
+   the shared bucket where namespaces mix. Don't rely on this for separation.
 
 | Client | Use `agent_id` |
 |--------|----------------|
@@ -41,12 +51,18 @@ own id to stay separate.
 
 ### 1a. Claude Code
 
-Register the server once (user scope = all projects):
+Register the server once (user scope = all projects) **with identity headers**
+so every call is attributed to `claude` without the model having to pass it:
 
 ```bash
-claude mcp add --transport http memclaw http://192.168.1.53:8000/mcp --scope user
+claude mcp add --transport http memclaw http://192.168.1.53:8000/mcp --scope user \
+  --header "X-Tenant-ID: default" \
+  --header "X-Agent-ID: claude"
 claude mcp list          # memclaw → ✓ Connected
 ```
+
+(Use a more unique id — e.g. `claude-<host>` — if multiple machines run Claude
+against the same MemClaw and you want them separated.)
 
 Optional but recommended — install the bundled usage skill so the model knows
 when to reach for each tool:
@@ -73,14 +89,18 @@ OpenCode speaks MCP natively. Add a **remote** server to `opencode.json`
     "memclaw": {
       "type": "remote",
       "url": "http://192.168.1.53:8000/mcp",
-      "enabled": true
+      "enabled": true,
+      "headers": {
+        "X-Tenant-ID": "default",
+        "X-Agent-ID": "opencode"
+      }
     }
   }
 }
 ```
 
-Then instruct the agent (system prompt / `AGENTS.md`) to pass
-`agent_id: "opencode"` on every `memclaw_*` call.
+The `X-Agent-ID` header pins every call to `opencode` — no need to instruct the
+model to pass `agent_id` in the body.
 
 ### 1c. Hermes (and any custom / programmatic client)
 
@@ -94,13 +114,15 @@ Minimal raw call (works as-is — copy/paste):
 curl -s -X POST http://192.168.1.53:8000/mcp \
   -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
+  -H 'X-Tenant-ID: default' \
+  -H 'X-Agent-ID: hermes-orchestrator' \
   -d '{
         "jsonrpc": "2.0",
         "id": 1,
         "method": "tools/call",
         "params": {
           "name": "memclaw_recall",
-          "arguments": { "query": "deployment runbook", "agent_id": "hermes-orchestrator", "top_k": 5 }
+          "arguments": { "query": "deployment runbook", "top_k": 5 }
         }
       }'
 ```
@@ -115,11 +137,14 @@ Python sketch for Hermes:
 import httpx, json
 
 MEMCLAW = "http://192.168.1.53:8000/mcp"
+# Identity headers pin every call to this agent's namespace — set once here
+# instead of passing agent_id in every body.
 HEADERS = {"Content-Type": "application/json",
-           "Accept": "application/json, text/event-stream"}
+           "Accept": "application/json, text/event-stream",
+           "X-Tenant-ID": "default",
+           "X-Agent-ID": "hermes-orchestrator"}
 
 def call(tool: str, args: dict) -> dict:
-    args.setdefault("agent_id", "hermes-orchestrator")
     r = httpx.post(MEMCLAW, headers=HEADERS, json={
         "jsonrpc": "2.0", "id": 1, "method": "tools/call",
         "params": {"name": tool, "arguments": args},
@@ -141,6 +166,11 @@ print(call("memclaw_recall", {"query": "what does hermes do", "top_k": 3}))
 MemClaw is multi-tenant-aware but here runs **single-tenant** (`default`). Within
 the tenant, every agent has an **identity** (`agent_id`) and an **effective
 trust level** that gates which scopes it may touch.
+
+**How identity is resolved** (first match wins): `X-Agent-ID` header (standalone
+honours it when `X-Tenant-ID` is also sent) → body `agent_id` arg → the
+deployment's seeded default. Setting the header in client config is the only
+option that doesn't depend on the model remembering the body arg — use it.
 
 ```
 scope = agent   → only memories/procedures the agent owns      (trust ≥ 1)
