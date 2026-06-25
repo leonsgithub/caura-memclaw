@@ -16,6 +16,7 @@ Audit: every write/delete emits an audit row (``CAURA-000``).
 from __future__ import annotations
 
 import logging
+import re
 from typing import cast
 
 from fastapi import APIRouter, HTTPException, Request, Response
@@ -33,6 +34,12 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/keystones", tags=["Keystones"])
 _svc = PostgresService()
+
+# Filesystem-safe slug. Mirrors the edge validators (core-api
+# KeystoneSetRequest.doc_id Field(pattern=...) and mcp_server's keystones_set
+# regex) so the storage validator enforces the same contract its callers and
+# docs promise, even for direct storage clients.
+_DOC_ID_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,99}$")
 
 
 # ---------------------------------------------------------------------------
@@ -52,6 +59,12 @@ def _validate_payload(body: dict) -> tuple[str, dict, str | None]:
     doc_id = body.get("doc_id")
     if not doc_id or not isinstance(doc_id, str):
         errors.append("doc_id is required and must be a string")
+    elif not _DOC_ID_RE.match(doc_id):
+        errors.append(
+            f"doc_id must match {_DOC_ID_RE.pattern} — "
+            "a stable kebab-case slug you choose (e.g. 'redis-pool-size-bump'); "
+            "re-using it upserts the rule"
+        )
 
     title = body.get("title")
     if not title or not isinstance(title, str):
@@ -96,7 +109,10 @@ def _validate_payload(body: dict) -> tuple[str, dict, str | None]:
         if scope == "agent" and not agent_id:
             errors.append("scope=agent requires agent_id")
         if scope != "agent" and agent_id is not None:
-            errors.append(f"scope={scope} must not include agent_id")
+            errors.append(
+                f"scope={scope} keystones apply {scope}-wide and are not agent-specific; "
+                "omit agent_id (it is only valid for scope=agent)"
+            )
 
     if errors:
         raise HTTPException(status_code=422, detail=errors)

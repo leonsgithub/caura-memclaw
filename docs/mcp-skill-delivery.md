@@ -162,16 +162,68 @@ an agent may see.
 Gating decides what *should* land; observability confirms what *did*.
 Each heartbeat carries the reconciler's summary — `installed` (the
 active skills converged onto that node's disk right now), plus per-tick
-`added` / `removed` / `skipped` / `protected` deltas — which the backend
-stores as the latest snapshot at `nodes.metadata.reconcile` and surfaces
-via `GET /api/v1/fleet/nodes`. So an operator who flips a skill to
-`active` can confirm it actually reached each node, and see *why* a
-malformed catalog row was skipped — closing the loop from "approved" to
-"installed on the fleet."
+`added` / `removed` / `skipped` / `collisions` / `protected` deltas —
+which the backend stores as the latest snapshot at
+`nodes.metadata.reconcile` and surfaces via `GET /api/v1/fleet/nodes`. So
+an operator who flips a skill to `active` can confirm it actually reached
+each node, and see *why* a malformed catalog row was skipped — closing
+the loop from "approved" to "installed on the fleet."
 
 `installed` is the standing truth, not a delta: it's reported on every
 tick (even steady-state ticks with empty `added`/`removed`), so a node's
 current live-skill set is always legible.
+
+When more than one target dir is configured (see below), those top-level
+arrays are deduped *across* targets. The summary also carries a
+`targets[]` array with a **per-target** breakdown — one entry per dir
+(`{ dir, mode, installed, added, removed, collisions, protected }`) — so
+an operator can see exactly *which* dir a skill landed in or collided in.
+For the default single-target case it's one entry mirroring the top-level
+arrays. A `registeredDirs[]` array lists the target dirs MemClaw has
+ensured are on OpenClaw's skill load path this tick (the `register: true`
+opt-in below); it's empty unless a target opts in.
+
+### Reconcile targets: `owned` vs `additive`
+
+By default the reconciler manages one **`owned`** dir — the plugin's own
+`skills/` — where it has full authority: anything on disk not in the
+catalog is pruned. Operators can add extra target dirs via the
+`MEMCLAW_SKILL_TARGETS` env var (JSON array of `{ dir, mode, register? }`):
+
+- **`owned`** — fully MemClaw-managed (destructive prune). Use only for
+  dirs MemClaw exclusively controls.
+- **`additive`** — a **shared/foreign** dir. MemClaw writes its active
+  skills there but **only ever touches entries it wrote**, tracked by a
+  per-skill `.memclaw-owned` marker file:
+  - a slug already occupied by an *unowned* skill is a **collision** —
+    skipped, never overwritten (reported in the summary's `collisions`
+    list, kept distinct from the catalog-shape `skipped` list);
+  - an unowned skill is **never removed**, even on an empty catalog;
+  - only marker-bearing entries are updated/pruned.
+
+This makes the "empty catalog / wrong tenant wipes the dir" hazard apply
+only to `owned` dirs — `additive` dirs lose only MemClaw's own entries,
+never the client's.
+
+#### Reaching agents: `register`
+
+The plugin's own `owned` dir is already published as a plugin skill, so it
+reaches agents automatically. An **extra** target dir (typically
+`additive`) is *not* on OpenClaw's skill load path by default — its skills
+land on disk but stay invisible. Set **`register: true`** on the entry and
+the reconciler adds that dir to **`skills.load.extraDirs`** in
+`~/.openclaw/openclaw.json` — OpenClaw's documented, watched mechanism for
+extra skill directories (`docs/tools/skills-config.md`; consumed by the
+skills-snapshot refresh). The write is append-only and idempotent (existing
+entries preserved; written only when the dir is newly added), and fail-safe
+(a missing/unreadable config is logged, never fatal to the heartbeat). The
+owned dir is never registered this way.
+
+`skills.load.watch` defaults to `true`, so OpenClaw picks up a newly
+registered dir and refreshes its skills snapshot without a restart.
+**But** a long-lived agent *session* keeps its cached `<available_skills>`
+snapshot — a session that was already running won't see the newly
+registered skills until a fresh session starts (new `--session-key`).
 
 ## What makes a skill findable: the summary
 

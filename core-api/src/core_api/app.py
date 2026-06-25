@@ -12,7 +12,7 @@ from fastapi.staticfiles import StaticFiles
 from starlette.types import ASGIApp as ASGIApplication
 from starlette.types import Receive, Scope, Send
 
-from common.structlog_config import configure_logging
+from common.structlog_config import configure_logging, reroute_third_party_loggers
 from core_api.config import settings as app_settings
 
 # Must run before any other module-level `logging.getLogger(...)` call emits
@@ -38,6 +38,7 @@ from core_api.mcp_server import get_mcp_app, mcp_lifespan
 from core_api.middleware.ingest_body_size import IngestBodySizeMiddleware
 from core_api.middleware.per_tenant_concurrency import per_tenant_storage_slot
 from core_api.middleware.rate_limit import limiter
+from core_api.middleware.request_observation import RequestObservationMiddleware
 from core_api.middleware.request_timeout import (
     _TIMEOUT_OPT_OUT_PATHS,
     RequestTimeoutMiddleware,
@@ -113,6 +114,17 @@ class SecurityHeadersMiddleware:
 
 @asynccontextmanager
 async def lifespan(app):
+    # Re-route third-party loggers (uvicorn / fastmcp / mcp / slowapi) to the
+    # root handler now that they're all imported. ``configure_logging()`` at
+    # import time (above) already runs this routing, but those libraries are
+    # imported AFTER that call (slowapi / mcp_server below, uvicorn by the
+    # server) — so the import-time pass no-ops for them (it logs a "rerouting
+    # was a no-op" warning) and their records never reach the JSON/GCP handler.
+    # Most consequentially, FastMCP's "Error executing tool ..." tool-error
+    # lines were invisible in prod logs. The re-route is idempotent, so this
+    # post-import re-run from the ASGI lifespan startup safely routes them.
+    reroute_third_party_loggers()
+
     # Increase default thread pool for concurrent LLM calls via asyncio.to_thread()
     import asyncio as _aio
     from concurrent.futures import ThreadPoolExecutor
@@ -165,7 +177,6 @@ async def lifespan(app):
                 'Generate one with: python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"'
             )
         _dangerous = {
-            "postgres_password": "changeme",
             "jwt_secret": "change-me-in-production",
         }
         for var, bad_val in _dangerous.items():
@@ -186,30 +197,25 @@ async def lifespan(app):
 
             init_standalone()
 
-        # Backfill agent rows for any memories written before agent tracking
+        # Backfill agent rows for any memories written before agent tracking.
+        # Fully storage-routed (backfill_agents → sc.backfill_from_memories), so
+        # no core-api DB session is opened here.
         try:
-            from core_api.db.session import async_session
             from core_api.services.agent_service import backfill_agents
 
-            async with async_session() as db:
-                count = await backfill_agents(db)
-                if count:
-                    await db.commit()
-                    print(f"[startup] Backfilled {count} agent(s) from memories")
+            count = await backfill_agents()
+            if count:
+                print(f"[startup] Backfilled {count} agent(s) from memories")
         except Exception as e:
             print(f"[startup] Agent backfill skipped: {e}")
 
-        # Wire service hooks (audit + recall tracking)
-        from core_api.repositories import memory_repo
+        # Wire service hooks (audit). Recall tracking now routes directly through
+        # the storage client (increment_recall) at each call site; the on_recall
+        # hook was removed with core-api's repositories/DB pool.
         from core_api.services.audit_service import log_action
         from core_api.services.hooks import ServiceHooks, configure_hooks
 
-        configure_hooks(
-            ServiceHooks(
-                audit_log=log_action,
-                on_recall=memory_repo.increment_recall,
-            )
-        )
+        configure_hooks(ServiceHooks(audit_log=log_action))
 
         # CAURA-628: bind + start the audit batch flusher. ``log_action``
         # checks for an active queue and falls back to a synchronous
@@ -370,6 +376,25 @@ async def lifespan(app):
             set_audit_queue(audit_queue)
             await audit_queue.start()
 
+        # Capability-usage adoption counters: in-process aggregation
+        # flushed to ``capability_usage`` every
+        # ``capability_usage_flush_interval_seconds``. Disabled →
+        # ``record_usage()`` stays a no-op (the emitters never null-check).
+        capability_usage_agg = None
+        if app_settings.capability_usage_enabled:
+            from core_api.services.capability_usage import (
+                CapabilityUsageAggregator,
+                _default_flush,
+                set_aggregator,
+            )
+
+            capability_usage_agg = CapabilityUsageAggregator(
+                flush_interval_seconds=app_settings.capability_usage_flush_interval_seconds,
+                flush_callable=_default_flush,
+            )
+            set_aggregator(capability_usage_agg)
+            await capability_usage_agg.start()
+
         from core_api.tasks import cancel_all_tasks
 
         # ``register_consumers`` must run before ``bus.start`` — the
@@ -422,6 +447,11 @@ async def lifespan(app):
         shutdown_steps: list = []
         if audit_queue is not None:
             shutdown_steps.append(audit_queue.stop(timeout=5.0))
+        if capability_usage_agg is not None:
+            # Final flush before the storage client closes — same ordering
+            # rationale as the audit queue (the flush writes via the DB
+            # session, which must still be live).
+            shutdown_steps.append(capability_usage_agg.stop(timeout=5.0))
         shutdown_steps.extend(
             [
                 event_bus.stop(),
@@ -463,7 +493,14 @@ async def _json_rate_limit_handler(request: Request, exc: RateLimitExceeded) -> 
     detail_str = f"Rate limit exceeded: {exc.detail}. Try again later."
     body = {"detail": detail_str, **make_error_payload("RATE_LIMITED", detail_str)}
     response = JSONResponse(body, status_code=429)
-    response = request.app.state.limiter._inject_headers(response, request.state.view_rate_limit)
+    # Inject X-RateLimit headers only when the limit was actually evaluated. A
+    # swallowed storage error (see _key_func) leaves view_rate_limit None; skip
+    # the private _inject_headers call entirely rather than depending on slowapi's
+    # None-handling for OUR call site. (On the 429 path it's normally set — a 429
+    # means a limit was hit — so this is defence in depth.)
+    view_rate_limit = getattr(request.state, "view_rate_limit", None)
+    if view_rate_limit is not None:
+        response = request.app.state.limiter._inject_headers(response, view_rate_limit)
     return response
 
 
@@ -530,6 +567,17 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     }
     return JSONResponse(body, status_code=422)
 
+
+# Request observation + capability-usage adoption signal. Registered FIRST so
+# it ends up INNERMOST — directly wrapping the router (only Starlette's pure-ASGI
+# ExceptionMiddleware sits between). This placement is load-bearing: it must read
+# ``scope["route"]`` (the matched route template) on the way back out, and
+# ``SlowAPIMiddleware`` is a ``BaseHTTPMiddleware`` that runs the downstream app
+# in a separate task — a route set inside it does NOT reliably propagate back out
+# to an outer middleware. Sitting inside SlowAPI guarantees the template is
+# readable. Trade-off: it no longer wraps RequestTimeout/SlowAPI, so 504s/429s
+# aren't observed — fine, those requests didn't execute a capability anyway.
+app.add_middleware(RequestObservationMiddleware)
 
 app.add_middleware(SlowAPIMiddleware)
 
@@ -650,15 +698,20 @@ app.router.routes.append(
 
 
 # CAURA-602: turn a silent regression into a startup crash. The
-# request-timeout middleware skips a hardcoded path-allowlist; if a
-# router prefix or path ever moves and the allowlist isn't updated to
-# match, the silent-create class would re-emerge with no error. Verify
-# at import time that every opt-out path is actually mounted on this
-# app — string-matching is forced by the ASGI scope shape, but at
-# least the divergence will fail loudly. ``getattr`` filters out
-# ``Host`` route entries (no ``.path``); ``Mount`` and ``APIRoute``
-# both carry it.
-_registered_paths = {getattr(r, "path", None) for r in app.routes if getattr(r, "path", None)}
+# request-timeout middleware skips a hardcoded path-allowlist; if a router prefix
+# or path ever moves and the allowlist isn't updated to match, the silent-create
+# class would re-emerge with no error. Verify at import time that every opt-out
+# path is a registered route.
+#
+# Read the paths from the OpenAPI schema rather than walking ``app.routes``:
+# FastAPI 0.137 changed ``include_router(prefix=...)`` to mount the router as an
+# opaque ``_IncludedRouter`` (path=None, no public ``.routes``), so the prefixed
+# paths are no longer top-level ``APIRoute.path`` entries — which is exactly what
+# silently broke this guard when 0.137 shipped. ``app.openapi()`` is the stable,
+# public surface and lists the prefixed paths under both old (flatten) and new
+# (mount) FastAPI. Every core-api route is ``include_in_schema=True``, so none is
+# hidden from this check.
+_registered_paths = set(app.openapi().get("paths", {}))
 for _opt_out in _TIMEOUT_OPT_OUT_PATHS:
     if _opt_out not in _registered_paths:
         raise RuntimeError(

@@ -81,7 +81,7 @@ class _CoreApiLifecycleAdapter:
         hygiene/health checks that ``run_crystallization`` runs even
         when its own ``auto_crystallize`` parameter is False.
         """
-        config = await resolve_config(None, org_id)
+        config = await resolve_config(org_id)
         if not config.auto_crystallize_enabled:
             return 0
         active = await self._storage.count_active(org_id, fleet_id)
@@ -114,50 +114,42 @@ class _CoreApiLifecycleAdapter:
         Returns the number of insight memories produced (audit row's
         ``stats.insights_created``).
         """
-        config = await resolve_config(None, org_id)
+        config = await resolve_config(org_id)
         if not config.auto_insights_enabled:
             return 0
 
-        # Lazy imports — insights_service has heavy transitive deps
+        # Lazy import — insights_service has heavy transitive deps
         # (LLM clients, embedding providers) we don't want loading at
         # core-api startup just for the lifecycle adapter wiring.
-        from sqlalchemy import func, select
-
-        from common.models.memory import Memory
-        from core_api.db.session import async_session
+        #
+        # Fix 2 Ph5b: the activity gate + ``generate_insights`` are now
+        # storage-routed (no ``async_session`` / direct DB pool). The cheap
+        # two-query MAX(created_at) gate runs via
+        # ``insights_activity_gate``; ``generate_insights`` carries
+        # ``tenant_id`` explicitly (``db=None``) and storage-commits its own
+        # supersede/create/restore transactions.
         from core_api.services.insights_service import generate_insights
 
-        # Single session covers both the cheap activity gate and the
-        # heavier ``generate_insights`` pass — mirrors entity_link's
-        # pattern of one session per adapter call, explicit commit.
-        async with async_session() as db:
-            scope_filter = [
-                Memory.tenant_id == org_id,
-                Memory.deleted_at.is_(None),
-            ]
-            if fleet_id:
-                scope_filter.append(Memory.fleet_id == fleet_id)
-
-            latest_non_insight = await db.scalar(
-                select(func.max(Memory.created_at)).where(*scope_filter, Memory.memory_type != "insight")
-            )
-            if latest_non_insight is None:
+        gate = await self._storage.insights_activity_gate(tenant_id=org_id, fleet_id=fleet_id)
+        latest_non_insight_raw = gate.get("latest_non_insight")
+        if latest_non_insight_raw is None:
+            return 0
+        latest_insight_raw = gate.get("latest_insight")
+        # Parse the ISO strings back to datetimes so the comparison matches
+        # the original tz-aware ``created_at`` ``<=`` (robust to mixed UTC
+        # offsets, unlike a lexicographic string compare).
+        latest_non_insight = datetime.fromisoformat(latest_non_insight_raw)
+        if latest_insight_raw is not None:
+            latest_insight = datetime.fromisoformat(latest_insight_raw)
+            if latest_non_insight <= latest_insight:
                 return 0
 
-            latest_insight = await db.scalar(
-                select(func.max(Memory.created_at)).where(*scope_filter, Memory.memory_type == "insight")
-            )
-            if latest_insight is not None and latest_non_insight <= latest_insight:
-                return 0
-
-            result = await generate_insights(
-                db,
-                org_id,
-                focus="discover",
-                scope="fleet" if fleet_id else "all",
-                fleet_id=fleet_id,
-            )
-            await db.commit()
+        result = await generate_insights(
+            org_id,
+            focus="discover",
+            scope="fleet" if fleet_id else "all",
+            fleet_id=fleet_id,
+        )
 
         return len(result.get("insight_memory_ids", []))
 
@@ -172,28 +164,29 @@ class _CoreApiLifecycleAdapter:
         Honors ``auto_entity_linking_enabled`` — orgs with the flag
         off return 0 without running the LLM pipeline.
         """
-        config = await resolve_config(None, org_id)
+        config = await resolve_config(org_id)
         if not config.auto_entity_linking_enabled:
             return 0
         # Lazy imports — same rationale as crystallize above.
-        from core_api.db.session import async_session
+        # The entity-linking steps are now DB-free (Fix 2 Ph6): each folds its
+        # multi-statement transaction into one atomic core-storage-api call, so
+        # this caller no longer opens an ``async_session`` / commits. The
+        # context carries no DB session (``db=None``).
         from core_api.pipeline.compositions.entity_linking import (
             build_full_entity_linking_pipeline,
         )
         from core_api.pipeline.context import PipelineContext
 
-        async with async_session() as db:
-            ctx = PipelineContext(
-                db=db,
-                data={
-                    "tenant_id": org_id,
-                    **({"fleet_id": fleet_id} if fleet_id else {}),
-                },
-            )
-            pipeline = build_full_entity_linking_pipeline()
-            await pipeline.run(ctx)
-            await db.commit()
-            links_created = ctx.data.get("links_created", 0)
+        ctx = PipelineContext(
+            db=None,
+            data={
+                "tenant_id": org_id,
+                **({"fleet_id": fleet_id} if fleet_id else {}),
+            },
+        )
+        pipeline = build_full_entity_linking_pipeline()
+        await pipeline.run(ctx)
+        links_created = ctx.data.get("links_created", 0)
         return int(links_created)
 
     async def forge_distill(self, *, org_id: str, fleet_id: str | None, run_label: str) -> int:
@@ -228,29 +221,22 @@ class _CoreApiLifecycleAdapter:
         the candidate's ``origin.run_id`` aligned with the event +
         audit row even when queue lag crosses a minute boundary.
         """
-        # Lazy imports — same rationale as crystallize / insights:
-        # ``cron_handler`` pulls in the LLM provider chain via
-        # ``common.llm`` which we don't want loading at core-api
-        # startup just for the lifecycle adapter wiring.
-        from core_api.db.session import async_session
+        # Lazy import — ``cron_handler`` pulls in the LLM provider chain via
+        # ``common.llm`` which we don't want loading at core-api startup just
+        # for the lifecycle adapter wiring.
+        #
+        # Fix 2 Ph5a: this path no longer opens an ``async_session()`` — the
+        # whole forge tick (candidate scan, CAS status flips, session-trace
+        # upsert, poison reads, outcome signals) goes through core-storage-api
+        # via the storage client, each its own committed transaction
+        # storage-side. ``tenant_id`` is threaded in place of the session.
         from core_api.services.forge.cron_handler import run_forge_cron_tick
 
-        async with async_session() as db:
-            stats = await run_forge_cron_tick(
-                db,
-                tenant_id=org_id,
-                fleet_id=fleet_id,
-                run_label=run_label,
-            )
-            # Critical: ``run_forge_cron_tick`` → ``promote_pending_candidates``
-            # → ``make_db_status_updater`` issues raw UPDATEs against this
-            # session. SQLAlchemy's ``async_sessionmaker`` defaults to
-            # ``autocommit=False``, so without this commit every
-            # candidate→staged promotion would roll back when the
-            # context exits — the audit row would report ``promoted=N``
-            # while the DB held ZERO actual transitions. Mirrors the
-            # commit pattern in ``entity_link`` above.
-            await db.commit()
+        stats = await run_forge_cron_tick(
+            tenant_id=org_id,
+            fleet_id=fleet_id,
+            run_label=run_label,
+        )
         # ``stats_key='candidates_produced'`` (see lifecycle_handlers.py
         # registration), so the return value here is the COUNT that
         # populates ``stats.candidates_produced`` on the audit row.
@@ -295,7 +281,7 @@ async def resolve_publisher_kwargs(action: str, org_id: str) -> dict:
     takes a settings dependency.
     """
     if action == "purge-soft-deleted":
-        config = await resolve_config(None, org_id)
+        config = await resolve_config(org_id)
         return {"retention_days": config.memory_retention_days}
     if action == "forge-distill":
         # ``publish_forge_distill_request`` requires ``run_label``; the

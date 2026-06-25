@@ -7,8 +7,8 @@ from fastapi.security import APIKeyHeader
 
 from core_api.config import settings
 from core_api.constants import API_KEY_HEADER
-from core_api.db.session import set_current_tenant, set_readable_tenants
 from core_api.suppression import is_tenant_suppressed
+from core_api.tenant_context import set_current_tenant, set_readable_tenants
 
 logger = logging.getLogger(__name__)
 
@@ -303,6 +303,20 @@ async def _block_if_any_readable_suppressed(tenant_id: str | None, readable_tena
             await _block_if_suppressed(rt)
 
 
+def _stash_request_tenant(request: Request, tenant_id: str) -> None:
+    """Best-effort: record the resolved tenant on ``request.state`` so the
+    request-observation middleware can attribute capability usage to an org.
+
+    Guarded because some unit tests invoke ``get_auth_context`` with a
+    lightweight fake request object that has no Starlette ``state``; a real
+    ``Request`` always does. Failure here must never break auth.
+    """
+    try:
+        request.state.tenant_id = tenant_id
+    except AttributeError:
+        pass
+
+
 async def get_auth_context(
     request: Request,
     key: str | None = Security(api_key_header),
@@ -347,6 +361,7 @@ async def get_auth_context(
                 tenant_id = get_standalone_tenant_id()
                 await _block_if_suppressed(tenant_id)
                 set_current_tenant(tenant_id)
+                _stash_request_tenant(request, tenant_id)
                 return AuthContext(tenant_id=tenant_id, org_role="admin", agent_id=agent_id)
             tenant_id = request.headers.get("x-tenant-id")
             if tenant_id:
@@ -358,6 +373,7 @@ async def get_auth_context(
                 # review round 2 on PR #244.
                 await _block_if_any_readable_suppressed(tenant_id, readable_tenants)
                 set_current_tenant(tenant_id)
+                _stash_request_tenant(request, tenant_id)
                 return AuthContext(
                     tenant_id=tenant_id,
                     agent_id=agent_id,
@@ -380,6 +396,7 @@ async def get_auth_context(
         tenant_id = get_standalone_tenant_id()
         await _block_if_suppressed(tenant_id)
         set_current_tenant(tenant_id)
+        _stash_request_tenant(request, tenant_id)
         return AuthContext(tenant_id=tenant_id, org_role="admin")
 
     # ── Path 4: X-Tenant-ID header (set by enterprise nginx / ingress) ──
@@ -414,6 +431,7 @@ async def get_auth_context(
         is_install_credential = credential_kind == "install_credential"
         install_uuid = request.headers.get("x-install-uuid") or None
         set_current_tenant(tenant_id)
+        _stash_request_tenant(request, tenant_id)
         # When the gateway plumbs a multi-tenant read set, expose it to the
         # DB layer so reads (and downstream RLS policies, when configured)
         # can widen. The home tenant is prepended to keep the set complete.

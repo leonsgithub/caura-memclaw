@@ -42,7 +42,13 @@ Screenshot*.png
 .idea/
 reports/
 
-# Python package manager lockfiles — produced by uv, consumed only by
-# local dev (uv sync). Prod/CI Dockerfiles pip install from pyproject
-# directly, so committing these adds diff noise without a consumer.
+# Python package manager lockfiles. The deployable core-* services commit their
+# locks (CAURA-000): their Dockerfiles install FROZEN + hash-verified from uv.lock
+# so the deployed images can't silently float to a new release (a lock-less pip
+# install floated to FastAPI 0.137 and crashed prod 2026-06-14). Any other uv.lock
+# (none today) stays ignored.
 **/uv.lock
+!core-api/uv.lock
+!core-storage-api/uv.lock
+!core-worker/uv.lock
+!core-operations/uv.lock

@@ -2,20 +2,14 @@
 
 from __future__ import annotations
 
-import logging
-
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator, model_validator
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from core_api.auth import AuthContext, get_auth_context
 from core_api.constants import EVOLVE_OUTCOME_TYPES, VALID_SCOPES
-from core_api.db.session import get_db
 from core_api.services.audit_service import log_action
-from core_api.services.trust_service import parse_trust_error, require_trust
+from core_api.services.caller_identity import resolve_caller_and_gate
 from core_api.services.usage_service import check_and_increment_by_tenant as check_and_increment
-
-logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Evolve"])
 
@@ -91,7 +85,6 @@ class EvolveRequest(BaseModel):
 async def report_outcome_endpoint(
     body: EvolveRequest,
     auth: AuthContext = Depends(get_auth_context),
-    db: AsyncSession = Depends(get_db),
 ):
     """Report an action outcome to evolve memory weights and generate rules.
 
@@ -122,47 +115,22 @@ async def report_outcome_endpoint(
             ),
         )
 
-    # Gateway-verified identity wins when present; otherwise fall back to
-    # body.agent_id, then to the "mcp-agent" placeholder so standalone
-    # callers still show up in audit logs. Warn only when the client sent
-    # an explicit body.agent_id that disagrees with the verified header —
-    # the Pydantic default would fire spuriously on every gateway call.
-    if auth.agent_id and body.agent_id is not None and auth.agent_id != body.agent_id:
-        logger.warning(
-            "evolve: verified agent_id=%s overrides body.agent_id=%s",
-            auth.agent_id,
-            body.agent_id,
-        )
-    caller_agent_id = auth.agent_id or body.agent_id or "mcp-agent"
+    # Resolve the caller identity (verified > body > DEFAULT_AGENT_ID) and gate
+    # the write on trust. Shared with insights.py — see services/caller_identity.
+    # Fix 2 Ph5b (PR2): all DB access for evolve is storage-routed, so this route
+    # holds no session — ``None`` is forwarded to the db-ignoring helpers
+    # (``resolve_caller_and_gate`` only passes db to the storage-routed
+    # ``require_trust``; ``check_and_increment`` / ``report_outcome`` /
+    # ``log_action`` ignore db). There is no local session to commit.
+    caller_agent_id = await resolve_caller_and_gate(
+        auth,
+        tenant_id=body.tenant_id,
+        body_agent_id=body.agent_id,
+        scope=body.scope,
+        action="evolve",
+    )
 
-    # Admin bypass — super admins are tenant-free and trust enforcement
-    # assumes a tenant-scoped agent row.
-    if not auth.is_admin:
-        if not caller_agent_id:
-            raise HTTPException(status_code=422, detail="agent_id is required.")
-        min_level = 1 if body.scope == "agent" else 2
-        # ``require_trust`` soft-passes a missing Agent row at
-        # ``DEFAULT_TRUST_LEVEL`` so read-only callers don't 403 on a
-        # brand-new agent_id. Write paths still need identity pinning,
-        # though: this endpoint persists outcome and rule memories
-        # plus an audit-log entry keyed to ``caller_agent_id``, and
-        # without a registered row backing the name, attribution
-        # becomes unverifiable (a tenant-key holder could synthesise
-        # ``"admin-bot"`` and have that string appear in the audit
-        # trail). API-key admission proves authorization, not identity
-        # — re-block unregistered agents on writes specifically. The
-        # soft-pass remains useful for read-only consumers calling
-        # ``require_trust`` directly.
-        _, not_found, terr = await require_trust(db, body.tenant_id, caller_agent_id, min_level=min_level)
-        if not_found:
-            raise HTTPException(
-                status_code=403,
-                detail=f"Agent '{caller_agent_id}' is not registered in tenant '{body.tenant_id}'.",
-            )
-        if terr:
-            raise HTTPException(status_code=403, detail=parse_trust_error(terr))
-
-    await check_and_increment(db, body.tenant_id, "evolve")
+    await check_and_increment(body.tenant_id, "evolve")
 
     from core_api.services.evolve_service import report_outcome
 
@@ -173,7 +141,6 @@ async def report_outcome_endpoint(
     # simply malformed in a way Pydantic couldn't catch.
     try:
         result = await report_outcome(
-            db,
             tenant_id=body.tenant_id,
             outcome=body.outcome,
             outcome_type=body.outcome_type,
@@ -186,7 +153,6 @@ async def report_outcome_endpoint(
         raise HTTPException(status_code=422, detail=str(e)) from e
 
     await log_action(
-        db,
         tenant_id=body.tenant_id,
         action="evolve_report",
         resource_type="outcome",
@@ -197,6 +163,5 @@ async def report_outcome_endpoint(
             "related_ids": body.related_ids,
         },
     )
-    await db.commit()
 
     return result

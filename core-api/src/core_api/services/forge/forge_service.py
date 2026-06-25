@@ -172,7 +172,6 @@ class ForgeRunResult:
 
 
 async def run_forge_distill(
-    db: Any,
     *,
     tenant_id: str,
     fleet_id: str | None,
@@ -217,8 +216,12 @@ async def run_forge_distill(
     run_started_at = datetime.now(UTC)
 
     # 1. Build traces (persists into session_traces via SF-102).
+    #
+    # ``db`` is a vestigial first positional arg on ``run_forge_distill``
+    # (Fix 2 Ph5a): ``build_session_traces`` + the injected fetchers now
+    # route through core-storage-api, so nothing here touches a DB session.
+    # The arg is kept for CLI / test call-site compatibility.
     traces = await build_session_traces(
-        db,
         tenant_id=tenant_id,
         fleet_id=fleet_id,
         window_start=window_start,

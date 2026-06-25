@@ -17,6 +17,31 @@ _engine: AsyncEngine | None = None
 _read_engine: AsyncEngine | None = None
 
 
+def _schema_is_at_head(connection: Connection, head: str | None) -> bool:
+    """True when the DB's Alembic revision already equals ``head``.
+
+    Lets a replica that isn't the one running the migration start serving as
+    soon as the schema is current — WITHOUT acquiring the migration advisory
+    lock — instead of queueing behind every other booting replica to acquire
+    the lock and run a redundant no-op ``upgrade``. That serialized
+    acquire-then-no-op is what pushed tail replicas past the Cloud Run startup
+    probe during multi-replica scale-ups (prod 2026-06-24 02:04: storage-writer
+    instances killed on a 240s STARTUP TCP probe DEADLINE_EXCEEDED).
+
+    ``head`` (the script head) is computed once by the caller and passed in —
+    it's constant for the process lifetime, so the per-poll follower check stays
+    a single ``alembic_version`` SELECT rather than re-walking the migrations
+    directory each poll. Returns False on a fresh DB (no ``alembic_version`` row
+    → current is None), so the bootstrap/stamp path still runs under the lock.
+    """
+    # Deferred alembic import to match this module's existing convention
+    # (``init_database`` imports ``command``/``Config`` inside the function).
+    from alembic.runtime.migration import MigrationContext
+
+    current = MigrationContext.configure(connection).get_current_revision()
+    return current is not None and current == head
+
+
 def _build_engine(url: str) -> AsyncEngine:
     return create_async_engine(
         url,
@@ -76,6 +101,7 @@ async def init_database() -> None:
 
     from alembic import command
     from alembic.config import Config
+    from alembic.script import ScriptDirectory
     from sqlalchemy import text
 
     engine = get_engine()
@@ -84,6 +110,23 @@ async def init_database() -> None:
     alembic_cfg = Config()
     alembic_cfg.set_main_option("script_location", migrations_dir)
 
+    # The script head is constant for the process lifetime — compute it once
+    # (a migrations-dir walk) and reuse it for every at-head check, so the
+    # follower poll loop below stays a single ``alembic_version`` SELECT per
+    # poll rather than re-walking the migrations directory each time.
+    schema_head = ScriptDirectory.from_config(alembic_cfg).get_current_head()
+
+    # Fast path: if the schema is already at head there's no migration to run,
+    # so start serving immediately without contending on the advisory lock.
+    # This is the steady-state boot (nothing pending), and it lets
+    # simultaneously-booting replicas skip the lock entirely when there's no
+    # work — only a genuine pending migration falls through to the serialized
+    # leader/follower path below.
+    async with engine.connect() as check_conn:
+        if await check_conn.run_sync(_schema_is_at_head, schema_head):
+            logger.info("Schema already at head — starting without migration lock")
+            return
+
     # Session-scoped advisory lock on a dedicated connection so it survives
     # the per-migration commits Alembic performs — migrations that use
     # ``autocommit_block`` (e.g. ``CREATE INDEX CONCURRENTLY``) commit and
@@ -91,8 +134,15 @@ async def init_database() -> None:
     # variant would be released by those commits, breaking the multi-worker
     # serialisation guarantee.
     _MIGRATION_LOCK_ID = 8_675_309  # arbitrary unique int
-    _LOCK_WAIT_SECONDS = 300
     _LOCK_POLL_INTERVAL = 0.5
+    _LOCK_LOG_EVERY_SECONDS = 30.0
+    # The winning replica holds this lock for the WHOLE ``alembic upgrade head``
+    # (including minutes-long ``CREATE INDEX CONCURRENTLY`` builds / backfills),
+    # so the wait is a stuck-migration backstop, not a routine cap. It must
+    # exceed the slowest real migration or a slow-but-progressing one crashes the
+    # N-1 booting replicas waiting on it (2026-06-16: a hardcoded 300s cap that
+    # migration 025 blew past, failing 6 writer boots). Tunable via env.
+    lock_wait_seconds = settings.migration_lock_wait_seconds
     async with engine.connect() as lock_conn:
         # AUTOCOMMIT so the lock_conn never sits "idle in transaction": a
         # blocking ``pg_advisory_lock`` waiter keeps an open tx for the full
@@ -102,7 +152,9 @@ async def init_database() -> None:
         # holds a tx for sub-ms per attempt and avoids that interaction.
         lock_conn = await lock_conn.execution_options(isolation_level="AUTOCOMMIT")
         loop = asyncio.get_event_loop()
-        deadline = loop.time() + _LOCK_WAIT_SECONDS
+        start = loop.time()
+        deadline = start + lock_wait_seconds
+        next_log = start + _LOCK_LOG_EVERY_SECONDS
         while True:
             got = await lock_conn.scalar(
                 text("SELECT pg_try_advisory_lock(:lock_id)"),
@@ -110,12 +162,35 @@ async def init_database() -> None:
             )
             if got:
                 break
-            if loop.time() >= deadline:
+            # Not the leader. Start as soon as the leader's migration lands
+            # (schema reaches head) WITHOUT acquiring the lock — so every
+            # waiting follower unblocks together when the migration completes,
+            # instead of serializing through acquire→no-op-upgrade→release one
+            # at a time (whose tail exceeded the startup probe). Reuse the
+            # AUTOCOMMIT ``lock_conn`` for the read — no per-poll connection churn.
+            if await lock_conn.run_sync(_schema_is_at_head, schema_head):
+                logger.info("Migration completed by another replica — starting without lock")
+                return
+            now = loop.time()
+            if now >= deadline:
                 raise TimeoutError(
-                    f"Migration advisory lock {_MIGRATION_LOCK_ID} not "
-                    f"acquired within {_LOCK_WAIT_SECONDS}s — another worker "
-                    "still running migrations or stuck"
+                    f"Migration advisory lock {_MIGRATION_LOCK_ID} not acquired "
+                    f"within {lock_wait_seconds}s — another worker is likely stuck "
+                    "running migrations. A healthy slow migration should finish "
+                    "within this window; if a legitimate migration needs longer, "
+                    "raise MIGRATION_LOCK_WAIT_SECONDS (keeping it <= the Cloud Run "
+                    "startup-probe deadline)."
                 )
+            # Surface the wait so a long-but-healthy migration looks like progress
+            # in the logs, not a silently hung boot.
+            if now >= next_log:
+                logger.info(
+                    "Waiting on migration advisory lock (%.0fs of %ds elapsed) — "
+                    "another worker is running migrations",
+                    now - start,
+                    lock_wait_seconds,
+                )
+                next_log = now + _LOCK_LOG_EVERY_SECONDS
             await asyncio.sleep(_LOCK_POLL_INTERVAL)
         try:
             async with engine.connect() as work_conn:

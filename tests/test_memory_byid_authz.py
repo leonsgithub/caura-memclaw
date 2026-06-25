@@ -21,6 +21,7 @@ import pytest
 from core_api.services import agent_service
 from core_api.services.agent_service import authorize_memory_access
 
+from tests._mcp_test_helpers import stub_storage_client
 from tests.conftest import parse_envelope  # noqa: F401  (re-exported MCP helper)
 
 
@@ -31,21 +32,12 @@ from tests.conftest import parse_envelope  # noqa: F401  (re-exported MCP helper
 pytestmark_unit = pytest.mark.unit
 
 
-class _FakeMem:
-    def __init__(self, *, visibility, agent_id, fleet_id, **extra):
-        self.visibility = visibility
-        self.agent_id = agent_id
-        self.fleet_id = fleet_id
-        for k, v in extra.items():
-            setattr(self, k, v)
-
-
 @pytest.fixture
 def patch_lookup(monkeypatch):
     """Install a fake ``lookup_agent`` returning a controlled agent dict."""
 
     def _set(*, fleet_id=None, trust_level=0, exists=True):
-        async def fake_lookup(db, tenant_id, agent_id):
+        async def fake_lookup(tenant_id, agent_id):
             if not exists:
                 return None
             return {"agent_id": agent_id, "fleet_id": fleet_id, "trust_level": trust_level}
@@ -56,9 +48,7 @@ def patch_lookup(monkeypatch):
 
 
 async def _call(caller, visibility, owner, fleet, *, write=False):
-    return await authorize_memory_access(
-        None,
-        "tenant-x",
+    return await authorize_memory_access("tenant-x",
         caller,
         visibility=visibility,
         owner_agent_id=owner,
@@ -134,35 +124,38 @@ async def test_unknown_agent_allowed(patch_lookup):
 
 
 def _fake_read_row(*, visibility, agent_id, fleet_id):
+    # Fix 2 Phase 4: ``memclaw_manage`` op=read fetches via the storage client
+    # (``sc.get_memory_for_tenant``), which returns a plain dict — not an ORM
+    # row. The authz contract under test (``authorize_memory_access`` over the
+    # row's visibility / owner / fleet) is unchanged; only the row SHAPE is.
     mid = uuid.uuid4()
-    return mid, _FakeMem(
-        visibility=visibility,
-        agent_id=agent_id,
-        fleet_id=fleet_id,
-        id=mid,
-        content="cross-fleet secret",
-        memory_type="fact",
-        status="active",
-        weight=0.5,
-        title=None,
-        created_at=None,
-        last_recalled_at=None,
-        recall_count=0,
-        deleted_at=None,
-        metadata_=None,
-    )
+    return mid, {
+        "id": str(mid),
+        "visibility": visibility,
+        "agent_id": agent_id,
+        "fleet_id": fleet_id,
+        "content": "cross-fleet secret",
+        "memory_type": "fact",
+        "status": "active",
+        "weight": 0.5,
+        "title": None,
+        "created_at": None,
+        "last_recalled_at": None,
+        "recall_count": 0,
+        "deleted_at": None,
+        "metadata_": None,
+    }
 
 
 async def _mcp_read(mcp_env, monkeypatch, *, caller, row):
     from core_api import mcp_server
-    from core_api.repositories import memory_repo
 
     mid, mem = row
 
-    async def fake_get(db, _uid, _tenant):
-        return mem
-
-    monkeypatch.setattr(memory_repo, "get_by_id_for_tenant", fake_get)
+    # Stub the storage client's by-id read; the real ``authorize_memory_access``
+    # then runs over the returned row (``lookup_agent`` is controlled by
+    # ``patch_lookup``), exactly as the pre-migration test exercised it.
+    stub_storage_client(monkeypatch, get_memory_for_tenant=mem)
     monkeypatch.setattr(mcp_server, "_get_agent_id", lambda: caller)
     return await mcp_server.memclaw_manage(op="read", memory_id=str(mid))
 
@@ -205,7 +198,7 @@ def as_agent(monkeypatch):
     """
     from core_api.app import app
     from core_api.auth import AuthContext, get_auth_context
-    from core_api.db.session import set_current_tenant
+    from core_api.tenant_context import set_current_tenant
 
     def _install(tenant_id: str, agent_id: str | None):
         async def _dep():
@@ -225,19 +218,22 @@ def as_agent(monkeypatch):
     _app.dependency_overrides.pop(_gac, None)
 
 
-async def _write(client, headers, tenant_id, *, agent_id, fleet_id, visibility, content=None):
-    resp = await client.post(
-        "/api/v1/memories",
-        json={
-            "tenant_id": tenant_id,
-            "content": content or f"row {uuid.uuid4().hex[:8]}",
-            "agent_id": agent_id,
-            "fleet_id": fleet_id,
-            "visibility": visibility,
-            "memory_type": "fact",
-        },
-        headers=headers,
-    )
+async def _write(client, headers, tenant_id, *, agent_id, fleet_id, visibility, content=None, write_mode=None):
+    body = {
+        "tenant_id": tenant_id,
+        "content": content or f"row {uuid.uuid4().hex[:8]}",
+        "agent_id": agent_id,
+        "fleet_id": fleet_id,
+        "visibility": visibility,
+        "memory_type": "fact",
+    }
+    # write_mode="strong" keeps embedding/indexing synchronous, so a search
+    # immediately after the write is deterministic (see test_a13). Omitted by
+    # default — only search-after-write tests need it; the by-id/list tests
+    # read from the DB directly and are unaffected.
+    if write_mode is not None:
+        body["write_mode"] = write_mode
+    resp = await client.post("/api/v1/memories", json=body, headers=headers)
     assert resp.status_code == 201, resp.text
     return resp.json()["id"]
 
@@ -332,9 +328,11 @@ async def test_rest_search_scope_agent_uses_authenticated_identity(client, as_ag
 
     tenant_id, headers = get_test_auth()
     marker = f"PRIVATEMARKER{uuid.uuid4().hex[:10]}"
+    content = f"alice private note {marker}"
     priv = await _write(
         client, headers, tenant_id, agent_id="alice", fleet_id="fleet-alpha",
-        visibility="scope_agent", content=f"alice private note {marker}",
+        visibility="scope_agent", content=content,
+        write_mode="strong",  # synchronous embedding ⇒ the row is searchable immediately (de-flakes)
     )
 
     async def _search(query):
@@ -342,11 +340,17 @@ async def test_rest_search_scope_agent_uses_authenticated_identity(client, as_ag
         assert r.status_code == 200, r.text
         return [m["id"] for m in r.json()["items"]]
 
+    # Query the row's EXACT content, not just the bare marker. The deterministic
+    # word-set fake embedder makes that a similarity-1.0 hit, so alice's freshly
+    # written row clears any relevance cutoff and is returned — the assertions
+    # then depend only on the scope_agent VISIBILITY filter, not on stochastic
+    # vector-rank ordering over the shared test corpus. (A marker-only query
+    # ranked the row out of top_k and flaked: "author cannot see own row".)
     as_agent(tenant_id, "bob")
-    assert priv not in await _search(marker), "scope_agent row leaked to another agent in search"
+    assert priv not in await _search(content), "scope_agent row leaked to another agent in search"
 
     as_agent(tenant_id, "alice")
-    assert priv in await _search(marker), "author cannot see own scope_agent row in search"
+    assert priv in await _search(content), "author cannot see own scope_agent row in search"
 
 
 # ---------------------------------------------------------------------------

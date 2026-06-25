@@ -1,19 +1,22 @@
 [project]
 name = "core-api"
-version = "2.14.0"
+version = "2.17.0"
 description = "MemClaw Core API service"
 license = "Apache-2.0"
 requires-python = ">=3.12"
 dependencies = [
+    # FastAPI 0.137+ is OK since #364 made the startup guard read app.openapi()
+    # instead of walking app.routes (0.137's include_router mounts a sub-app,
+    # hiding prefixed paths from app.routes). The committed uv.lock pins the exact
+    # version; this range only bounds future re-locks.
     "fastapi>=0.115,<1",
     "uvicorn[standard]>=0.34,<1",
     "sqlalchemy[asyncio]>=2.0,<3",
-    # SQLAlchemy[asyncio] pulls in greenlet. Pin <3.5.0 — greenlet 3.5.0
-    # shipped wheels for macOS/Windows ARM only, no Linux x86_64, so CI
-    # (which uses ``uv pip install`` and re-resolves rather than reading
-    # the lockfile) breaks on the Linux runner. Drop once 3.5.x has full
-    # platform coverage.
-    "greenlet<3.5.0",
+    # SQLAlchemy[asyncio] pulls in greenlet. greenlet 3.5.0 shipped wheels for
+    # macOS/Windows ARM only (no Linux x86_64) which broke the Linux runner, but
+    # 3.5.1 restored the Linux x86_64 wheels — so the old <3.5.0 cap is lifted to
+    # <3.6.0 (kept only as a major-version guardrail).
+    "greenlet<3.6.0",
     "asyncpg>=0.30,<1",
     "pgvector>=0.3,<1",
     "alembic>=1.14,<2",
@@ -31,22 +34,20 @@ dependencies = [
     "pyotp>=2.9",
     "cachetools>=5.3",
     "croniter>=2.0",
-    "redis[hiredis]>=5.0,<6",
+    # redis-py cap lifted <6 -> <9 (lock resolves 8.0.0). 8.x dropped its pyjwt
+    # transitive and reworked the connection pool, but core-api only uses
+    # ``redis.asyncio.from_url`` (cache.py) and ``r.pipeline(transaction=False)``
+    # (providers/redis_stm.py) — both stable across the 5->8 jump and exercised by
+    # the full test suite under 8.0.0. <9 keeps the next major out as a guardrail.
+    "redis[hiredis]>=5.0,<9",
     "slowapi>=0.1.9,<1.0",
     "sentry-sdk[fastapi]>=2.0,<3",
-    "structlog>=25.4,<26",
+    "structlog>=25.4,<27",
     # PR #7 (Tier-1 ingest A4): structure-aware document chunking.
     # All three are pure-Python (no system C deps); together ~1 MB.
     "markdown-it-py>=4.0,<5",  # markdown AST walker
     "tiktoken>=0.10,<1",  # cl100k_base token counter for size caps
     "pysbd>=0.3,<1",  # sentence boundary detection for sub-chunk splits
-    # PR #8 (Tier-1 ingest, optional multi-format): Kreuzberg replaces
-    # what would otherwise be pypdf + python-docx + python-pptx + … (88+
-    # formats). Provides ``extract_bytes(data, mime) -> ExtractionResult``;
-    # text-PDF works out of the box, scanned-PDF OCR requires Tesseract on
-    # the host (deferred to a follow-up — image-only PDFs raise 422 for now).
-    # License Elastic-2.0.
-    "kreuzberg>=4.9,<5",
     # PR #9: FastAPI's UploadFile / Form support needs python-multipart at
     # runtime. Pulled in transitively today via ``mcp`` but declaring
     # explicitly so removing/upgrading mcp can't silently break uploads.
@@ -57,16 +58,22 @@ dependencies = [
 # Optional: required only when EVENT_BUS_BACKEND=pubsub (SaaS deployments).
 # Standalone installs default to the in-process bus and don't need this.
 pubsub = ["google-cloud-pubsub>=2.23,<3"]
+# Optional: multi-format document extraction for the /ingest/* endpoints.
+# Kreuzberg (~64MB, Elastic-2.0) is excluded from the default image to cut
+# cold-start pull + import time — the ingest endpoints return 501 without it
+# (see core_api.services.ingest_service guarded import). Build with
+# `--extra ingest` (Dockerfile: --build-arg WITH_INGEST=1) to enable ingest.
+ingest = ["kreuzberg>=4.9,<5"]
 dev = [
-    "core-api[test,pubsub]",
-    "mypy>=1.13,<2.0",
+    "core-api[test,pubsub,ingest]",
+    "mypy>=1.13,<3.0",
     "ruff>=0.8,<1.0",
     "types-croniter>=2.0",
 ]
 test = [
-    "pytest>=8.3,<9.0",
-    "pytest-asyncio>=0.24,<1.0",
-    "pytest-cov>=6.0,<7.0",
+    "pytest>=8.3,<10.0",
+    "pytest-asyncio>=0.24,<2.0",
+    "pytest-cov>=6.0,<8.0",
     "httpx>=0.27,<1.0",
     "aiosqlite>=0.20,<1.0",
 ]
@@ -134,7 +141,6 @@ ignore_errors = true
 
 [[tool.mypy.overrides]]
 module = [
-    "core_api.repositories.*",
     "core_api.providers.local_embedding",
     "core_api.providers._registry",
     "core_api.services.*",
@@ -145,7 +151,6 @@ module = [
     "core_api.mcp_server",
     "core_api.app",
     "core_api.auth",
-    "core_api.db.session",
 ]
 ignore_errors = true
 

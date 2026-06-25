@@ -22,20 +22,23 @@ Cross-worker invalidation is tracked as a follow-up (see CAURA-571).
 from __future__ import annotations
 
 import logging
-from typing import Any
+from dataclasses import dataclass
 
 from cachetools import TTLCache
 from croniter import CroniterBadCronError, croniter
-from sqlalchemy import func, select, text
-from sqlalchemy.dialects.postgresql import insert as pg_insert
-from sqlalchemy.ext.asyncio import AsyncSession
 
+from common.events.base import Event
+from common.events.factory import get_event_bus
 from common.events.lifecycle_purge_request import (
     MEMORY_RETENTION_MAX_DAYS,
     MEMORY_RETENTION_MIN_DAYS,
 )
-from common.models.organization_settings import OrganizationSettings, OrganizationSettingsAudit
+from common.events.org_settings_changed_event import OrgSettingsChangedEvent
+from common.events.topics import Topics
+from common.governance import PIICategory
+from common.organization_settings_merge import deep_merge as _deep_merge
 from common.provider_names import ProviderName
+from core_api.clients.storage_client import get_storage_client
 from core_api.config import settings as global_settings
 
 logger = logging.getLogger(__name__)
@@ -101,6 +104,13 @@ DEFAULT_SETTINGS: dict = {
     # corpus has grown.
     "insights": {
         "auto_insights_enabled": None,
+    },
+    "observability": {
+        # Opt-in (default off). When on, each agent-chosen ``memclaw_recall``
+        # call is logged (query + scope + candidate scores) to ``recall_event``
+        # / ``recall_candidate`` for "why aren't good memories recalled?"
+        # analysis. The plugin's automatic ``/search`` is never logged.
+        "recall_logging_enabled": None,
     },
     "chunking": {
         "auto_chunk_enabled": None,
@@ -224,6 +234,75 @@ DEFAULT_SETTINGS: dict = {
         "work",
         "code",
     ],
+    # Ingestion-boundary content governance (eToro). Opt-in: booleans default
+    # False and the action/disposition default to the safe, non-destructive
+    # choice (flag / store) so enabling the feature later is a deliberate step.
+    # ``pii.categories`` toggles which detector categories are in scope; when
+    # PII is enabled with NO category selected, the gate scans ALL categories
+    # (the secure default — enabling protection shouldn't silently protect
+    # nothing). See ``ResolvedConfig.governance_pii``.
+    #
+    # Two paths back the PII ``action`` (mask/drop/flag), with different recall:
+    #   1. Deterministic, span-aware validators (``GovernanceScanContent``):
+    #      regex/Luhn/IBAN/entropy. The strong, fail-closed path for structured
+    #      PII (email/phone/cards/IBAN/keys), and the only one that can honestly
+    #      ``mask`` (it has span offsets). Precision confirmed; high recall on
+    #      the patterns it covers.
+    #   2. The enrichment LLM's free-form ``contains_pii`` signal
+    #      (``GovernanceDecision``): catches unstructured/contextual PII the
+    #      patterns can't (e.g. "X is in addiction recovery"), but its RECALL is
+    #      bounded by the enrichment model — a small/cheap model (e.g. *-nano)
+    #      under-detects subtly-phrased free-form PII. A tenant relying on
+    #      ``drop``/``mask`` to catch FREE-FORM PII should set a capable
+    #      ``enrichment.model``; the deterministic path stays the precise
+    #      backstop, but free-form coverage is only as strong as that model's
+    #      recall. (The LLM path has no offsets, so a ``mask`` policy can only
+    #      flag a free-form match — see ``llm_pii_audit_detail`` /
+    #      ``configured_action``.)
+    "governance": {
+        "pii": {
+            "enabled": False,
+            "action": None,  # None → "flag"; one of mask | drop | flag
+            "categories": {
+                "email": False,
+                "phone": False,
+                "credit_card": False,
+                "iban": False,
+                "national_id": False,
+                "api_key": False,
+                "secret": False,
+            },
+        },
+        "non_business": {
+            "enabled": False,
+            "disposition": None,  # None → "store"; one of drop | keep_private | store
+            # Fast pre-gate (opt-in): a cheap business-vs-personal go/no-go that
+            # runs BEFORE enrichment / embedding / entity extraction and rejects
+            # personal content early when ``disposition="drop"``. Disabled by
+            # default like every other security control. Its own provider/model
+            # so the signal is independent of the enrichment provider (survives
+            # ``enrichment_provider=none``, e.g. CI). ``min_confidence`` None →
+            # act on any "personal" verdict. Raising it makes the pre-gate SKIP
+            # the early drop for low-confidence "personal" verdicts and defer
+            # them to the more accurate post-enrichment gate; it does NOT add a
+            # confidence floor to the final decision (that backstop drops any
+            # "personal" verdict unconditionally — there is no enrichment
+            # confidence to gate on). So it trades a little extra compute for
+            # fewer *early* rejects on borderline content, not a blanket
+            # reduction in drops. ``fail_closed`` False → fail-open: a classifier
+            # failure/timeout never blocks a write (the post-enrichment gate
+            # remains the backstop). Set ``fail_closed`` True so a tenant that
+            # requires enforcement REJECTS writes (503) when the classifier is
+            # unavailable rather than storing unclassified content.
+            "pregate": {
+                "enabled": False,
+                "provider": None,
+                "model": None,
+                "min_confidence": None,
+                "fail_closed": False,
+            },
+        },
+    },
     "api_keys": {},
 }
 
@@ -301,50 +380,53 @@ def _remap_vertex(provider: str) -> str:
 _settings_cache: TTLCache[str, dict] = TTLCache(maxsize=10_000, ttl=300)
 
 
-def _deep_merge(old: Any, new: Any) -> Any:
-    """Return ``old`` with ``new`` merged recursively for nested dicts.
-
-    Non-dict values in ``new`` overwrite ``old`` wholesale (including lists).
-    """
-    if not isinstance(old, dict) or not isinstance(new, dict):
-        return new
-    out = dict(old)
-    for k, v in new.items():
-        if isinstance(v, dict) and isinstance(out.get(k), dict):
-            out[k] = _deep_merge(out[k], v)
-        else:
-            out[k] = v
-    return out
-
-
-def _diff_settings(old: dict, new: dict, prefix: str = "") -> dict:
-    """Flat diff: ``{"enrichment.provider": [old, new], ...}``.
-
-    Recurses into nested dicts; treats non-dict values as leaves. Only records
-    keys present in ``new`` whose value differs from ``old``; does not record
-    deletions (updates are additive).
-    """
-    out: dict = {}
-    for k, new_v in new.items():
-        path = f"{prefix}{k}"
-        old_v = old.get(k) if isinstance(old, dict) else None
-        if isinstance(new_v, dict):
-            # Recurse even when the old side is absent, so we always emit flat
-            # leaf keys (e.g. "security_audit.schedule_enabled") rather than a
-            # whole-dict diff ["enrichment": [None, {...}]].
-            old_dict = old_v if isinstance(old_v, dict) else {}
-            out.update(_diff_settings(old_dict, new_v, prefix=f"{path}."))
-        elif new_v != old_v:
-            out[path] = [old_v, new_v]
-    return out
-
-
 def _validate_cron(expr: str) -> None:
     """Raise ``ValueError`` if *expr* is not a valid cron expression."""
     try:
         croniter(expr)
     except (CroniterBadCronError, ValueError) as exc:
         raise ValueError(f"Invalid cron expression {expr!r}: {exc}") from exc
+
+
+_PII_ACTIONS = frozenset({"mask", "drop", "flag"})
+_NON_BUSINESS_DISPOSITIONS = frozenset({"drop", "keep_private", "store"})
+# The fast pre-gate accepts any known LLM provider name (incl. ``none``/``fake``
+# for disable/test). Membership-checked so a typo can't silently disable the gate.
+_PREGATE_PROVIDERS = frozenset(p.value for p in ProviderName)
+
+
+def _validate_governance_enums(payload: dict) -> None:
+    """Raise ``ValueError`` for governance enum values outside their allowed set.
+
+    ``_validate_leaf_types`` already pins these to ``str``; this pins the
+    actual allowed values (the leaf-type machinery checks Python types, not
+    value membership).
+    """
+    gov = payload.get("governance")
+    if not isinstance(gov, dict):
+        return
+    action = gov.get("pii", {}).get("action")
+    if action is not None and action not in _PII_ACTIONS:
+        raise ValueError(f"governance.pii.action must be one of {sorted(_PII_ACTIONS)}, got {action!r}")
+    nb = gov.get("non_business", {})
+    disposition = nb.get("disposition")
+    if disposition is not None and disposition not in _NON_BUSINESS_DISPOSITIONS:
+        raise ValueError(
+            f"governance.non_business.disposition must be one of "
+            f"{sorted(_NON_BUSINESS_DISPOSITIONS)}, got {disposition!r}"
+        )
+    pregate = nb.get("pregate", {})
+    provider = pregate.get("provider")
+    if provider is not None and provider not in _PREGATE_PROVIDERS:
+        raise ValueError(
+            f"governance.non_business.pregate.provider must be one of "
+            f"{sorted(_PREGATE_PROVIDERS)}, got {provider!r}"
+        )
+    min_conf = pregate.get("min_confidence")
+    if min_conf is not None and not (0.0 <= min_conf <= 1.0):
+        raise ValueError(
+            f"governance.non_business.pregate.min_confidence must be in [0.0, 1.0], got {min_conf!r}"
+        )
 
 
 def _check_keys(payload: dict, schema: dict, path: str = "") -> None:
@@ -384,6 +466,7 @@ _LEAF_TYPES: dict[str, type | tuple[type, ...]] = {
     "lifecycle.memory_retention_days": int,
     "entity_linking.auto_entity_linking_enabled": bool,
     "insights.auto_insights_enabled": bool,
+    "observability.recall_logging_enabled": bool,
     "chunking.auto_chunk_enabled": bool,
     "agents.require_agent_approval": bool,
     "entity_blocklist": list,
@@ -405,6 +488,25 @@ _LEAF_TYPES: dict[str, type | tuple[type, ...]] = {
     "skills_factory.forge.llm_tokens_per_run": int,
     "skills_factory.forge.max_writes_per_run": int,
     "skills_factory.openclaw_bridge.enabled": bool,
+    # Governance content policy (eToro). Enum values (action / disposition) are
+    # type-checked here as str; their allowed values are checked by
+    # ``_validate_governance_enums`` in update_settings.
+    "governance.pii.enabled": bool,
+    "governance.pii.action": str,
+    "governance.pii.categories.email": bool,
+    "governance.pii.categories.phone": bool,
+    "governance.pii.categories.credit_card": bool,
+    "governance.pii.categories.iban": bool,
+    "governance.pii.categories.national_id": bool,
+    "governance.pii.categories.api_key": bool,
+    "governance.pii.categories.secret": bool,
+    "governance.non_business.enabled": bool,
+    "governance.non_business.disposition": str,
+    "governance.non_business.pregate.enabled": bool,
+    "governance.non_business.pregate.provider": str,
+    "governance.non_business.pregate.model": str,
+    "governance.non_business.pregate.min_confidence": (int, float),
+    "governance.non_business.pregate.fail_closed": bool,
 }
 
 # Inclusive range constraints applied AFTER type validation. Listed
@@ -467,6 +569,45 @@ def _validate_leaf_types(payload: dict, prefix: str = "") -> None:
                     raise ValueError(f"Settings key {path!r} must be in [{lo}, {hi}], got {v!r}")
 
 
+_PII_CATEGORY_VALUES: frozenset[str] = frozenset(c.value for c in PIICategory)
+
+
+@dataclass(frozen=True)
+class _GovPII:
+    """Resolved PII governance policy. ``enabled_categories=None`` means scan
+    ALL categories (the secure default when the feature is on but no category
+    was narrowed); otherwise scan only the listed ones."""
+
+    enabled: bool
+    action: str  # "mask" | "drop" | "flag"
+    enabled_categories: frozenset[PIICategory] | None
+
+
+@dataclass(frozen=True)
+class _GovNB:
+    """Resolved non-business (personal-content) governance policy."""
+
+    enabled: bool
+    disposition: str  # "drop" | "keep_private" | "store"
+
+
+@dataclass(frozen=True)
+class _GovNBPregate:
+    """Resolved fast pre-gate policy: a business/personal go/no-go before
+    enrichment. ``provider``/``model`` None → resolved by the step (falls back to
+    the enrichment provider). ``min_confidence`` None → act on any "personal"
+    verdict; raising it defers low-confidence verdicts to the post-enrichment
+    backstop rather than dropping them early (it does not floor the final drop).
+    ``fail_closed`` → reject the write (503) when the classifier is unavailable
+    instead of failing open."""
+
+    enabled: bool
+    provider: str | None
+    model: str | None
+    min_confidence: float | None
+    fail_closed: bool
+
+
 class ResolvedConfig:
     """Resolves LLM/feature config from organization overrides + global fallbacks."""
 
@@ -481,6 +622,40 @@ class ResolvedConfig:
         # docstring's promise to keep call-site signatures stable until
         # the parameter rename follow-up lands.
         self._ts = org_settings or tenant_settings or {}
+
+    # Governance (eToro content policy)
+    @property
+    def governance_pii(self) -> _GovPII:
+        g = self._ts.get("governance", {}).get("pii", {})
+        cats = g.get("categories", {})
+        selected = frozenset(
+            PIICategory(name) for name, on in cats.items() if on and name in _PII_CATEGORY_VALUES
+        )
+        return _GovPII(
+            enabled=bool(g.get("enabled", False)),
+            action=g.get("action") or "flag",
+            # Empty selection → None → scan all categories (secure default).
+            enabled_categories=selected or None,
+        )
+
+    @property
+    def governance_non_business(self) -> _GovNB:
+        g = self._ts.get("governance", {}).get("non_business", {})
+        return _GovNB(
+            enabled=bool(g.get("enabled", False)),
+            disposition=g.get("disposition") or "store",
+        )
+
+    @property
+    def governance_non_business_pregate(self) -> _GovNBPregate:
+        g = self._ts.get("governance", {}).get("non_business", {}).get("pregate", {})
+        return _GovNBPregate(
+            enabled=bool(g.get("enabled", False)),
+            provider=g.get("provider") or None,
+            model=g.get("model") or None,
+            min_confidence=g.get("min_confidence"),
+            fail_closed=bool(g.get("fail_closed", False)),
+        )
 
     # Enrichment
     @property
@@ -642,6 +817,13 @@ class ResolvedConfig:
     @property
     def auto_insights_enabled(self) -> bool:
         val = self._ts.get("insights", {}).get("auto_insights_enabled")
+        return val if val is not None else False
+
+    # Recall logging — opt-in (default False). When on, agent-chosen
+    # ``memclaw_recall`` calls are logged to recall_event / recall_candidate.
+    @property
+    def recall_logging_enabled(self) -> bool:
+        val = self._ts.get("observability", {}).get("recall_logging_enabled")
         return val if val is not None else False
 
     # Chunking
@@ -814,70 +996,42 @@ def invalidate_cache(tenant_id: str) -> None:
     logger.info("organization_settings cache invalidated for %s", tenant_id)
 
 
-async def resolve_config(db: AsyncSession | None, tenant_id: str) -> ResolvedConfig:
+async def resolve_config(tenant_id: str) -> ResolvedConfig:
     """Resolve config for a tenant: tenant override → global env default.
 
-    ``db`` may be ``None`` for fire-and-forget callers (post-commit
-    contradiction detection, the CAURA-595 ENRICHED consumer) — see
-    :func:`get_raw_settings` for the cold-cache fallback.
+    Settings load through core-storage-api (Fix 2 Phase 0).
     """
-    raw = await get_raw_settings(db, tenant_id)
+    raw = await get_raw_settings(tenant_id)
     return ResolvedConfig(raw)
 
 
-async def get_raw_settings(db: AsyncSession | None, tenant_id: str) -> dict:
+async def get_raw_settings(tenant_id: str) -> dict:
     """Return the tenant's raw override dict, or ``{}`` if no overrides set.
 
-    Cache-first: returns ``{}`` for tenants that have never been configured.
-
-    ``db is None`` is the fire-and-forget path: post-commit detection
-    (the request session has closed), the CAURA-595 ``ENRICHED``
-    consumer (Pub/Sub handler with no ambient request session), and
-    similar callers can pass ``None`` and rely on the cache. On a
-    cache miss with ``db is None`` we open a fresh session here
-    rather than crash with ``AttributeError: 'NoneType' object has
-    no attribute 'execute'`` — which is what happened in production
-    until this fallback landed (CAURA-595 Phase 5a brought the
-    consumer up; cold-start always missed the cache; every event
-    crashed inside detection before this guard).
+    Cache-first (5-min TTL); on a miss, fetched via core-storage-api (Fix 2
+    Phase 0 routed this through the storage client — no direct DB read).
     """
     cached = _settings_cache.get(tenant_id)
     if cached is not None:
         logger.debug("organization_settings cache hit for %s", tenant_id)
         return cached
-
-    if db is None:
-        # Lazy import — db.session imports SQLAlchemy engine which
-        # touches DATABASE_URL at module-import time; keeping this
-        # behind a cache miss means the standalone OSS path that
-        # never hits the cold-cache branch doesn't pay the cost.
-        from core_api.db.session import async_session
-
-        async with async_session() as session:
-            return await _load_and_cache(session, tenant_id)
-
-    return await _load_and_cache(db, tenant_id)
+    return await _load_and_cache(tenant_id)
 
 
-async def _load_and_cache(db: AsyncSession, tenant_id: str) -> dict:
-    result = await db.execute(
-        select(OrganizationSettings.settings).where(OrganizationSettings.org_id == tenant_id)
-    )
-    row = result.scalar_one_or_none()
-    resolved = row if isinstance(row, dict) else {}
+async def _load_and_cache(tenant_id: str) -> dict:
+    resolved = await get_storage_client().get_org_settings(tenant_id)
     _settings_cache[tenant_id] = resolved
-    logger.info("organization_settings cache miss for %s; loaded from DB and cached", tenant_id)
+    logger.info("organization_settings cache miss for %s; loaded via storage-api and cached", tenant_id)
     return resolved
 
 
-async def get_settings_for_display(db: AsyncSession | None, tenant_id: str) -> dict:
+async def get_settings_for_display(tenant_id: str) -> dict:
     """Return ``DEFAULT_SETTINGS`` merged with the tenant's overrides for UI display."""
-    raw = await get_raw_settings(db, tenant_id)
+    raw = await get_raw_settings(tenant_id)
     return _deep_merge(DEFAULT_SETTINGS, raw)
 
 
 async def update_settings(
-    db: AsyncSession,
     tenant_id: str,
     new_settings: dict,
     *,
@@ -888,51 +1042,51 @@ async def update_settings(
     Returns the merged display view (``DEFAULT_SETTINGS`` ⊕ tenant overrides)
     so callers can echo back the resulting state. No-ops when the submitted
     payload introduces no actual changes.
+
+    The transactional upsert (``FOR UPDATE`` read → flat diff → JSONB ``||``
+    merge → audit row, one transaction) runs server-side in core-storage-api
+    (Fix 2 Phase 0). Validation, the TTL-cache invalidate, and the
+    ``SETTINGS_CHANGED`` broadcast stay here.
     """
     _check_keys(new_settings, DEFAULT_SETTINGS)
     _validate_leaf_types(new_settings)
+    _validate_governance_enums(new_settings)
     cron_override = new_settings.get("security_audit", {}).get("schedule_cron")
     if cron_override is not None:
         _validate_cron(cron_override)
 
-    # Read current overrides straight from DB — we don't want to diff against a
-    # stale cache entry, and this path is rare compared to reads.
-    # FOR UPDATE prevents lost-update races under concurrent writes for the same tenant.
-    result = await db.execute(
-        select(OrganizationSettings.settings)
-        .where(OrganizationSettings.org_id == tenant_id)
-        .with_for_update()
-    )
-    current_row = result.scalar_one_or_none()
-    current: dict = current_row if isinstance(current_row, dict) else {}
+    # The diff-against-current + upsert + audit happen in one server-side
+    # transaction (the FOR UPDATE lost-update guard can't span an HTTP read +
+    # write, so it lives in storage-api). ``merged`` is the resulting raw
+    # overrides; ``changed`` is False when the payload was a no-op.
+    result = await get_storage_client().update_org_settings(tenant_id, new_settings, changed_by=changed_by)
+    merged = result["settings"]
+    if not result.get("changed"):
+        # Identical payload — storage wrote nothing; nothing to invalidate or broadcast.
+        return _deep_merge(DEFAULT_SETTINGS, merged)
 
-    diff = _diff_settings(current, new_settings)
-    if not diff:
-        # Identical payload — skip write and audit row entirely.
-        return _deep_merge(DEFAULT_SETTINGS, current)
-
-    merged = _deep_merge(current, new_settings)
-
-    # FOR UPDATE serialises all writes once the row exists. Concurrent first-time
-    # inserts (no row yet) use JSONB || to merge at the DB level so two racing
-    # inserts don't silently overwrite each other. The shallow || merge is safe
-    # because top-level schema keys (enrichment, recall, …) are independent.
-    upsert = pg_insert(OrganizationSettings).values(org_id=tenant_id, settings=merged)
-    await db.execute(
-        upsert.on_conflict_do_update(
-            index_elements=["org_id"],
-            set_={
-                "settings": text("organization_settings.settings || EXCLUDED.settings"),
-                "updated_at": func.now(),
-            },
-        )
-    )
-    await db.execute(
-        pg_insert(OrganizationSettingsAudit).values(org_id=tenant_id, changed_by=changed_by, diff=diff)
-    )
-    await db.commit()
-
-    # Local invalidation — other workers pick up the change within TTL.
+    # Invalidate THIS process's cache immediately...
     invalidate_cache(tenant_id)
+    # ...and broadcast so every other worker/instance drops its copy promptly
+    # too (CAURA-571), instead of serving the stale value for up to the TTL —
+    # which matters for a tightened governance control. Best-effort: a publish
+    # failure must not fail a settings write that already committed; siblings
+    # then fall back to the TTL, exactly as before this change.
+    try:
+        await get_event_bus().publish(
+            Topics.Org.SETTINGS_CHANGED,
+            Event(
+                event_type=Topics.Org.SETTINGS_CHANGED,
+                tenant_id=tenant_id,
+                payload=OrgSettingsChangedEvent(org_id=tenant_id).model_dump(mode="json"),
+            ),
+        )
+    except Exception:
+        logger.warning(
+            "failed to publish settings-changed for %s; sibling workers will "
+            "pick up the change within the cache TTL",
+            tenant_id,
+            exc_info=True,
+        )
 
     return _deep_merge(DEFAULT_SETTINGS, merged)

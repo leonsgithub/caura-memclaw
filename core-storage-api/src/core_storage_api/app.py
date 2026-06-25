@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import logging
 from collections.abc import AsyncIterator
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from common.structlog_config import configure_logging
 from core_storage_api.config import settings
@@ -28,21 +30,27 @@ from core_storage_api.middleware import RejectWritesOnReaderMiddleware
 from core_storage_api.routers import (
     agents_router,
     audit_router,
+    capability_usage_router,
     debug_router,
     documents_router,
     entities_router,
+    evolve_router,
     fleet_router,
     health_router,
     idempotency_router,
+    insights_router,
     keystones_router,
     lifecycle_audit_router,
     memories_router,
+    organization_settings_router,
     preview_router,
     procedures_router,
     purge_router,
     reports_router,
+    skill_factory_router,
     tasks_router,
     tenant_suppression_router,
+    tenants_router,
 )
 
 logger = logging.getLogger(__name__)
@@ -79,6 +87,14 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
         redirect_slashes=False,
     )
+
+    @app.exception_handler(json.JSONDecodeError)
+    async def _malformed_json_handler(request: Request, exc: json.JSONDecodeError) -> JSONResponse:
+        # Every router parses the body with a bare ``await request.json()``;
+        # malformed JSON would otherwise surface as an unhandled 500. Convert it
+        # to a fail-closed 422 app-wide so the body-validation contract holds at
+        # the transport layer too (rather than guarding 100+ call sites).
+        return JSONResponse(status_code=422, content={"detail": "request body must be valid JSON"})
 
     # Order matters: Starlette executes middlewares in reverse registration
     # order (last added = outermost). Register the reader filter FIRST so
@@ -121,10 +137,31 @@ def create_app() -> FastAPI:
     app.include_router(fleet_router, prefix=prefix)
     app.include_router(audit_router, prefix=prefix)
     app.include_router(reports_router, prefix=prefix)
+    # Fix 2 Ph5a: skill-factory pipeline reads/writes (forge poison,
+    # session traces, outcome-signal analytic reads) moved off core-api's
+    # direct DB pool. core-api calls these via its storage_client.
+    app.include_router(skill_factory_router, prefix=prefix)
+    # Fix 2 Ph5b: insights analytic memory reads + supersede/restore writes +
+    # the lifecycle activity gate, moved off core-api's direct DB pool. core-api
+    # calls these via its storage_client; the LLM analysis + numpy k-means stay
+    # client-side.
+    app.include_router(insights_router, prefix=prefix)
+    # Fix 2 Ph5b (PR2): evolve scope-filter read + the atomic weight-adjust/
+    # backfill write, moved off core-api's direct DB pool. core-api calls these
+    # via its storage_client; the rule-generation LLM round-trip stays
+    # client-side.
+    app.include_router(evolve_router, prefix=prefix)
     app.include_router(tasks_router, prefix=prefix)
     app.include_router(idempotency_router, prefix=prefix)
     app.include_router(lifecycle_audit_router, prefix=prefix)
     app.include_router(procedures_router, prefix=prefix)
+    # Fix 2 Phase 0: per-org settings read/write, moved off core-api's
+    # direct DB pool. core-api calls these via its storage_client and keeps
+    # the TTL cache / SETTINGS_CHANGED publish / validators client-side.
+    app.include_router(organization_settings_router, prefix=prefix)
+    # Fix 2 Phase 1: tenant-discovery lists for the lifecycle fanout, moved off
+    # core-api's direct DB pool (active / purgeable / skills-factory-enabled).
+    app.include_router(tenants_router, prefix=prefix)
     app.include_router(purge_router, prefix=prefix)
     # CAURA-696: per-tenant row counts for the deletion-preview panel.
     # Mirrors ``purge``'s VPC-only trust model: no router-level auth,
@@ -140,6 +177,11 @@ def create_app() -> FastAPI:
     # Behind the same private-VPC posture as everything else here —
     # not exposed via the gateway.
     app.include_router(debug_router, prefix=prefix)
+    # Fix 2 final-cleanup (PR1): adoption-counter flush, moved off core-api's
+    # direct DB pool. Intentionally cross-tenant / RLS-free (migration 023) —
+    # one flush batch carries many tenants' counters. core-api's in-process
+    # aggregator POSTs here on its flush interval via the storage_client.
+    app.include_router(capability_usage_router, prefix=prefix)
 
     return app
 

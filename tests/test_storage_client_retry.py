@@ -22,13 +22,14 @@ keys storage-side.
 
 Retry policy
 ────────────
-- Max 3 attempts (1 initial + 2 retries)
+- Idempotent methods: max 3 attempts (1 initial + 2 retries)
+- Connection-phase (POST) failures: max ``CONNECT_PHASE_MAX_ATTEMPTS`` (5) —
+  they add no server load, so retrying more rides out a cold start
 - Retryable exceptions: ``httpx.ConnectTimeout``, ``httpx.ReadTimeout``,
   ``httpx.PoolTimeout`` (idempotent methods); connection-phase subset
   for POST
 - Retryable HTTP statuses: 502, 503, 504 (idempotent methods only)
-- Exponential backoff with small jitter, capped: ~0.2s, ~0.4s
-- Worst-case added latency: < 1s
+- Exponential backoff with small jitter, capped at ``RETRY_BACKOFF_MAX_S``
 """
 
 from __future__ import annotations
@@ -102,14 +103,20 @@ async def test_get_retries_on_connect_timeout_then_succeeds() -> None:
 async def test_get_retries_then_gives_up_after_max_attempts() -> None:
     """When storage stays unreachable, we eventually raise the original
     timeout so the caller (the worker's except-block) still sees a
-    clear failure mode in logs."""
+    clear failure mode in logs. A perma ConnectTimeout is a connection-phase
+    failure, so an idempotent GET rides the higher CONNECT_PHASE_MAX_ATTEMPTS
+    (5) budget — same as POST — to ride out a storage cold start. ReadTimeout
+    / 5xx stay capped at the default 3 (see
+    test_get_logs_giving_up_when_5xx_exhausts_retries)."""
+    from common.http_retry import CONNECT_PHASE_MAX_ATTEMPTS
+
     client, _write, read = await _make_client()
     read.get = AsyncMock(side_effect=httpx.ConnectTimeout("perma down"))
 
     with pytest.raises(httpx.ConnectTimeout):
         await client._get("/entities/exact", read=True)
 
-    assert read.get.await_count == 3  # 1 initial + 2 retries = max attempts
+    assert read.get.await_count == CONNECT_PHASE_MAX_ATTEMPTS == 5
 
 
 async def test_get_retries_on_connect_error_then_succeeds() -> None:
@@ -146,6 +153,24 @@ async def test_get_retries_on_5xx_status() -> None:
 
     assert result == {"id": "abc"}
     assert read.get.await_count == 2
+
+
+async def test_get_logs_giving_up_when_5xx_exhausts_retries(caplog) -> None:
+    """All attempts returning a retryable status must emit the same
+    "giving up" signal as the exception-exhaustion path — a 3x-502
+    incident should read as exhausted retries in the logs, not just a
+    bare HTTPStatusError from the caller."""
+    import logging
+
+    client, _write, read = await _make_client()
+    read.get = AsyncMock(return_value=_ok_response(502))
+
+    with caplog.at_level(logging.WARNING, logger="common.http_retry"):
+        with pytest.raises(httpx.HTTPStatusError):
+            await client._get("/entities/exact", read=True)
+
+    assert read.get.await_count == 3
+    assert any("giving up" in r.message for r in caplog.records), caplog.records
 
 
 async def test_get_does_not_retry_on_success_first_try() -> None:
@@ -265,13 +290,21 @@ async def test_post_retries_on_connect_error_then_succeeds() -> None:
 
 
 async def test_post_gives_up_after_max_attempts_on_connect_timeout() -> None:
+    """Connection-phase failures retry CONNECT_PHASE_MAX_ATTEMPTS (5) times —
+    more than the ReadTimeout/5xx default (3, see
+    test_get_logs_giving_up_when_5xx_exhausts_retries) — because a connect
+    failure was provably never sent: it adds no load to a healthy server and
+    just rides out a cold start. Idempotent GETs share this connect-phase
+    budget too (see test_get_retries_then_gives_up_after_max_attempts)."""
+    from common.http_retry import CONNECT_PHASE_MAX_ATTEMPTS
+
     client, write, _read = await _make_client()
     write.post = AsyncMock(side_effect=httpx.ConnectTimeout("storage unreachable"))
 
     with pytest.raises(httpx.ConnectTimeout):
         await client._post("/entities", {"canonical_name": "x"})
 
-    assert write.post.await_count == 3
+    assert write.post.await_count == CONNECT_PHASE_MAX_ATTEMPTS == 5
 
 
 async def test_post_does_not_retry_on_read_timeout() -> None:
@@ -311,4 +344,65 @@ async def test_post_optional_retries_on_connect_timeout_then_succeeds() -> None:
     result = await client._post_optional("/verification-codes/c1/use")
 
     assert result == {"ok": True}
+    assert write.post.await_count == 2
+
+
+async def test_backoff_delay_cap_is_a_hard_ceiling() -> None:
+    """``RETRY_BACKOFF_MAX_S`` is a HARD ceiling — jitter is applied before the
+    cap, so no single backoff sleep exceeds it even at the highest attempt.
+    (Regression: capping before jitter let the real ceiling reach MAX * 1.1.)"""
+    from common.http_retry import RETRY_BACKOFF_MAX_S, _backoff_delay
+
+    # Attempts 5+ saturate the cap; sample widely to catch the jittered maximum.
+    for attempt in range(1, 9):
+        for _ in range(200):
+            assert 0.0 <= _backoff_delay(attempt) <= RETRY_BACKOFF_MAX_S
+
+
+# ---------------------------------------------------------------------------
+# Audit bulk flush — idempotent POST retries the FULL transient set
+# ---------------------------------------------------------------------------
+#
+# Each event carries a ``client_event_id`` and storage dedups on it under the
+# per-tenant chain-head lock, so a retry of a lost-ack batch can't double-append
+# to the tamper-evident hash chain. That makes ReadTimeout / 5xx safe to retry
+# for create_audit_logs_bulk (idempotent=True) — unlike a bare POST, which must
+# raise on those because the request may have committed (the POST tests above).
+# Recovers the silent audit-slice drop from the connect-phase-only path.
+
+_AUDIT_EVENT = {
+    "tenant_id": "t",
+    "action": "a",
+    "resource_type": "r",
+    "client_event_id": "ev-1",
+}
+
+
+async def test_audit_bulk_retries_on_read_timeout_then_succeeds() -> None:
+    client, write, _read = await _make_client()
+    write.post = AsyncMock(
+        side_effect=[
+            httpx.ReadTimeout("response never arrived"),
+            _ok_response(200, {"ok": True, "count": 1}),
+        ]
+    )
+
+    result = await client.create_audit_logs_bulk([dict(_AUDIT_EVENT)])
+
+    assert result == {"ok": True, "count": 1}
+    assert write.post.await_count == 2
+
+
+async def test_audit_bulk_retries_on_5xx_then_succeeds() -> None:
+    client, write, _read = await _make_client()
+    write.post = AsyncMock(
+        side_effect=[
+            _ok_response(503),
+            _ok_response(200, {"ok": True, "count": 1}),
+        ]
+    )
+
+    result = await client.create_audit_logs_bulk([dict(_AUDIT_EVENT)])
+
+    assert result == {"ok": True, "count": 1}
     assert write.post.await_count == 2

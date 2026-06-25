@@ -114,7 +114,15 @@ class TestEnumConstants:
     def test_allowed_statuses(self):
         # Mirrors plan §5 lifecycle states.
         assert ALLOWED_STATUSES == frozenset(
-            {"candidate", "staged", "active", "rejected", "quarantined", "stale", "deprecated"}
+            {
+                "candidate",
+                "staged",
+                "active",
+                "rejected",
+                "quarantined",
+                "stale",
+                "deprecated",
+            }
         )
 
     def test_admin_only_partitions(self):
@@ -232,9 +240,13 @@ class TestDescriptionCap:
         char = "€"  # 3 UTF-8 bytes each
         s = char * 54  # 162 bytes > 160
         with pytest.raises(HTTPException):
-            await validate_and_normalize_skill_write(_valid_doc(description=s), ctx=_agent_ctx())
+            await validate_and_normalize_skill_write(
+                _valid_doc(description=s), ctx=_agent_ctx()
+            )
         s_ok = char * 53  # 159 bytes
-        out, _ = await validate_and_normalize_skill_write(_valid_doc(description=s_ok), ctx=_agent_ctx())
+        out, _ = await validate_and_normalize_skill_write(
+            _valid_doc(description=s_ok), ctx=_agent_ctx()
+        )
         assert out["description"] == s_ok
 
     @pytest.mark.asyncio
@@ -465,7 +477,9 @@ class TestAutoFill:
         # session_key, run_id, message_id are client-provided and
         # should pass through unchanged.
         out, _ = await validate_and_normalize_skill_write(
-            _valid_doc(origin={"session_key": "sk-1", "run_id": "r-2", "message_id": "m-3"}),
+            _valid_doc(
+                origin={"session_key": "sk-1", "run_id": "r-2", "message_id": "m-3"}
+            ),
             ctx=_agent_ctx(caller_agent_id="alice"),
         )
         assert out["origin"]["session_key"] == "sk-1"
@@ -475,7 +489,9 @@ class TestAutoFill:
 
     @pytest.mark.asyncio
     async def test_timestamps_filled(self):
-        out, _ = await validate_and_normalize_skill_write(_valid_doc(), ctx=_agent_ctx())
+        out, _ = await validate_and_normalize_skill_write(
+            _valid_doc(), ctx=_agent_ctx()
+        )
         assert "created_at" in out
         assert "updated_at" in out
 
@@ -522,13 +538,19 @@ class TestHashBindingAndScan:
             await validate_and_normalize_skill_write(
                 _valid_doc(
                     kind="update",
-                    target={"slug": "test-skill", "target_content_hash": "sha256:CALLER"},
+                    target={
+                        "slug": "test-skill",
+                        "target_content_hash": "sha256:CALLER",
+                    },
                 ),
                 ctx=_agent_ctx(),
                 live_skill_doc={"data": {"content_hash": "sha256:LIVE"}},
             )
         assert exc.value.status_code == 409
-        assert "mismatch" in str(exc.value.detail).lower() or "changed" in str(exc.value.detail).lower()
+        assert (
+            "mismatch" in str(exc.value.detail).lower()
+            or "changed" in str(exc.value.detail).lower()
+        )
 
     @pytest.mark.asyncio
     async def test_update_hash_match_succeeds(self):
@@ -550,7 +572,10 @@ class TestHashBindingAndScan:
             await validate_and_normalize_skill_write(
                 _valid_doc(
                     kind="update",
-                    target={"slug": "test-skill", "target_content_hash": "sha256:WHATEVER"},
+                    target={
+                        "slug": "test-skill",
+                        "target_content_hash": "sha256:WHATEVER",
+                    },
                 ),
                 ctx=_agent_ctx(),
                 live_skill_doc={"data": {"name": "Imported", "source": "imported"}},
@@ -559,7 +584,9 @@ class TestHashBindingAndScan:
 
     @pytest.mark.asyncio
     async def test_scan_result_attached_clean(self):
-        out, scan = await validate_and_normalize_skill_write(_valid_doc(), ctx=_agent_ctx())
+        out, scan = await validate_and_normalize_skill_write(
+            _valid_doc(), ctx=_agent_ctx()
+        )
         assert "scan" in out
         assert out["scan"]["state"] == "clean"
         assert out["scan"]["critical"] == 0
@@ -580,6 +607,7 @@ class TestRouteSlugRegex:
 
     def _re(self):
         from core_api.routes.documents import _SKILL_SLUG_RE
+
         return _SKILL_SLUG_RE
 
     def test_plain_slug_accepted(self):
@@ -636,13 +664,78 @@ class TestMigrationChain:
     def test_single_head(self):
         chain = self._load()
         heads = set(chain) - {dr for dr in chain.values() if dr is not None}
-        assert heads == {"022"}, f"Expected single head '022', got {sorted(heads)}"
+        assert heads == {"027"}, f"Expected single head '027', got {sorted(heads)}"
 
     def test_skill_factory_chain_links(self):
         chain = self._load()
         assert chain.get("020") == "019", "020 must follow 019"
         assert chain.get("021") == "020", "021 must follow 020"
         assert chain.get("022") == "021", "022 must follow 021"
+        assert chain.get("023") == "022", "023 must follow 022"
+        # 024: fleet_commands auto-upgrade partial index (CAURA-000)
+        assert chain.get("024") == "023", "024 must follow 023"
+        # 025: tamper-evident audit hash chain (eToro governance)
+        assert chain.get("025") == "024", "025 must follow 024"
+        # 026: per-event audit idempotency (client_event_id + partial unique)
+        assert chain.get("026") == "025", "026 must follow 025"
+        # 027: opt-in recall logging (recall_event + recall_candidate)
+        assert chain.get("027") == "026", "027 must follow 026"
+
+    def test_no_plain_create_index_on_large_tables(self):
+        """Indexes on large, pre-existing tables MUST be built ``CONCURRENTLY``
+        (inside an ``op.get_context().autocommit_block()``). A plain,
+        in-transaction ``CREATE INDEX`` takes an AccessExclusive lock that blocks
+        writes AND holds the migration advisory lock for the whole build — which
+        crashed 6 storage-writer boots on 2026-06-16 (migration 025 indexed
+        ``audit_log`` without CONCURRENTLY). This guards the raw-SQL
+        ``op.execute("CREATE INDEX ...")`` path on the known-large tables; indexes
+        created on a brand-new table in the same migration are unaffected."""
+        import re
+
+        large_tables = {
+            "audit_log",
+            "memories",
+            "entities",
+            "documents",
+            "memory_entity_links",
+            "relations",
+        }
+        # The CONCURRENTLY convention for indexes on already-populated large
+        # tables is enforced from migration 005 onward (see 005/007/011/016/017).
+        # 001–004 build the initial schema and index tables that are empty at
+        # creation, so a plain CREATE INDEX there is harmless. 025 postdates the
+        # convention but predates enforcement and is already applied in prod (the
+        # index exists; the migration can't be rewritten) — documented debt.
+        convention_from = 5
+        applied_debt = {25}
+        # CREATE [UNIQUE] INDEX [CONCURRENTLY] [IF NOT EXISTS] <name> ON <table>
+        pat = re.compile(
+            r"CREATE\s+(?:UNIQUE\s+)?INDEX\s+(CONCURRENTLY\s+)?"
+            r"(?:IF\s+NOT\s+EXISTS\s+)?\w+\s+ON\s+(\w+)",
+            re.IGNORECASE,
+        )
+        versions = pathlib.Path(
+            "core-storage-api/src/core_storage_api/database/migrations/versions"
+        )
+        violations: list[str] = []
+        for f in sorted(versions.glob("*.py")):
+            prefix = f.stem.split("_")[0]
+            if (
+                not prefix.isdigit()
+                or int(prefix) < convention_from
+                or int(prefix) in applied_debt
+            ):
+                continue
+            for concurrently, table in pat.findall(f.read_text()):
+                if table.lower() in large_tables and not concurrently:
+                    violations.append(f"{f.name}: plain CREATE INDEX on '{table}'")
+        assert not violations, (
+            "Plain (non-CONCURRENTLY) CREATE INDEX on a large table blocks writes "
+            "and holds the migration advisory lock for the whole build (crashed "
+            "storage-writer boots on 2026-06-16). Use CREATE INDEX CONCURRENTLY in "
+            "an op.get_context().autocommit_block() — see migration 007 / 026. "
+            f"Violations: {'; '.join(violations)}"
+        )
 
 
 @pytest.mark.unit
@@ -803,7 +896,7 @@ class TestMigration022Sentinel:
         upgrade_section = src.split("def upgrade")[1].split("def downgrade")[0]
         assert upgrade_section.count("'_migrated_by'") == 2, (
             "Only Branches 1+2 should stamp _migrated_by; "
-            f"got {upgrade_section.count(chr(39)+chr(95)+'migrated_by'+chr(39))} occurrences"
+            f"got {upgrade_section.count(chr(39) + chr(95) + 'migrated_by' + chr(39))} occurrences"
         )
 
     def test_downgrade_filters_by_sentinel(self):

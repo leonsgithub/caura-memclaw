@@ -12,12 +12,8 @@ from datetime import UTC, datetime
 from urllib.parse import urlparse
 
 import httpx
-import kreuzberg
 from fastapi import HTTPException
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from common.models.memory import Memory
 from core_api.clients.storage_client import get_storage_client
 from core_api.config import settings
 from core_api.constants import MEMORY_TYPES
@@ -36,6 +32,15 @@ from core_api.services.ingest_chunking import (
 )
 from core_api.services.memory_service import _content_hash, create_memories_bulk
 from core_api.services.organization_settings import resolve_config
+
+# Document extraction (PDF / Office / EPUB / …) is an optional ``ingest`` extra:
+# kreuzberg is ~64MB and is excluded from the default image to cut cold-start
+# pull + import time. When absent, the ingest endpoints return 501 (see
+# ``_extract_with_kreuzberg``); every other code path works unchanged.
+try:
+    import kreuzberg
+except ImportError:  # pragma: no cover - only in slim (no-ingest) builds
+    kreuzberg = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -418,7 +423,11 @@ def _check_hostname_safe(url: str) -> None:
 # extracted PDFs/Office docs and produce breadcrumb-tagged sections, instead
 # of dumping one giant plaintext blob. Created once at module load to avoid
 # rebuilding it on every request.
-_KREUZBERG_CFG = kreuzberg.ExtractionConfig(output_format=kreuzberg.OutputFormat.MARKDOWN)
+_KREUZBERG_CFG = (
+    kreuzberg.ExtractionConfig(output_format=kreuzberg.OutputFormat.MARKDOWN)
+    if kreuzberg is not None
+    else None
+)
 
 
 def decode_text_body(body: bytes, mime: str, encoding: str | None = None) -> str:
@@ -458,6 +467,11 @@ async def _extract_with_kreuzberg(body: bytes, mime: str) -> str:
     - Empty extracted content (image-only PDF with no Tesseract installed)
       → 422 — better to fail loudly than to send the LLM 0 bytes.
     """
+    if kreuzberg is None:
+        raise HTTPException(
+            status_code=501,
+            detail="Document ingest is not available in this build — install the 'ingest' extra (kreuzberg).",
+        )
     try:
         result = await kreuzberg.extract_bytes(body, mime, _KREUZBERG_CFG)
     except kreuzberg.ParsingError as e:
@@ -585,38 +599,19 @@ async def _fetch_url_text(url: str) -> str:
     return decode_text_body(body, content_type, encoding)
 
 
-async def _find_prior_ingest_by_doc_hash(db: AsyncSession, tenant_id: str, doc_hash: str) -> list[Memory]:
-    """A2 cache lookup. Returns memories from the most recent prior ingest of
+async def _find_prior_ingest_by_doc_hash(tenant_id: str, doc_hash: str) -> list[dict]:
+    """A2 cache lookup. Returns memory rows from the most recent prior ingest of
     the same content for the same tenant — or empty list if no cache hit.
 
     A "prior ingest" means a non-deleted row whose metadata carries the same
     ``doc_hash`` value and was tagged as ``source="ingest"``. When multiple
-    runs match (the user could have ingested the same content twice in the
-    past), we return the memories tagged with the most-recent ``run_id``.
+    runs match, the storage endpoint returns the rows tagged with the
+    most-recent ``run_id`` (the newest-run filter runs server-side).
     """
-    stmt = (
-        select(Memory)
-        .where(
-            Memory.tenant_id == tenant_id,
-            Memory.metadata_["doc_hash"].astext == doc_hash,
-            Memory.metadata_["source"].astext == "ingest",
-            Memory.deleted_at.is_(None),
-        )
-        .order_by(Memory.created_at.desc())
-    )
-    result = await db.execute(stmt)
-    rows: list[Memory] = list(result.scalars().all())
-    if not rows:
-        return []
-
-    # Pick the most recent run_id from the top-level column. (We dropped the
-    # redundant ``metadata.ingest_run_id`` JSONB write in the parent-doc PR,
-    # so this is now the single source of truth for batch identity.)
-    newest_run_id = rows[0].run_id
-    return [r for r in rows if r.run_id == newest_run_id]
+    return await get_storage_client().find_prior_ingest_by_doc_hash(tenant_id, doc_hash)
 
 
-async def ingest_preview(db: AsyncSession, request: IngestRequest) -> dict:
+async def ingest_preview(request: IngestRequest) -> dict:
     """Preview mode: extract facts from URL or text without writing anything.
 
     Response fields:
@@ -635,7 +630,7 @@ async def ingest_preview(db: AsyncSession, request: IngestRequest) -> dict:
                         and no LLM call was made.
       run_id          — only set when cached=True; the prior ingest_run_id.
     """
-    tenant_config = await resolve_config(db, request.tenant_id)
+    tenant_config = await resolve_config(request.tenant_id)
 
     # Get content
     url = request.url
@@ -665,16 +660,16 @@ async def ingest_preview(db: AsyncSession, request: IngestRequest) -> dict:
     #   3. ``"text-input"`` marker for pasted-content / no-source ingests.
     source_uri_default = request.source_uri or url or "text-input"
     doc_hash = _doc_hash(request.tenant_id, content)
-    cached_memories = await _find_prior_ingest_by_doc_hash(db, request.tenant_id, doc_hash)
+    cached_memories = await _find_prior_ingest_by_doc_hash(request.tenant_id, doc_hash)
     if cached_memories:
-        prior_run_id = cached_memories[0].run_id
+        prior_run_id = cached_memories[0]["run_id"]
         cached_facts = []
         for m in cached_memories:
-            md = m.metadata_ or {}
+            md = m.get("metadata_") or {}
             fact: dict = {
-                "content": m.content,
-                "suggested_type": m.memory_type,
-                "source_uri": m.source_uri or source_uri_default,
+                "content": m["content"],
+                "suggested_type": m["memory_type"],
+                "source_uri": m.get("source_uri") or source_uri_default,
             }
             if md.get("salience") is not None:
                 fact["salience"] = md["salience"]
@@ -909,7 +904,7 @@ async def _write_parent_ingest_document(
         )
 
 
-async def ingest_commit(db: AsyncSession, request: IngestCommitRequest) -> dict:
+async def ingest_commit(request: IngestCommitRequest) -> dict:
     """Commit mode: write previewed facts as memories.
 
     Three correctness/quality moves over the original loop:
@@ -959,11 +954,10 @@ async def ingest_commit(db: AsyncSession, request: IngestCommitRequest) -> dict:
 
     t0 = time.perf_counter()
 
-    # Pre-warm the tenant-config cache. The first cached lookup is the
-    # only one that may touch ``db``; afterwards every per-fact pipeline
-    # hits the in-process TTLCache. Avoids racing on the shared session
-    # when the concurrent writes fan out below.
-    await resolve_config(db, request.tenant_id)
+    # Pre-warm the tenant-config cache so every per-fact pipeline below hits
+    # the in-process TTLCache instead of each issuing its own storage fetch
+    # when the concurrent writes fan out.
+    await resolve_config(request.tenant_id)
 
     # ----- P1.4: pre-loop dedup -----
     # Compute the same content-hash the write pipeline uses for its 409
@@ -1065,7 +1059,7 @@ async def ingest_commit(db: AsyncSession, request: IngestCommitRequest) -> dict:
             items=bulk_items,
         )
         try:
-            bulk_response = await create_memories_bulk(db, bulk_data, bulk_attempt_id=run_id)
+            bulk_response = await create_memories_bulk(bulk_data, bulk_attempt_id=run_id)
             created = bulk_response.created
             skipped_in_loop = bulk_response.duplicates
             errored = bulk_response.errors

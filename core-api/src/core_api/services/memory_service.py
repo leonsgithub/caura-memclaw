@@ -11,11 +11,10 @@ from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncSession
 
 from core_api.clients.storage_client import get_storage_client
 from core_api.config import settings
-from core_api.middleware.per_tenant_concurrency import per_tenant_storage_slot
+from core_api.middleware.per_tenant_concurrency import per_tenant_slot, per_tenant_storage_slot
 from core_api.tasks import track_task
 
 try:
@@ -37,6 +36,7 @@ except ImportError:
 from common.constants import VECTOR_DIM
 from common.embedding import get_embedding, get_embeddings_batch, get_query_embedding
 from common.events import publish_memory_embed_request, publish_memory_enrich_request
+from common.governance import mask, scan
 from core_api.constants import (
     BULK_EMBEDDING_TIMEOUT_SECONDS,
     BULK_ENRICHMENT_CONCURRENCY,
@@ -74,6 +74,14 @@ from core_api.schemas import (
 )
 from core_api.services.entity_extraction_worker import process_entity_extraction
 from core_api.services.entity_tokens import extract_entity_tokens
+from core_api.services.governance_gate import (
+    ACTION_PII_DROP,
+    ACTION_PII_FLAG,
+    ACTION_PII_MASK,
+    emit_governance_audit,
+    mark_pii_flagged,
+    pii_audit_detail,
+)
 from core_api.services.hooks import get_hooks
 from core_api.services.task_tracker import tracked_task
 
@@ -103,7 +111,6 @@ def _auto_chunk_request_id() -> str:
 
 
 async def _find_semantic_duplicate(
-    db: AsyncSession,
     tenant_id: str,
     fleet_id: str | None,
     embedding: list[float],
@@ -227,14 +234,16 @@ def _memory_to_out(
     )
 
 
-async def create_memory(db: AsyncSession, data: MemoryCreate) -> MemoryOut:
+async def create_memory(data: MemoryCreate) -> MemoryOut:
+    if not data.agent_id:
+        raise ValueError("agent_id must be resolved before calling create_memory")
     if _USE_PIPELINE_WRITE:
-        return await _create_memory_pipeline(db, data)
+        return await _create_memory_pipeline(data)
     logger.warning("legacy write path invoked; this path is deprecated and scheduled for removal")
-    return await _create_memory_legacy(db, data)
+    return await _create_memory_legacy(data)
 
 
-async def _create_memory_pipeline(db: AsyncSession, data: MemoryCreate) -> MemoryOut:
+async def _create_memory_pipeline(data: MemoryCreate) -> MemoryOut:
     """Pipeline-based create_memory — same logic, decomposed into timed steps."""
     from core_api.pipeline.compositions.write import (
         build_enrichment_pipeline,
@@ -256,26 +265,34 @@ async def _create_memory_pipeline(db: AsyncSession, data: MemoryCreate) -> Memor
                 status_code=422,
                 detail="STM is not enabled. Set USE_STM=true to enable short-term memory.",
             )
+        # Resolve config so the deterministic governance gate runs on STM too.
+        # STM bypasses enrichment, so only the deterministic scan applies (no
+        # LLM free-form / business-relevance signal) — a scoped limitation.
+        stm_config = await resolve_config(data.tenant_id)
         ctx = PipelineContext(
-            db=db,
             data={"input": data, "t0": time.perf_counter()},
+            tenant_config=stm_config,
         )
         pipeline = build_stm_write_pipeline()
-        await pipeline.run(ctx)
+        result = await pipeline.run(ctx)
+        if result.failed:
+            raise HTTPException(status_code=500, detail="STM write pipeline failed unexpectedly")
         return ctx.data["stm_response"]
 
     # Resolve tenant config BEFORE building the pipeline
-    tenant_config = await resolve_config(db, data.tenant_id)
+    tenant_config = await resolve_config(data.tenant_id)
 
     # Extract-only and auto-chunk branches: always use the original enrichment+persist flow
     if not data.persist or (
         len(data.content) > CHUNKING_THRESHOLD_CHARS and tenant_config.auto_chunk_enabled
     ):
-        ctx = PipelineContext(db=db, data={"input": data, "t0": time.perf_counter()})
+        ctx = PipelineContext(data={"input": data, "t0": time.perf_counter()})
 
         # Phase 1: Enrichment (always runs)
         enrichment_pipeline = build_enrichment_pipeline()
-        await enrichment_pipeline.run(ctx)
+        enrichment_result = await enrichment_pipeline.run(ctx)
+        if enrichment_result.failed:
+            raise HTTPException(status_code=500, detail="Memory enrichment pipeline failed unexpectedly")
 
         fields = ctx.data["memory_fields"]
 
@@ -310,13 +327,12 @@ async def _create_memory_pipeline(db: AsyncSession, data: MemoryCreate) -> Memor
             )
 
         # Branch: auto-chunk
-        return await _handle_auto_chunk_from_ctx(db, data, ctx)
+        return await _handle_auto_chunk_from_ctx(data, ctx)
 
     # Standard persist path: resolve write mode and pick pipeline
     resolved_mode = _resolve_write_mode(data, tenant_config)
 
     ctx = PipelineContext(
-        db=db,
         data={
             "input": data,
             "t0": time.perf_counter(),
@@ -347,10 +363,21 @@ async def _create_memory_pipeline(db: AsyncSession, data: MemoryCreate) -> Memor
     _exc: BaseException | None = None
     try:
         try:
-            await pipeline.run(ctx)
+            result = await pipeline.run(ctx)
         except BaseException as e:
             _exc = e
             raise
+
+        # The runner records a failed step and STOPS without re-raising
+        # (runner.py breaks on StepResult(FAILED)), AND logs it with full
+        # traceback + step/timing. Surface it here instead of falling through
+        # to ``ctx.data["memory"]`` below, which would mask the real failure as
+        # a cryptic ``KeyError: 'memory'`` (e.g. an MCP write whose
+        # ``load_tenant_config`` step raised "requires a DB session"). No
+        # re-log — the runner already logged the failing step.
+        if result.failed:
+            _exc = HTTPException(status_code=500, detail="Memory write pipeline failed unexpectedly")
+            raise _exc
 
         memory = ctx.data["memory"]
         return _memory_to_out(
@@ -380,7 +407,17 @@ async def _create_memory_pipeline(db: AsyncSession, data: MemoryCreate) -> Memor
                 "embedding_ms": timings.get("embedding_ms"),
                 "enrichment_ms": timings.get("enrichment_ms"),
                 "storage_ms": timings.get("storage_ms"),
+                "dedup_lookup_ms": timings.get("dedup_lookup_ms"),
                 "entity_links_ms": timings.get("entity_links_ms"),
+                # Sum of every storage roundtrip on the write path (dedup
+                # lookup + insert + entity-link upsert). ``total_ms`` minus
+                # this is pure core-api-side time — the split that attributes
+                # the single_write p99 tail to storage-DB vs core-api.
+                "storage_total_ms": (
+                    (timings.get("storage_ms") or 0)
+                    + (timings.get("dedup_lookup_ms") or 0)
+                    + (timings.get("entity_links_ms") or 0)
+                ),
                 "total_ms": round((time.perf_counter() - ctx.data["t0"]) * 1000),
                 "embedding_pending": bool(memory_metadata.get("embedding_pending")),
                 "enrichment_pending": bool(memory_metadata.get("enrichment_pending")),
@@ -390,7 +427,7 @@ async def _create_memory_pipeline(db: AsyncSession, data: MemoryCreate) -> Memor
         )
 
 
-async def _handle_auto_chunk_from_ctx(db: AsyncSession, data: MemoryCreate, ctx: object) -> MemoryOut:
+async def _handle_auto_chunk_from_ctx(data: MemoryCreate, ctx: object) -> MemoryOut:
     """Auto-chunking branch using pipeline context enrichment results."""
     from core_api.services.ingest_service import _chunk_content
 
@@ -462,7 +499,6 @@ async def _handle_auto_chunk_from_ctx(db: AsyncSession, data: MemoryCreate, ctx:
         if _hooks.audit_log:
             try:
                 await _hooks.audit_log(
-                    db,
                     tenant_id=data.tenant_id,
                     agent_id=data.agent_id,
                     action="create",
@@ -537,7 +573,9 @@ async def _handle_auto_chunk_from_ctx(db: AsyncSession, data: MemoryCreate, ctx:
     from core_api.pipeline.compositions.write import build_persist_pipeline
 
     persist_pipeline = build_persist_pipeline()
-    await persist_pipeline.run(ctx)
+    persist_result = await persist_pipeline.run(ctx)
+    if persist_result.failed:
+        raise HTTPException(status_code=500, detail="Memory write pipeline failed unexpectedly")
 
     memory = ctx.data["memory"]
     return _memory_to_out(
@@ -546,7 +584,7 @@ async def _handle_auto_chunk_from_ctx(db: AsyncSession, data: MemoryCreate, ctx:
     )
 
 
-async def _create_memory_legacy(db: AsyncSession, data: MemoryCreate) -> MemoryOut:
+async def _create_memory_legacy(data: MemoryCreate) -> MemoryOut:
     # -- Content quality gate -- reject before any LLM work --
     if len(data.content.strip()) < CRYSTALLIZER_SHORT_CONTENT_CHARS:
         raise HTTPException(
@@ -559,7 +597,7 @@ async def _create_memory_legacy(db: AsyncSession, data: MemoryCreate) -> MemoryO
     # -- Resolve per-tenant LLM config (falls back to global) --
     from core_api.services.organization_settings import resolve_config
 
-    tenant_config = await resolve_config(db, data.tenant_id)
+    tenant_config = await resolve_config(data.tenant_id)
 
     # -- Compute content hash early for embedding dedup --
     ch = _content_hash(data.tenant_id, data.fleet_id, data.content) if data.persist else None
@@ -730,7 +768,6 @@ async def _create_memory_legacy(db: AsyncSession, data: MemoryCreate) -> MemoryO
             if _hooks.audit_log:
                 try:
                     await _hooks.audit_log(
-                        db,
                         tenant_id=data.tenant_id,
                         agent_id=data.agent_id,
                         action="create",
@@ -821,7 +858,6 @@ async def _create_memory_legacy(db: AsyncSession, data: MemoryCreate) -> MemoryO
     if tenant_config.semantic_dedup_enabled and embedding is not None:
         t_dedup = time.perf_counter()
         sem_dup = await _find_semantic_duplicate(
-            db,
             data.tenant_id,
             data.fleet_id,
             embedding,
@@ -922,7 +958,6 @@ async def _create_memory_legacy(db: AsyncSession, data: MemoryCreate) -> MemoryO
     if _hooks.audit_log:
         try:
             await _hooks.audit_log(
-                db,
                 tenant_id=data.tenant_id,
                 agent_id=data.agent_id,
                 action="create",
@@ -990,7 +1025,6 @@ async def _create_memory_legacy(db: AsyncSession, data: MemoryCreate) -> MemoryO
 
 
 async def create_memories_bulk(
-    db: AsyncSession,
     data: BulkMemoryCreate,
     *,
     bulk_attempt_id: str,
@@ -1033,12 +1067,59 @@ async def create_memories_bulk(
     # -- Resolve per-tenant config once --
     from core_api.services.organization_settings import resolve_config
 
-    tenant_config = await resolve_config(db, data.tenant_id)
+    tenant_config = await resolve_config(data.tenant_id)
 
     # -- Batch embeddings + parallel enrichment (valid items only). Short
     # items are skipped so we don't spend provider budget on content
     # that will surface as an error anyway.
     valid_indices = [i for i in range(n) if i not in short_content_errors]
+
+    # -- Deterministic governance gate (eToro). Runs BEFORE embeddings +
+    # content-hash so masked content flows through dedup + storage, and dropped
+    # items never get embedded/enriched/written. The LLM free-form signal is
+    # applied post-persist via the enriched-consumer remediation (deferred bulk).
+    governance_errors: dict[int, str] = {}
+    gov_pii = tenant_config.governance_pii
+    if gov_pii.enabled:
+        for i in valid_indices:
+            item = items[i]
+            findings = scan(item.content, enabled_categories=gov_pii.enabled_categories)
+            if not findings:
+                continue
+            if gov_pii.action == "drop":
+                await emit_governance_audit(
+                    tenant_id=data.tenant_id,
+                    agent_id=data.agent_id,
+                    action=ACTION_PII_DROP,
+                    detail=pii_audit_detail(ACTION_PII_DROP, findings, item.content, "bulk"),
+                    # Reject path: the item is refused, so this audit is the only
+                    # record — must survive queue overflow (sync-fallback).
+                    critical=True,
+                )
+                governance_errors[i] = "rejected by content policy: sensitive data detected"
+            elif gov_pii.action == "mask":
+                await emit_governance_audit(
+                    tenant_id=data.tenant_id,
+                    agent_id=data.agent_id,
+                    action=ACTION_PII_MASK,
+                    detail=pii_audit_detail(ACTION_PII_MASK, findings, item.content, "bulk"),
+                )
+                item.content = mask(item.content, findings)
+            else:  # flag
+                md = item.metadata or {}
+                mark_pii_flagged(md, findings)
+                item.metadata = md
+                await emit_governance_audit(
+                    tenant_id=data.tenant_id,
+                    agent_id=data.agent_id,
+                    action=ACTION_PII_FLAG,
+                    detail=pii_audit_detail(ACTION_PII_FLAG, findings, item.content, "bulk"),
+                )
+        # Dropped items skip embed / enrich / hash / write; surfaced as per-item
+        # errors in the results loop below.
+        if governance_errors:
+            valid_indices = [i for i in valid_indices if i not in governance_errors]
+
     embeddings: list = [None] * n
     if valid_indices and settings.inline_embedding:
         try:
@@ -1139,6 +1220,17 @@ async def create_memories_bulk(
             error_count += 1
             continue
 
+        # Governance-dropped items: never embedded, enriched, deduped, or written.
+        if i in governance_errors:
+            results[i] = BulkItemResult(
+                index=i,
+                client_request_id=item_request_id,
+                status="error",
+                error=governance_errors[i],
+            )
+            error_count += 1
+            continue
+
         ch = hashes[i]
 
         # An existing row matches this content. Two flavours:
@@ -1221,6 +1313,7 @@ async def create_memories_bulk(
                 metadata["contains_pii"] = True
                 if enrichment.pii_types:
                     metadata["pii_types"] = enrichment.pii_types
+            metadata["business_relevance"] = enrichment.business_relevance
 
         if memory_type is None:
             memory_type = "fact"
@@ -1411,7 +1504,6 @@ async def create_memories_bulk(
                 track_task(
                     tracked_task(
                         _hooks.audit_log(
-                            db,
                             tenant_id=data.tenant_id,
                             agent_id=data.agent_id,
                             action="create",
@@ -1715,7 +1807,7 @@ async def _reembed_memory(
         # want the backoff.
         await asyncio.sleep(EMBEDDING_REEMBED_DELAY_S)
     try:
-        tenant_config = await resolve_config(None, tenant_id)
+        tenant_config = await resolve_config(tenant_id)
     except Exception:
         logger.warning("Failed to resolve tenant config for re-embed (tenant=%s)", tenant_id, exc_info=True)
         tenant_config = None
@@ -1775,7 +1867,7 @@ async def _reembed_memory(
                 )
             )
             return
-        await sc.update_embedding(str(memory_id), embedding)
+        await sc.update_embedding(str(memory_id), tenant_id, embedding)
         logger.info("Background re-embed succeeded for memory %s", memory_id)
     except (TimeoutError, ValueError, RuntimeError, OpenAIError, GoogleAPIError):
         logger.exception("Background re-embed error for memory %s", memory_id)
@@ -1819,7 +1911,7 @@ async def _reembed_memories_bulk(
     if not items:
         return
     try:
-        tenant_config = await resolve_config(None, tenant_id)
+        tenant_config = await resolve_config(tenant_id)
     except Exception:
         # Config miss: continue with None so get_embeddings_batch can
         # use its default provider rather than stranding the whole batch.
@@ -1944,7 +2036,7 @@ async def _reembed_memories_bulk(
             )
             continue
         try:
-            await sc.update_embedding(str(memory_id), embedding)
+            await sc.update_embedding(str(memory_id), tenant_id, embedding)
         except Exception:
             # Broad match for the same reason as the outer batch-call
             # except: httpx-layer errors, pool exhaustion, auth, etc.
@@ -2014,7 +2106,7 @@ async def _enrich_memory_background(
     from core_api.services.task_tracker import tracked_task
 
     try:
-        tenant_config = await resolve_config(None, tenant_id)
+        tenant_config = await resolve_config(tenant_id)
     except Exception:
         logger.exception("Background enrichment: failed to resolve config for memory %s", memory_id)
         return
@@ -2085,9 +2177,9 @@ async def _enrich_memory_background(
             if patch:
                 # Use a generic memory patch (metadata, type, weight, etc.)
                 # Fall back to update via scored-search patch endpoint
-                await sc._patch(f"/memories/{memory_id}", patch)
+                await sc.update_memory(str(memory_id), tenant_id, patch)
             if status_val:
-                await sc.update_memory_status(str(memory_id), status_val)
+                await sc.update_memory_status(str(memory_id), status_val, tenant_id=tenant_id)
 
         memory_type = patch.get("memory_type") or mem.get("memory_type")
 
@@ -2211,7 +2303,7 @@ async def _enrich_memory_background(
         logger.exception("Background enrichment error for memory %s", memory_id)
 
 
-async def soft_delete_memory(db: AsyncSession, memory_id: UUID, tenant_id: str) -> None:
+async def soft_delete_memory(memory_id: UUID, tenant_id: str) -> None:
     sc = get_storage_client()
     mem = await sc.get_memory_for_tenant(tenant_id, str(memory_id))
     if not mem:
@@ -2223,7 +2315,6 @@ async def soft_delete_memory(db: AsyncSession, memory_id: UUID, tenant_id: str) 
     if _hooks.audit_log:
         try:
             await _hooks.audit_log(
-                db,
                 tenant_id=tenant_id,
                 agent_id=mem.get("agent_id"),
                 action="soft_delete",
@@ -2235,7 +2326,6 @@ async def soft_delete_memory(db: AsyncSession, memory_id: UUID, tenant_id: str) 
 
 
 async def update_memory(
-    db: AsyncSession,
     memory_id: UUID,
     tenant_id: str,
     data: MemoryUpdate,
@@ -2253,12 +2343,11 @@ async def update_memory(
     if agent_id:
         from core_api.services.agent_service import authorize_memory_access, enforce_update
 
-        await enforce_update(db, tenant_id, agent_id, mem.get("agent_id"))
+        await enforce_update(tenant_id, agent_id, mem.get("agent_id"))
         # Cross-fleet / scope_agent row authorization (write threshold) — the
         # same fleet/scope contract the list/search paths enforce, so a by-id
         # PATCH can't mutate a peer fleet's row.
         allowed = await authorize_memory_access(
-            db,
             tenant_id,
             agent_id,
             visibility=mem.get("visibility"),
@@ -2283,7 +2372,7 @@ async def update_memory(
     new_embedding = None
     # Content change: re-embed, re-hash, check dedup
     if content_changed:
-        tenant_config = await resolve_config(db, tenant_id)
+        tenant_config = await resolve_config(tenant_id)
         new_embedding = await get_embedding(data.content, tenant_config)
         new_hash = _content_hash(tenant_id, mem.get("fleet_id"), data.content)
 
@@ -2299,7 +2388,6 @@ async def update_memory(
         # Semantic dedup on content change (exclude self; skip when new embedding is None)
         if tenant_config.semantic_dedup_enabled and new_embedding is not None:
             sem_dup = await _find_semantic_duplicate(
-                db,
                 tenant_id,
                 mem.get("fleet_id"),
                 new_embedding,
@@ -2428,7 +2516,7 @@ async def update_memory(
 
     # Apply the patch via storage client
     if patch:
-        await sc._patch(f"/memories/{memory_id}", patch)
+        await sc.update_memory(str(memory_id), tenant_id, patch)
 
     # Audit log — only fire when something actually changed. The
     # ``elif data.metadata`` guard above already prevents falsy
@@ -2442,7 +2530,6 @@ async def update_memory(
     if _hooks.audit_log and (changes or patch):
         try:
             await _hooks.audit_log(
-                db,
                 tenant_id=tenant_id,
                 agent_id=agent_id or mem.get("agent_id"),
                 action="update",
@@ -2458,7 +2545,7 @@ async def update_memory(
 
     # Post-commit async tasks for content changes
     if content_changed:
-        tenant_config = await resolve_config(db, tenant_id)
+        tenant_config = await resolve_config(tenant_id)
         if tenant_config.entity_extraction_enabled:
             track_task(
                 tracked_task(
@@ -2503,12 +2590,7 @@ async def update_memory(
     return _dict_to_memory_out(updated, entity_links=entity_links)
 
 
-# Re-exported from EntityRepository for backward compatibility (tests, pipeline steps).
-from core_api.repositories.entity_repository import _relation_weight  # noqa: F401
-
-
 async def expand_graph(
-    db: AsyncSession,
     seed_entity_ids: list[UUID],
     tenant_id: str,
     fleet_id: str | None,
@@ -2684,7 +2766,16 @@ async def _get_or_cache_embedding(query: str, tenant_id: str, tenant_config):
         # task instruction (env: ``EMBEDDING_QUERY_INSTRUCTION``) so the query
         # is encoded with the same instruction prefix the model was trained on.
         # Documents (writes) embed unmodified text.
-        embedding = await asyncio.wait_for(get_query_embedding(query, tenant_config), timeout=10.0)
+        #
+        # Per-tenant embed slot: gate the cold-miss leader so one tenant's
+        # search storm can't occupy the whole fixed TEI pool and starve
+        # other tenants (noisy-neighbor-search). Only the leader reaches
+        # here — cache hits and in-flight joiners returned above and take
+        # no slot. Held strictly across the TEI call; a 429 on acquire
+        # propagates through the ``except`` below (future + joiners) and
+        # the ``finally`` still pops the in-flight entry.
+        async with per_tenant_slot("embed", tenant_id):
+            embedding = await asyncio.wait_for(get_query_embedding(query, tenant_config), timeout=10.0)
         if embedding is None:
             raise ValueError("Embedding service unavailable")
         await cache_set(_cache_key, json.dumps(embedding), ttl=EMBEDDING_CACHE_TTL)
@@ -2698,6 +2789,13 @@ async def _get_or_cache_embedding(query: str, tenant_id: str, tenant_config):
         # finally block.
         if not fut.done():
             fut.set_exception(exc)
+            # Mark the exception retrieved immediately: in the common
+            # single-caller case there are no joiners, nobody ever awaits
+            # ``fut``, and its GC logs ERROR "Future exception was never
+            # retrieved" (prod 2026-06-12 — fired on every solo
+            # search-embed timeout). Joiners are unaffected — ``await
+            # fut`` still raises; this only clears the GC log flag.
+            fut.exception()
         raise
     finally:
         # Drop the inflight slot only after the future has been resolved.
@@ -2707,7 +2805,6 @@ async def _get_or_cache_embedding(query: str, tenant_id: str, tenant_config):
 
 
 async def _entity_boost_pipeline(
-    db: AsyncSession,
     query: str,
     tenant_id: str,
     fleet_ids: list[str] | None,
@@ -2753,7 +2850,6 @@ async def _entity_boost_pipeline(
             # Graph expansion
             if graph_expand and graph_max_hops > 0:
                 entity_hops = await expand_graph(
-                    db,
                     matched_entity_ids,
                     tenant_id,
                     fleet_ids[0] if fleet_ids and len(fleet_ids) == 1 else None,
@@ -2963,7 +3059,6 @@ def _extract_temporal_date_range(
 
 
 async def search_memories(
-    db: AsyncSession,
     tenant_id: str,
     query: str,
     fleet_ids: list[str] | None = None,
@@ -2980,11 +3075,11 @@ async def search_memories(
     diagnostic: bool = False,
     diagnostic_ctx: dict | None = None,
     readable_tenant_ids: list[str] | None = None,
+    source: str = "search",
 ) -> list[MemoryOut]:
     # Diagnostic mode requires the pipeline path for score introspection
     if _USE_PIPELINE_SEARCH or diagnostic:
         return await _search_memories_pipeline(
-            db,
             tenant_id,
             query,
             fleet_ids=fleet_ids,
@@ -3001,10 +3096,10 @@ async def search_memories(
             diagnostic=diagnostic,
             diagnostic_ctx=diagnostic_ctx,
             readable_tenant_ids=readable_tenant_ids,
+            source=source,
         )
     logger.warning("legacy search path invoked; this path is deprecated and scheduled for removal")
     return await _search_memories_legacy(
-        db,
         tenant_id,
         query,
         fleet_ids=fleet_ids,
@@ -3022,7 +3117,6 @@ async def search_memories(
 
 
 async def _search_memories_pipeline(
-    db: AsyncSession,
     tenant_id: str,
     query: str,
     fleet_ids: list[str] | None = None,
@@ -3039,13 +3133,13 @@ async def _search_memories_pipeline(
     diagnostic: bool = False,
     diagnostic_ctx: dict | None = None,
     readable_tenant_ids: list[str] | None = None,
+    source: str = "search",
 ) -> list[MemoryOut]:
     """Pipeline-based search_memories -- same logic, decomposed into timed steps."""
     from core_api.pipeline.compositions.search import build_search_pipeline
     from core_api.pipeline.context import PipelineContext
 
     ctx = PipelineContext(
-        db=db,
         data={
             "query": query,
             "tenant_id": tenant_id,
@@ -3062,6 +3156,7 @@ async def _search_memories_pipeline(
             "search_profile": search_profile,
             "diagnostic": diagnostic,
             "readable_tenant_ids": readable_tenant_ids,
+            "source": source,
         },
         tenant_config=tenant_config,
     )
@@ -3093,7 +3188,6 @@ async def _search_memories_pipeline(
 
 
 async def _search_memories_legacy(
-    db: AsyncSession,
     tenant_id: str,
     query: str,
     fleet_ids: list[str] | None = None,
@@ -3131,7 +3225,7 @@ async def _search_memories_legacy(
     # Parallel: embedding + entity pipeline
     emb_task = asyncio.ensure_future(_get_or_cache_embedding(query, tenant_id, tenant_config))
     ent_task = asyncio.ensure_future(
-        _entity_boost_pipeline(db, query, tenant_id, fleet_ids, graph_expand, _graph_max_hops)
+        _entity_boost_pipeline(query, tenant_id, fleet_ids, graph_expand, _graph_max_hops)
     )
     try:
         embedding, (boosted_memory_ids, memory_boost_factor) = await asyncio.gather(emb_task, ent_task)
@@ -3215,16 +3309,19 @@ async def _search_memories_legacy(
             _dict_to_memory_out(
                 row,
                 entity_links=entity_links,
-                similarity=round(float(row.get("score", 0)), 4) if row.get("score") is not None else None,
+                # Raw vector cosine (``vec_sim``), NOT ``score`` (the ranking
+                # composite, which exceeds 1.0 and is useless for threshold
+                # gating). Mirrors LoadAndSerialize in the pipeline path so both
+                # surfaces agree (test_search_pipeline_equivalence) — see F-14.
+                similarity=round(float(row["vec_sim"]), 4) if row.get("vec_sim") is not None else None,
             )
         )
 
     # Increment recall_count and update last_recalled_at for returned memories
-    _hooks = get_hooks()
-    if memory_ids and _hooks.on_recall:
+    if memory_ids:
         try:
-            await _hooks.on_recall(db, memory_ids)
+            await get_storage_client().increment_recall([str(m) for m in memory_ids])
         except Exception:
-            logger.debug("Recall tracking hook failed (non-critical)", exc_info=True)
+            logger.debug("Recall tracking failed (non-critical)", exc_info=True)
 
     return results

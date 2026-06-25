@@ -1,5 +1,46 @@
 # Changelog
 
+## [2.11.0](https://github.com/caura-ai/caura-memclaw/compare/plugin-v2.10.1...plugin-v2.11.0) (2026-06-24)
+
+
+### Features
+
+* **plugin:** additive-mode skill reconcile with ownership marker (PR2) ([#417](https://github.com/caura-ai/caura-memclaw/issues/417)) ([3d970ef](https://github.com/caura-ai/caura-memclaw/commit/3d970ef2cbd26c4ab3830101bb4ae313409545bd))
+* **plugin:** auto-register additive skill dirs on OpenClaw's load path (PR3b) ([#425](https://github.com/caura-ai/caura-memclaw/issues/425)) ([819a77f](https://github.com/caura-ai/caura-memclaw/commit/819a77f9110352ad5008c7d1160a60a43b5451fa))
+* **plugin:** per-target reconcile observability (PR3a) ([#424](https://github.com/caura-ai/caura-memclaw/issues/424)) ([04120f2](https://github.com/caura-ai/caura-memclaw/commit/04120f241f6083615dcab2de49fca661d692c334))
+* **skills:** refresh canonical + plugin memclaw skills, add company-brain ([#482](https://github.com/caura-ai/caura-memclaw/issues/482)) ([aa03c03](https://github.com/caura-ai/caura-memclaw/commit/aa03c03c47aaeef4da3390d2b810ae3b46045bfd))
+
+
+### Documentation
+
+* **core-api:** clarify memclaw_recall top_k is soft-capped, not rejected ([#481](https://github.com/caura-ai/caura-memclaw/issues/481)) ([6938f08](https://github.com/caura-ai/caura-memclaw/commit/6938f08fd52dd9a9c9efdb3fba42f7b20c4b65d0))
+
+
+### Code Refactoring
+
+* **plugin:** configurable skill-reconcile targets (PR1 — refactor + config plumbing) ([#413](https://github.com/caura-ai/caura-memclaw/issues/413)) ([57e5e96](https://github.com/caura-ai/caura-memclaw/commit/57e5e962cbc5a0f95555e0bfe762e5a3ae309b49))
+
+## [2.10.1](https://github.com/caura-ai/caura-memclaw/compare/plugin-v2.10.0...plugin-v2.10.1) (2026-06-15)
+
+
+### Bug Fixes
+
+* **plugin:** send X-Bulk-Attempt-Id header on bulk memory writes ([#355](https://github.com/caura-ai/caura-memclaw/issues/355)) ([a4515ed](https://github.com/caura-ai/caura-memclaw/commit/a4515ed1e5f5f7679daea36c99e58d1d331b3934))
+
+## [2.10.0](https://github.com/caura-ai/caura-memclaw/compare/plugin-v2.9.0...plugin-v2.10.0) (2026-06-13)
+
+
+### Features
+
+* **skills:** gate the OpenClaw install path to active-only skills ([#317](https://github.com/caura-ai/caura-memclaw/issues/317)) ([50488fc](https://github.com/caura-ai/caura-memclaw/commit/50488fc6eb07d244297ad1d3e065887c8cb3e47e))
+* **skills:** per-node skill-reconcile observability on the heartbeat ([#325](https://github.com/caura-ai/caura-memclaw/issues/325)) ([d806114](https://github.com/caura-ai/caura-memclaw/commit/d806114bc943a1d97480584192091e0583d41545))
+
+
+### Bug Fixes
+
+* **plugin:** point agents at the memclaw skill by name, not by filesystem path (CAURA-000) ([#323](https://github.com/caura-ai/caura-memclaw/issues/323)) ([ec3fcaf](https://github.com/caura-ai/caura-memclaw/commit/ec3fcaf45a7545568e9f713a6f1db631dfa1c2f3))
+* **release:** keep plugin/src/version.ts in sync on release-please PRs ([#335](https://github.com/caura-ai/caura-memclaw/issues/335)) ([e26a3c5](https://github.com/caura-ai/caura-memclaw/commit/e26a3c561b542fbf58b4fd556ec2919e87286dfd))
+
 ## [2.9.0](https://github.com/caura-ai/caura-memclaw/compare/plugin-v2.8.1...plugin-v2.9.0) (2026-06-08)
 
 

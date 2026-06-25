@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import random
 from collections.abc import Awaitable, Callable
+from datetime import datetime
 from typing import Any, Literal, NotRequired, TypedDict
+from uuid import UUID
 
 import httpx
 
 from common.events.lifecycle_purge_request import MEMORY_RETENTION_MAX_DAYS
+from common.http_retry import CONNECT_PHASE_MAX_ATTEMPTS, with_connect_phase_retry, with_retry
 from core_api.clients.identity_token import evict as _evict_id_token
 from core_api.clients.identity_token import fetch_auth_header
 from core_api.config import settings
@@ -18,140 +20,22 @@ from core_api.config import settings
 logger = logging.getLogger(__name__)
 
 
-# F5 — transient-error retry policy for idempotent storage calls.
-#
-# Cloud Run logs over 7 days showed a 31% silent-failure rate on
-# ``process_entity_extraction`` (61 failed / 138 succeeded) on
-# ``staging-memclaw-core-api``. Every failure traced to
-# ``httpx.ConnectTimeout`` reaching ``core-storage-api`` from
-# ``upsert_entity`` — storage-api cold starts / autoscaling
-# inconsistencies. The outer ``except Exception`` in
-# ``entity_extraction_worker.process_entity_extraction`` then
-# silently absorbed the timeout, leaving ``entity_links`` empty
-# on user-visible memory rows.
-#
-# Retry policy:
-#  - Max 3 attempts (1 initial + 2 retries)
-#  - Exponential backoff with jitter: ~0.2s, ~0.4s
-#  - Worst-case added latency: < 1s
-#  - Idempotent HTTP methods (GET, PATCH, DELETE) retry the full
-#    transient set below plus retryable 5xx statuses.
-#  - POST retries connection-phase failures ONLY (ConnectTimeout /
-#    ConnectError / PoolTimeout — all raised before a single request
-#    byte is written, so a retry cannot double-insert). ReadTimeout
-#    and 5xx are NOT retried for POST: the request reached storage
-#    and may have committed; safe retry there needs idempotency-key
-#    support storage-side. Connection-phase loss was observed in prod
-#    2026-06-11: `find_similar_candidates` (contradiction detection,
-#    42 failures) and `create_audit_logs_bulk` (audit events dropped)
-#    both died on first-attempt ConnectTimeout behind the VPC
-#    connector while idempotent siblings recovered via retry.
-_RETRY_MAX_ATTEMPTS = 3
-_RETRY_BACKOFF_BASE_S = 0.2
-_RETRYABLE_EXCEPTIONS = (
-    httpx.ConnectTimeout,
-    httpx.ReadTimeout,
-    httpx.PoolTimeout,
-    # ConnectError covers refused / DNS-not-yet-resolved / route-down —
-    # all transient during Cloud Run autoscaling and storage-api
-    # restarts. Local chaos test (docker network disconnect) showed
-    # httpx raises ConnectError("Name or service not known"), not
-    # ConnectTimeout, when the upstream is temporarily unreachable.
-    httpx.ConnectError,
-)
-# Failures raised while establishing/acquiring a connection — the
-# request body was never transmitted, so retrying is safe even for
-# non-idempotent methods. ReadTimeout is deliberately absent.
-_CONNECT_PHASE_EXCEPTIONS = (
-    httpx.ConnectTimeout,
-    httpx.ConnectError,
-    httpx.PoolTimeout,
-)
-_RETRYABLE_STATUS_CODES = frozenset({502, 503, 504})
-_NO_RETRYABLE_STATUSES: frozenset[int] = frozenset()
+# Retry policy (F5 + the 2026-06-11 connect-timeout incident) lives in
+# ``common/http_retry.py``, shared with core-worker's storage client:
+# GET/PATCH/DELETE retry the full transient set + retryable 5xx;
+# POSTs retry connection-phase failures only (request provably never
+# sent, so a retry cannot double-insert).
 
 
-async def _with_retry(
-    do_request: Callable[[], Awaitable[httpx.Response]],
-    *,
-    label: str,
-    retryable_exceptions: tuple[type[Exception], ...] = _RETRYABLE_EXCEPTIONS,
-    retryable_statuses: frozenset[int] = _RETRYABLE_STATUS_CODES,
-) -> httpx.Response:
-    """Wrap a single HTTP call with retry on transient errors.
-
-    Defaults match the idempotent-method policy: retry on
-    ``ConnectTimeout`` / ``ReadTimeout`` / ``PoolTimeout`` (transient
-    connection issues) and on 5xx responses in
-    ``_RETRYABLE_STATUS_CODES`` (transient server-side). 4xx (including
-    404) and other 2xx/3xx responses are returned immediately —
-    retrying won't change a client error. Non-idempotent callers pass
-    ``_CONNECT_PHASE_EXCEPTIONS`` / empty statuses to retry only
-    failures where the request was provably never sent.
-    """
-    last_exc: BaseException | None = None
-    for attempt in range(1, _RETRY_MAX_ATTEMPTS + 1):
-        try:
-            resp = await do_request()
-        except retryable_exceptions as e:
-            last_exc = e
-            if attempt < _RETRY_MAX_ATTEMPTS:
-                delay = _RETRY_BACKOFF_BASE_S * (2 ** (attempt - 1))
-                delay *= 1.0 + random.uniform(-0.1, 0.1)  # ±10% jitter
-                logger.warning(
-                    "storage_client.%s: %s on attempt %d/%d, retrying in %.2fs",
-                    label,
-                    type(e).__name__,
-                    attempt,
-                    _RETRY_MAX_ATTEMPTS,
-                    delay,
-                )
-                await asyncio.sleep(delay)
-                continue
-            logger.warning(
-                "storage_client.%s: %s on final attempt %d/%d, giving up",
-                label,
-                type(e).__name__,
-                attempt,
-                _RETRY_MAX_ATTEMPTS,
-            )
-            raise
-        if resp.status_code in retryable_statuses and attempt < _RETRY_MAX_ATTEMPTS:
-            delay = _RETRY_BACKOFF_BASE_S * (2 ** (attempt - 1))
-            delay *= 1.0 + random.uniform(-0.1, 0.1)
-            logger.warning(
-                "storage_client.%s: HTTP %d on attempt %d/%d, retrying in %.2fs",
-                label,
-                resp.status_code,
-                attempt,
-                _RETRY_MAX_ATTEMPTS,
-                delay,
-            )
-            await asyncio.sleep(delay)
-            continue
-        return resp
-    # Unreachable — the loop either returns a response or raises.
-    if last_exc is not None:
-        raise last_exc
-    raise RuntimeError("storage_client retry loop exited without response or exception")
-
-
-async def _post_with_retry(
-    do_request: Callable[[], Awaitable[httpx.Response]],
-    *,
-    label: str,
-) -> httpx.Response:
-    """Retry policy for non-idempotent POSTs, encoded in one place.
-
-    Connection-phase failures only — the request was provably never
-    sent, so a retry cannot double-insert. No status-based retries.
-    """
-    return await _with_retry(
-        do_request,
-        label=label,
-        retryable_exceptions=_CONNECT_PHASE_EXCEPTIONS,
-        retryable_statuses=_NO_RETRYABLE_STATUSES,
-    )
+# Idempotent reads (GET) ride out a storage cold start / instance recycle on
+# the connection-phase retry budget (CONNECT_PHASE_MAX_ATTEMPTS) — a connect
+# failure is provably never sent, so the extra attempts add no load — while
+# ReadTimeout/5xx stay at the default 3. Without this, a multi-second storage
+# blip exhausted the 3 GET attempts and surfaced on the Pub/Sub enrichment
+# path as a handler failure → nack → redelivery (the "pubsub handler raised"
+# tail; the POST connect-phase path was already on this budget).
+async def _read_retry(do_request: Callable[[], Awaitable[httpx.Response]], *, label: str) -> httpx.Response:
+    return await with_retry(do_request, label=label, connect_phase_max_attempts=CONNECT_PHASE_MAX_ATTEMPTS)
 
 
 class KeystoneUpsertPayload(TypedDict):
@@ -227,6 +111,16 @@ class CoreStorageClient:
             # against a single service for no benefit.
             self._read_http = self._http
 
+        # Pool self-healing (incident 2026-06-16): the singleton pool could
+        # leak connection slots when in-flight calls were cancelled and never
+        # recovered without a process restart. ``_pool_generation`` lets
+        # concurrent ``PoolTimeout``s collapse into exactly one rebuild.
+        self._pool_lock = asyncio.Lock()
+        self._pool_generation = 0
+        # Anchor fire-and-forget pool-close tasks so they aren't GC'd while
+        # pending (Python 3.12+ warns otherwise); discard on completion.
+        self._background_tasks: set[asyncio.Task] = set()
+
     @staticmethod
     def _make_pool() -> httpx.AsyncClient:
         """Construct an httpx pool with the tuned timeouts + limits.
@@ -257,7 +151,14 @@ class CoreStorageClient:
             # Sized for 20 concurrent storm writes x ~5 storage calls
             # each = 100 in-flight at peak, plus tenant-B probe headroom
             # and a 33% burst margin.
-            limits=httpx.Limits(max_connections=200, max_keepalive_connections=150),
+            # ``keepalive_expiry`` defaults to 5s in httpx — too short for the
+            # bursty entity-context / enrichment fan-out, whose bursts arrive
+            # seconds-to-tens-of-seconds apart. At 5s the warm pool drains
+            # between bursts, so the next burst opens cold TCP handshakes that
+            # pile up at the Cloud Run VPC connector (the residual ConnectTimeout
+            # class). 90s keeps connections warm across the inter-burst gap so the
+            # fan-out reuses them instead of re-handshaking.
+            limits=httpx.Limits(max_connections=200, max_keepalive_connections=150, keepalive_expiry=90.0),
             follow_redirects=True,
         )
 
@@ -283,6 +184,94 @@ class CoreStorageClient:
         finally:
             if self._read_http is not self._http:
                 await self._read_http.aclose()
+
+    # -- pool resilience (incident 2026-06-16) ---------------------------
+
+    async def _cancel_safe(self, coro: Awaitable[httpx.Response]) -> httpx.Response:
+        """Run an in-flight storage request so cancellation cannot strand its
+        pooled connection.
+
+        When the 35s enrichment ``wait_for`` or the 45s request-timeout
+        cancels the awaiting task mid-request, httpcore (1.0.9, current)
+        does not return the connection to the pool — leaked slots accumulate
+        until the ``max_connections=200`` ceiling is hit and every acquire
+        ``PoolTimeout``s (incident 2026-06-16). Shielding lets the request
+        run to completion (returning its slot) while the caller still
+        observes ``CancelledError`` immediately; the orphaned result is
+        consumed so it is not logged as never-retrieved.
+        """
+        task = asyncio.create_task(coro)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+
+            def _consume_result(t: asyncio.Task) -> None:
+                if t.cancelled():
+                    return
+                exc = t.exception()
+                if exc is not None:
+                    logger.debug("storage_client: shielded request failed after caller cancellation: %r", exc)
+
+            task.add_done_callback(_consume_result)
+            raise
+
+    @staticmethod
+    async def _safe_aclose(client: httpx.AsyncClient) -> None:
+        try:
+            await client.aclose()
+        except Exception as exc:  # pool teardown must never surface to callers
+            logger.warning("storage_client: error closing recycled pool: %r", exc)
+
+    async def _recycle_pools(self, *, observed_gen: int, label: str) -> None:
+        """Rebuild the httpx pool(s) after exhaustion so a leaked-out singleton
+        self-heals in seconds instead of requiring a process restart. The
+        generation guard means concurrent ``PoolTimeout``s trigger exactly one
+        rebuild; later arrivals see the bumped generation and return."""
+        async with self._pool_lock:
+            if self._pool_generation != observed_gen:
+                return
+            old_write, old_read = self._http, self._read_http
+            shared = old_read is old_write
+            self._http = self._make_pool()
+            self._read_http = self._http if shared else self._make_pool()
+            self._pool_generation += 1
+            logger.error(
+                "storage_client.%s: core-storage pool exhausted (PoolTimeout) — "
+                "recycled connection pool (generation %d→%d); see incident 2026-06-16",
+                label,
+                observed_gen,
+                self._pool_generation,
+            )
+        # Force-close the old pool(s) in the background. Safe to drop mid-flight:
+        # a pool only reaches this path once it can no longer hand out
+        # connections, so there is no healthy in-flight work left to disrupt.
+        for old in {old_write, old_read}:
+            t = asyncio.create_task(self._safe_aclose(old))
+            self._background_tasks.add(t)
+            t.add_done_callback(self._background_tasks.discard)
+
+    async def _execute(
+        self,
+        do_request: Callable[[], Awaitable[httpx.Response]],
+        *,
+        retry: Callable[..., Awaitable[httpx.Response]],
+        label: str,
+    ) -> httpx.Response:
+        """Run ``do_request`` through the ``retry`` policy, made cancellation-safe
+        and pool-self-healing. ``do_request`` must read ``self._http`` /
+        ``self._read_http`` lazily so a recycled pool is picked up on retry.
+        If ``PoolTimeout`` survives the retry policy the pool is exhausted —
+        recycle it once and retry on the fresh pool."""
+
+        def _shielded() -> Awaitable[httpx.Response]:
+            return self._cancel_safe(do_request())
+
+        observed_gen = self._pool_generation
+        try:
+            return await retry(_shielded, label=label)
+        except httpx.PoolTimeout:
+            await self._recycle_pools(observed_gen=observed_gen, label=label)
+            return await retry(_shielded, label=label)
 
     # -- internal helpers ------------------------------------------------
 
@@ -317,14 +306,15 @@ class CoreStorageClient:
             _evict_id_token(audience)
 
     async def _get(self, path: str, *, read: bool = True, **params: Any) -> dict | None:
-        http = self._read_http if read else self._http
         prefix = self._read_prefix if read else self._prefix
         headers = await self._auth_headers(read=read)
 
-        async def _do() -> httpx.Response:
-            return await http.get(f"{prefix}{path}", params=params, headers=headers)
+        def _do() -> Awaitable[httpx.Response]:
+            # Read the pool lazily so a mid-call recycle is picked up on retry.
+            http = self._read_http if read else self._http
+            return http.get(f"{prefix}{path}", params=params, headers=headers)
 
-        resp = await _with_retry(_do, label=f"GET {path}")
+        resp = await self._execute(_do, retry=_read_retry, label=f"GET {path}")
         if resp.status_code == 404:
             return None
         self._maybe_evict_on_auth_error(resp, read=read)
@@ -336,27 +326,34 @@ class CoreStorageClient:
         # sit on the write path, so no per-call opt-out is needed yet.
         headers = await self._auth_headers(read=True)
 
-        async def _do() -> httpx.Response:
-            return await self._read_http.get(f"{self._read_prefix}{path}", params=params, headers=headers)
+        def _do() -> Awaitable[httpx.Response]:
+            return self._read_http.get(f"{self._read_prefix}{path}", params=params, headers=headers)
 
-        resp = await _with_retry(_do, label=f"GET-list {path}")
+        resp = await self._execute(_do, retry=_read_retry, label=f"GET-list {path}")
         self._maybe_evict_on_auth_error(resp, read=True)
         resp.raise_for_status()
         return resp.json()
 
-    async def _post(self, path: str, data: Any = None, *, read: bool = False) -> dict | list:
-        http = self._read_http if read else self._http
+    async def _post(
+        self, path: str, data: Any = None, *, read: bool = False, idempotent: bool = False
+    ) -> dict | list:
         prefix = self._read_prefix if read else self._prefix
         headers = await self._auth_headers(read=read)
 
-        async def _do() -> httpx.Response:
-            return await http.post(
+        def _do() -> Awaitable[httpx.Response]:
+            http = self._read_http if read else self._http
+            return http.post(
                 f"{prefix}{path}",
                 json=data if data is not None else {},
                 headers=headers,
             )
 
-        resp = await _post_with_retry(_do, label=f"POST {path}")
+        # Non-idempotent POSTs retry connection-phase failures ONLY (the request
+        # was provably never sent). ``idempotent=True`` opts a POST into the full
+        # transient set (ReadTimeout + 5xx too) — safe ONLY when the endpoint
+        # dedups replays storage-side (e.g. /audit-logs/bulk on client_event_id).
+        retry = with_retry if idempotent else with_connect_phase_retry
+        resp = await self._execute(_do, retry=retry, label=f"POST {path}")
         self._maybe_evict_on_auth_error(resp, read=read)
         resp.raise_for_status()
         return resp.json()
@@ -364,10 +361,10 @@ class CoreStorageClient:
     async def _patch(self, path: str, data: dict) -> dict | None:
         headers = await self._auth_headers(read=False)
 
-        async def _do() -> httpx.Response:
-            return await self._http.patch(f"{self._prefix}{path}", json=data, headers=headers)
+        def _do() -> Awaitable[httpx.Response]:
+            return self._http.patch(f"{self._prefix}{path}", json=data, headers=headers)
 
-        resp = await _with_retry(_do, label=f"PATCH {path}")
+        resp = await self._execute(_do, retry=with_retry, label=f"PATCH {path}")
         if resp.status_code == 404:
             return None
         self._maybe_evict_on_auth_error(resp, read=False)
@@ -377,10 +374,10 @@ class CoreStorageClient:
     async def _delete(self, path: str, **params: Any) -> bool:
         headers = await self._auth_headers(read=False)
 
-        async def _do() -> httpx.Response:
-            return await self._http.delete(f"{self._prefix}{path}", params=params, headers=headers)
+        def _do() -> Awaitable[httpx.Response]:
+            return self._http.delete(f"{self._prefix}{path}", params=params, headers=headers)
 
-        resp = await _with_retry(_do, label=f"DELETE {path}")
+        resp = await self._execute(_do, retry=with_retry, label=f"DELETE {path}")
         if resp.status_code == 404:
             return False
         self._maybe_evict_on_auth_error(resp, read=False)
@@ -388,18 +385,18 @@ class CoreStorageClient:
         return True
 
     async def _post_optional(self, path: str, data: Any = None, *, read: bool = False) -> dict | None:
-        http = self._read_http if read else self._http
         prefix = self._read_prefix if read else self._prefix
         headers = await self._auth_headers(read=read)
 
-        async def _do() -> httpx.Response:
-            return await http.post(
+        def _do() -> Awaitable[httpx.Response]:
+            http = self._read_http if read else self._http
+            return http.post(
                 f"{prefix}{path}",
                 json=data if data is not None else {},
                 headers=headers,
             )
 
-        resp = await _post_with_retry(_do, label=f"POST {path}")
+        resp = await self._execute(_do, retry=with_connect_phase_retry, label=f"POST {path}")
         if resp.status_code == 404:
             return None
         self._maybe_evict_on_auth_error(resp, read=read)
@@ -439,8 +436,12 @@ class CoreStorageClient:
     async def get_memory_for_tenant(self, tenant_id: str, memory_id: str) -> dict | None:
         return await self._get(f"/memories/{memory_id}", tenant_id=tenant_id)
 
-    async def update_memory(self, memory_id: str, data: dict) -> dict | None:
-        return await self._patch(f"/memories/{memory_id}", data)
+    async def update_memory(self, memory_id: str, tenant_id: str, data: dict) -> dict | None:
+        # ``tenant_id`` (the row's home tenant) scopes the by-id UPDATE on
+        # the storage side so a content PATCH can't cross tenants; sent in
+        # the body and popped there before the remaining keys become the
+        # patch. The explicit arg wins over any ``tenant_id`` in ``data``.
+        return await self._patch(f"/memories/{memory_id}", {**data, "tenant_id": tenant_id})
 
     async def soft_delete_memory(self, memory_id: str) -> bool:
         return await self._delete(f"/memories/{memory_id}")
@@ -451,10 +452,16 @@ class CoreStorageClient:
         status: str,
         supersedes_id: str | None = None,
         *,
+        tenant_id: str,
         unset_supersedes: bool = False,
         expected_supersedes_id: str | None = None,
     ) -> dict | None:
         """Update status and optionally set or clear ``supersedes_id``.
+
+        ``tenant_id`` is the home tenant of the target memory and is REQUIRED:
+        the storage route scopes every write to ``tenant_id == memory.tenant_id``
+        so a caller in tenant B cannot flip the status of tenant A's memory by
+        id (cross-tenant write guard).
 
         Set path (existing behaviour):
             ``supersedes_id=<uuid>`` sets the row's pointer, guarded by
@@ -487,7 +494,7 @@ class CoreStorageClient:
                     "for the CAS anchor; clearing without one would race "
                     "concurrent setters."
                 )
-        payload: dict[str, Any] = {"status": status}
+        payload: dict[str, Any] = {"status": status, "tenant_id": tenant_id}
         if supersedes_id is not None:
             payload["supersedes_id"] = supersedes_id
         if unset_supersedes:
@@ -747,11 +754,15 @@ class CoreStorageClient:
     async def update_embedding(
         self,
         memory_id: str,
+        tenant_id: str,
         embedding: list[float],
     ) -> dict | None:
+        # ``tenant_id`` (the row's home tenant) scopes the by-id embedding
+        # write so a worker/backfill can't overwrite a foreign tenant's
+        # vector.
         return await self._patch(
             f"/memories/{memory_id}/embedding",
-            {"embedding": embedding},
+            {"embedding": embedding, "tenant_id": tenant_id},
         )
 
     async def update_memory_entities(
@@ -800,6 +811,31 @@ class CoreStorageClient:
             params["fleet_id"] = fleet_id
         return await self._get("/memories/type-distribution", **params) or {}
 
+    async def get_entity_coverage(
+        self,
+        tenant_id: str,
+        fleet_id: str | None = None,
+    ) -> int:
+        """Distinct memories with >=1 entity link (crystallizer entity-coverage)."""
+        params: dict[str, Any] = {"tenant_id": tenant_id}
+        if fleet_id is not None:
+            params["fleet_id"] = fleet_id
+        result = await self._get("/memories/entity-coverage", **params) or {}
+        return int(result.get("memories_with_entities", 0))
+
+    async def get_audit_usage(self, tenant_id: str) -> dict:
+        """Agent-activity + peak-hours from audit_log (crystallizer usage)."""
+        return await self._get("/memories/audit-usage", tenant_id=tenant_id) or {}
+
+    async def find_prior_ingest_by_doc_hash(self, tenant_id: str, doc_hash: str) -> list[dict]:
+        """Prior ingest rows for a doc_hash (idempotency cache; write-path read)."""
+        result = await self._post(
+            "/memories/prior-ingest-by-doc-hash",
+            {"tenant_id": tenant_id, "doc_hash": doc_hash},
+            read=False,
+        )
+        return result.get("rows", []) if isinstance(result, dict) else []
+
     async def get_recent_memories(
         self,
         tenant_id: str,
@@ -820,11 +856,24 @@ class CoreStorageClient:
     async def find_neighbors_by_embedding(self, data: dict) -> list[dict]:
         return await self._post("/memories/neighbors-by-embedding", data) or []  # type: ignore[return-value]
 
-    async def mark_dedup_checked(self, memory_ids: list[str]) -> dict:
-        return await self._post("/memories/mark-dedup-checked", {"memory_ids": memory_ids})  # type: ignore[return-value]
+    async def mark_dedup_checked(self, memory_ids: list[str], tenant_id: str) -> dict:
+        # ``tenant_id`` (the row's home tenant) bounds the bulk dedup-checked
+        # stamp to the caller's tenant.
+        return await self._post(
+            "/memories/mark-dedup-checked",
+            {"memory_ids": memory_ids, "tenant_id": tenant_id},
+        )  # type: ignore[return-value]
 
-    async def batch_update_status(self, data: dict) -> dict:
-        return await self._post("/memories/batch-update-status", data)  # type: ignore[return-value]
+    async def batch_update_status(self, data: dict, *, tenant_id: str) -> dict:
+        """Apply status updates to many memories within one tenant.
+
+        ``tenant_id`` is the trigger tenant shared by every memory in the
+        batch and is REQUIRED: the storage route scopes each row's write to
+        ``tenant_id == memory.tenant_id`` (cross-tenant write guard). It is
+        injected at the batch level rather than per row.
+        """
+        payload = {**data, "tenant_id": tenant_id}
+        return await self._post("/memories/batch-update-status", payload)  # type: ignore[return-value]
 
     async def bulk_get_memories(
         self,
@@ -883,6 +932,184 @@ class CoreStorageClient:
         self, procedure_id: str, data: dict
     ) -> dict | None:
         return await self._patch(f"/procedures/{procedure_id}/stats", data)
+
+    # =====================================================================
+    # Fix 2 Phase 2 — fleet/admin discovery, detail, bulk mutations
+    # =====================================================================
+    #
+    # The list/dict GET helpers below always return 200 with an envelope
+    # (an empty list / zeroed stats when there's no data), so a None / 404
+    # from ``_get`` means the endpoint is MISSING (version skew / routing),
+    # not "no data" — raise rather than silently degrade (mirrors the
+    # Phase 1 tenant-discovery methods). The two by-id reads
+    # (``get_memory_detail`` / ``get_memory_contradictions``) DO treat 404
+    # as a legitimate "memory not found" and return None for the caller to
+    # translate into its own 404.
+
+    async def memory_fleet_distribution(
+        self,
+        tenant_id: str | None = None,
+        *,
+        exclude_scope_agent: bool = False,
+    ) -> list[dict]:
+        """Distinct ``fleet_id`` with memory + agent counts, desc."""
+        params: dict[str, Any] = {"exclude_scope_agent": exclude_scope_agent}
+        if tenant_id is not None:
+            params["tenant_id"] = tenant_id
+        return await self._get_list("/memories/fleet-distribution", **params)
+
+    async def get_memory_detail(self, tenant_id: str, memory_id: str) -> dict | None:
+        """Full memory row + entity links + server-computed embedding stats.
+
+        Returns None on 404 (absent / soft-deleted / cross-tenant) — the
+        caller raises its own 404.
+        """
+        return await self._get(f"/memories/{memory_id}/detail", tenant_id=tenant_id)
+
+    async def get_memory_contradictions(self, tenant_id: str, memory_id: str) -> dict | None:
+        """Raw contradiction rows ``{memory, supersessors[], older|null}``.
+
+        Returns None on 404 (absent / soft-deleted / cross-tenant) — the
+        caller raises its own 404.
+        """
+        return await self._get(f"/memories/{memory_id}/contradictions", tenant_id=tenant_id)
+
+    async def admin_memory_stats(
+        self,
+        tenant_id: str | None = None,
+        fleet_id: str | None = None,
+    ) -> dict:
+        """Admin ``{total, by_type, by_agent, by_status}`` (cross-tenant when
+        ``tenant_id`` is omitted)."""
+        params: dict[str, Any] = {}
+        if tenant_id is not None:
+            params["tenant_id"] = tenant_id
+        if fleet_id is not None:
+            params["fleet_id"] = fleet_id
+        result = await self._get("/memories/admin-stats", **params)
+        if result is None:
+            raise RuntimeError("core-storage-api /memories/admin-stats returned 404")
+        return result
+
+    async def admin_list_memories(self, data: dict) -> list[dict]:
+        """Admin cross-tenant memory list (NO visibility scoping).
+
+        ``data`` carries the filter/sort/cursor params plus ``limit`` already
+        widened to ``limit+1``; the caller slices + builds the next cursor.
+        """
+        result = await self._post("/memories/admin-list", data, read=True)
+        if result is None:
+            raise RuntimeError("core-storage-api /memories/admin-list returned 404")
+        return result  # type: ignore[return-value]
+
+    async def soft_delete_by_filter(self, data: dict) -> int:
+        """Soft-delete every matching live memory for a tenant; returns count."""
+        result = await self._post("/memories/soft-delete-by-filter", data)
+        return (result or {}).get("deleted", 0)  # type: ignore[union-attr]
+
+    async def soft_delete_by_ids(self, tenant_id: str, ids: list[str]) -> int:
+        """Soft-delete live memories by id (tenant-scoped); returns count."""
+        result = await self._post("/memories/soft-delete-by-ids", {"tenant_id": tenant_id, "ids": ids})
+        return (result or {}).get("deleted", 0)  # type: ignore[union-attr]
+
+    async def list_memories_by_filters(self, data: dict) -> list[dict]:
+        """Non-admin memory list WITH visibility scoping (MCP ``memclaw_list``).
+
+        ``data`` carries the filter/sort/cursor params (incl. ``caller_agent_id``
+        for the scope_agent visibility gate and an optional ``readable_tenant_ids``
+        widening) plus ``limit`` (the desired page size). The storage service
+        over-fetches ``limit+1`` internally for has_more detection; the caller
+        slices to ``limit`` + builds the next cursor. Distinct from
+        ``admin_list_memories`` (NO visibility scoping).
+        """
+        result = await self._post("/memories/list", data, read=True)
+        if result is None:
+            raise RuntimeError("core-storage-api /memories/list returned 404")
+        return result  # type: ignore[return-value]
+
+    async def memory_stats_breakdown(self, data: dict) -> dict:
+        """Visibility-scoped stats breakdown (MCP ``memclaw_stats``).
+
+        ``data`` carries ``{tenant_id?, fleet_id?, agent_id?, memory_type?,
+        status?, include_deleted?, readable_tenant_ids?}``. Returns
+        ``{total, by_type, by_agent, by_status}`` plus optional ``by_tenant`` /
+        ``deleted`` / ``total_including_deleted``. Distinct from
+        ``admin_memory_stats`` (no scoping).
+        """
+        result = await self._post("/memories/stats-breakdown", data, read=True)
+        if result is None:
+            raise RuntimeError("core-storage-api /memories/stats-breakdown returned 404")
+        return result  # type: ignore[return-value]
+
+    async def soft_delete_by_run(
+        self,
+        tenant_id: str,
+        run_id: str,
+        *,
+        metadata_source: str = "ingest",
+    ) -> int:
+        """Soft-delete live memories tagged with ``run_id`` AND
+        ``metadata.source = metadata_source``; returns count."""
+        result = await self._post(
+            "/memories/soft-delete-by-run",
+            {"tenant_id": tenant_id, "run_id": run_id, "metadata_source": metadata_source},
+        )
+        return (result or {}).get("deleted", 0)  # type: ignore[union-attr]
+
+    async def redistribute_memories(
+        self,
+        tenant_id: str,
+        memory_ids: list[str],
+        target_agent_id: str,
+    ) -> dict:
+        """Bulk-reassign memories in ONE storage transaction.
+
+        Returns ``{moved, promoted, skipped, from_agents[], not_found[]}``.
+        """
+        result = await self._post(
+            "/memories/redistribute",
+            {"tenant_id": tenant_id, "memory_ids": memory_ids, "target_agent_id": target_agent_id},
+        )
+        if result is None:
+            raise RuntimeError("core-storage-api /memories/redistribute returned 404")
+        return result  # type: ignore[return-value]
+
+    # =====================================================================
+    # Recall logging + capability usage (Fix 2 final cleanup — the last
+    # core-api direct-DB writes, now routed through storage). All three are
+    # fire-and-forget background writes, so ``read=False`` (writer fleet).
+    # Payloads MUST be JSON-safe: ``_post`` does NOT auto-encode UUIDs /
+    # datetimes, so callers stringify UUIDs + ISO-format datetimes first.
+    # =====================================================================
+
+    async def increment_recall(self, memory_ids: list[str]) -> int:
+        """Bump ``recall_count`` + ``last_recalled_at`` for memories by id.
+
+        ``memory_ids`` must already be stringified (the storage endpoint
+        re-parses each as a UUID). Returns the rows-updated count.
+        """
+        result = await self._post("/memories/increment-recall", {"memory_ids": memory_ids})
+        return result.get("updated", 0)  # type: ignore[union-attr]
+
+    async def log_recall(self, event: dict, candidates: list[dict]) -> str:
+        """Persist one ``recall_event`` + its ``recall_candidate`` rows, ONE txn.
+
+        ``event`` + every ``candidate`` dict must be JSON-safe — stringify
+        UUIDs (e.g. ``candidate["memory_id"]``) and ISO-format any datetimes
+        BEFORE calling. Returns the new ``recall_event.id`` as a string.
+        """
+        result = await self._post("/memories/recall-log", {"event": event, "candidates": candidates})
+        return result["recall_event_id"]  # type: ignore[index,return-value]
+
+    async def flush_capability_usage(self, rows: list[dict]) -> int:
+        """Bulk-append adoption-counter rows to ``capability_usage``.
+
+        Cross-tenant by design (each row carries its own ``tenant_id``); the
+        endpoint applies no per-tenant scoping. ``ts_bucket`` must be an ISO
+        string (JSON has no datetime). Returns the rows-inserted count.
+        """
+        result = await self._post("/capability-usage", {"rows": rows})
+        return result.get("inserted", 0)  # type: ignore[union-attr]
 
     # =====================================================================
     # Entities
@@ -1050,7 +1277,7 @@ class CoreStorageClient:
     async def get_memory_ids_by_entity_ids(
         self,
         entity_ids: list[str],
-    ) -> list[tuple]:
+    ) -> list[dict]:
         result = await self._post(
             "/entities/memory-ids-by-entity-ids",
             {"entity_ids": entity_ids},
@@ -1062,6 +1289,125 @@ class CoreStorageClient:
 
     async def find_broken_entity_links(self, tenant_id: str) -> list[dict]:
         return await self._get_list("/entities/broken-links", tenant_id=tenant_id)
+
+    # ---------------------------------------------------------------------
+    # Entity-linking pipeline (Fix 2 Ph6) — thin wrappers over the coarse
+    # run-op endpoints that fold each entity-linking step into one atomic
+    # storage txn. The 4 pipeline steps call these instead of holding a
+    # direct DB session; tuning constants are passed from ``core_api.constants``.
+    # ---------------------------------------------------------------------
+
+    async def resolve_entities(
+        self,
+        *,
+        tenant_id: str,
+        fleet_id: str | None,
+        batch_size: int,
+        threshold: float,
+        candidate_limit: int,
+    ) -> dict:
+        """Merge duplicate entities (full resolve step, ONE atomic txn with a
+        SAVEPOINT per dupe). Returns ``{merge_count, clusters, cluster_errors,
+        merged_entity_ids}`` (or ``{error, cluster_errors}`` when every cluster
+        failed)."""
+        return await self._post(  # type: ignore[return-value]
+            "/entities/resolve",
+            {
+                "tenant_id": tenant_id,
+                "fleet_id": fleet_id,
+                "batch_size": batch_size,
+                "threshold": threshold,
+                "candidate_limit": candidate_limit,
+            },
+            read=False,
+        )
+
+    async def discover_cross_links(
+        self,
+        *,
+        tenant_id: str,
+        fleet_id: str | None,
+        batch_size: int,
+        threshold: float,
+        text_verify: bool,
+        target_memory_ids: list | None = None,
+    ) -> dict:
+        """Link under-connected memories to similar entities (targeted when
+        ``target_memory_ids`` is non-empty, else batch). Returns
+        ``{links_created}``."""
+        return await self._post(  # type: ignore[return-value]
+            "/entities/discover-cross-links",
+            {
+                "tenant_id": tenant_id,
+                "fleet_id": fleet_id,
+                "batch_size": batch_size,
+                "threshold": threshold,
+                "text_verify": text_verify,
+                "target_memory_ids": [str(mid) for mid in target_memory_ids] if target_memory_ids else None,
+            },
+            read=False,
+        )
+
+    async def infer_relations(
+        self,
+        *,
+        tenant_id: str,
+        fleet_id: str | None,
+        batch_size: int,
+        min_cooccurrence: int,
+        reinforce_delta: float,
+        max_relation_weight: float,
+    ) -> dict:
+        """Infer 'related_to' relations from co-occurrence (ONE atomic txn).
+        Returns ``{relations_created, relations_reinforced}``."""
+        return await self._post(  # type: ignore[return-value]
+            "/entities/infer-relations",
+            {
+                "tenant_id": tenant_id,
+                "fleet_id": fleet_id,
+                "batch_size": batch_size,
+                "min_cooccurrence": min_cooccurrence,
+                "reinforce_delta": reinforce_delta,
+                "max_relation_weight": max_relation_weight,
+            },
+            read=False,
+        )
+
+    async def list_null_embedding_entities(
+        self,
+        *,
+        tenant_id: str,
+        fleet_id: str | None,
+        batch_size: int,
+    ) -> list[dict]:
+        """Entities needing a name embedding (read half of backfill). Returns a
+        list of ``{id, canonical_name}`` dicts for the core-api LLM embed loop."""
+        resp = await self._post(
+            "/entities/list-null-embeddings",
+            {
+                "tenant_id": tenant_id,
+                "fleet_id": fleet_id,
+                "batch_size": batch_size,
+            },
+            read=True,
+        )
+        return resp["rows"]  # type: ignore[index,return-value]
+
+    async def set_entity_embeddings(
+        self,
+        *,
+        tenant_id: str,
+        updates: list[dict],
+    ) -> int:
+        """Write back computed name embeddings (write half of backfill, ONE
+        atomic txn). ``updates`` is ``[{id, embedding:[float,...]}, ...]``.
+        Returns the count written."""
+        resp = await self._post(
+            "/entities/set-embeddings",
+            {"tenant_id": tenant_id, "updates": updates},
+            read=False,
+        )
+        return resp["backfill_count"]  # type: ignore[index,return-value]
 
     # =====================================================================
     # Agents
@@ -1128,19 +1474,106 @@ class CoreStorageClient:
     async def upsert_document(self, data: dict) -> dict:
         return await self._post("/documents", data)  # type: ignore[return-value]
 
+    async def upsert_document_xmax(self, data: dict) -> dict:
+        return await self._post("/documents/upsert-xmax", data, read=False)  # type: ignore[return-value]
+
+    async def list_document_collections(
+        self,
+        *,
+        tenant_id: str,
+        fleet_id: str | None = None,
+        readable_tenant_ids: list[str] | None = None,
+    ) -> dict:
+        params: dict[str, Any] = {"tenant_id": tenant_id}
+        if fleet_id is not None:
+            params["fleet_id"] = fleet_id
+        if readable_tenant_ids is not None:
+            params["readable_tenant_ids"] = readable_tenant_ids
+        result = await self._get("/documents/collections", read=True, **params)
+        if result is None:
+            # _get returns None only on 404 — i.e. the endpoint is missing
+            # (version skew / undeployed). Surface it instead of masking it as
+            # an empty collection list with `or {}`.
+            raise RuntimeError("GET /documents/collections returned 404 — core-storage-api version skew?")
+        return result
+
+    async def search_documents_vector(self, data: dict) -> list[dict]:
+        return await self._post("/documents/search", data, read=True)  # type: ignore[return-value]
+
     async def get_document(
         self,
         tenant_id: str,
         collection: str,
         doc_id: str,
+        *,
+        read: bool = True,
+        readable_tenant_ids: list[str] | None = None,
     ) -> dict | None:
+        # read=False forces the primary — use it for read-after-write re-fetches
+        # (e.g. immediately after an upsert) so replication lag can't yield None.
+        # ``readable_tenant_ids`` widens the tenant predicate to ANY($readable)
+        # for cross-tenant credentials (omit ⇒ home-tenant only).
+        params: dict[str, Any] = {"tenant_id": tenant_id}
+        if readable_tenant_ids is not None:
+            params["readable_tenant_ids"] = readable_tenant_ids
         return await self._get(
             f"/documents/{collection}/{doc_id}",
-            tenant_id=tenant_id,
+            read=read,
+            **params,
         )
+
+    async def document_count_in_collection(
+        self,
+        tenant_id: str,
+        collection: str,
+        *,
+        status: str | None = None,
+        fleet_id: str | None = None,
+        readable_tenant_ids: list[str] | None = None,
+    ) -> int:
+        """Count docs in one collection, optionally filtered by
+        ``data->>'status'``. Backs the MCP skills active-only count."""
+        params: dict[str, Any] = {"tenant_id": tenant_id, "collection": collection}
+        if status is not None:
+            params["status"] = status
+        if fleet_id is not None:
+            params["fleet_id"] = fleet_id
+        if readable_tenant_ids is not None:
+            params["readable_tenant_ids"] = readable_tenant_ids
+        result = await self._get("/documents/collection-count", read=True, **params)
+        return (result or {}).get("count", 0)
 
     async def query_documents(self, data: dict) -> list[dict]:
         return await self._post("/documents/query", data, read=True)  # type: ignore[return-value]
+
+    async def update_document_status(
+        self,
+        *,
+        tenant_id: str,
+        collection: str,
+        doc_id: str,
+        new_status: str,
+        expected_status: str,
+    ) -> dict | None:
+        """Conditional (CAS) status flip on a document's ``data`` jsonb.
+
+        Returns ``{"updated": True, "doc_id": ...}`` when the row still
+        carried ``expected_status`` and was flipped; returns ``None`` when the
+        storage route 404s (CAS miss — a concurrent writer transitioned the
+        row, or it never existed). The caller raises ``AlreadyTransitionedError``
+        on ``None``. ``read=False`` (writer) — this is a write on the primary.
+        """
+        return await self._post_optional(
+            "/documents/update-status",
+            {
+                "tenant_id": tenant_id,
+                "collection": collection,
+                "doc_id": doc_id,
+                "new_status": new_status,
+                "expected_status": expected_status,
+            },
+            read=False,
+        )
 
     async def list_documents(
         self,
@@ -1160,10 +1593,418 @@ class CoreStorageClient:
         tenant_id: str,
         collection: str,
         doc_id: str,
+        *,
+        require_status: str | None = None,
     ) -> bool:
+        # ``require_status`` folds a ``data->>'status' = :status`` guard into the
+        # DELETE atomically (the MCP skills active-only gate): a non-matching /
+        # missing row deletes nothing and returns False, indistinguishable from
+        # a missing one. Home-tenant scoped (deletes never span readable tenants).
+        params: dict[str, Any] = {"tenant_id": tenant_id}
+        if require_status is not None:
+            params["require_status"] = require_status
         return await self._delete(
             f"/documents/{collection}/{doc_id}",
-            tenant_id=tenant_id,
+            **params,
+        )
+
+    # =====================================================================
+    # Skill factory pipeline (Fix 2 Ph5a)
+    # =====================================================================
+    #
+    # Forge poison memory, session-trace upsert, and the bespoke
+    # memory-window / outcome-signal analytic reads. Reads route to the
+    # replica (post-commit analytic queries — replica lag is harmless);
+    # writes hit the primary. Each takes an explicit tenant_id (+ fleet /
+    # window / params) — there are no RLS GUCs server-side.
+
+    async def forge_write_rejected_fingerprint(
+        self,
+        *,
+        tenant_id: str,
+        fleet_id: str | None,
+        cluster_fingerprint: str,
+        rejected_by_agent: str,
+        cooloff_days: int,
+        reason: str | None = None,
+    ) -> str:
+        """Insert one ``forge_rejected_fingerprints`` row; return its id."""
+        payload: dict[str, Any] = {
+            "tenant_id": tenant_id,
+            "fleet_id": fleet_id,
+            "cluster_fingerprint": cluster_fingerprint,
+            "rejected_by_agent": rejected_by_agent,
+            "cooloff_days": cooloff_days,
+            "reason": reason,
+        }
+        result = await self._post("/forge/rejected-fingerprints", payload)
+        return result["id"]  # type: ignore[index,call-overload]
+
+    async def forge_is_fingerprint_poisoned(
+        self,
+        *,
+        tenant_id: str,
+        fleet_id: str | None,
+        cluster_fingerprint: str,
+    ) -> bool:
+        """True iff a live cooloff row exists for this (tenant, fleet, fp)."""
+        result = await self._post(
+            "/forge/rejected-fingerprints/check",
+            {
+                "tenant_id": tenant_id,
+                "fleet_id": fleet_id,
+                "cluster_fingerprint": cluster_fingerprint,
+            },
+            read=True,
+        )
+        return bool(result.get("poisoned"))  # type: ignore[union-attr]
+
+    async def upsert_session_traces(self, *, tenant_id: str, traces: list[dict]) -> None:
+        """Batch-upsert ``session_traces`` rows (ON CONFLICT keyed by
+        tenant/run/agent). ``tenant_id`` scopes every row server-side."""
+        await self._post(
+            "/session-traces/upsert",
+            {"tenant_id": tenant_id, "traces": traces},
+        )
+
+    async def session_memories_in_window(
+        self,
+        *,
+        tenant_id: str,
+        fleet_id: str | None,
+        window_start: datetime,
+        window_end: datetime,
+    ) -> list[dict]:
+        """Run-scoped memories in the window for trace enumeration."""
+        return await self._post(  # type: ignore[return-value]
+            "/session-traces/memories-window",
+            {
+                "tenant_id": tenant_id,
+                "fleet_id": fleet_id,
+                "window_start": window_start.isoformat(),
+                "window_end": window_end.isoformat(),
+            },
+            read=True,
+        )
+
+    async def session_trace_entity_links(self, *, tenant_id: str, memory_ids: list[str]) -> list[dict]:
+        """``(memory_id, entity_id)`` pairs for a batch of memory ids."""
+        return await self._post(  # type: ignore[return-value]
+            "/session-traces/entity-links",
+            {"tenant_id": tenant_id, "memory_ids": memory_ids},
+            read=True,
+        )
+
+    async def forge_memory_content_by_ids(self, *, tenant_id: str, memory_ids: list[str]) -> list[dict]:
+        """Bulk ``(id, content)`` by memory id for the forge memory fetcher."""
+        return await self._post(  # type: ignore[return-value]
+            "/forge/memories-content",
+            {"tenant_id": tenant_id, "memory_ids": memory_ids},
+            read=True,
+        )
+
+    async def outcome_contradiction_signals(
+        self,
+        *,
+        tenant_id: str,
+        fleet_id: str | None,
+        window_start: datetime,
+        window_end: datetime,
+        contradicted_statuses: list[str],
+        run_id: str | None = None,
+        agent_id: str | None = None,
+    ) -> list[dict]:
+        return await self._post(  # type: ignore[return-value]
+            "/outcome-signals/contradictions",
+            {
+                "tenant_id": tenant_id,
+                "fleet_id": fleet_id,
+                "window_start": window_start.isoformat(),
+                "window_end": window_end.isoformat(),
+                "contradicted_statuses": contradicted_statuses,
+                "run_id": run_id,
+                "agent_id": agent_id,
+            },
+            read=True,
+        )
+
+    async def outcome_supersession_signals(
+        self,
+        *,
+        tenant_id: str,
+        fleet_id: str | None,
+        window_start: datetime,
+        window_end: datetime,
+        run_id: str | None = None,
+        agent_id: str | None = None,
+    ) -> list[dict]:
+        return await self._post(  # type: ignore[return-value]
+            "/outcome-signals/supersessions",
+            {
+                "tenant_id": tenant_id,
+                "fleet_id": fleet_id,
+                "window_start": window_start.isoformat(),
+                "window_end": window_end.isoformat(),
+                "run_id": run_id,
+                "agent_id": agent_id,
+            },
+            read=True,
+        )
+
+    async def outcome_cross_agent_reuse_signals(
+        self,
+        *,
+        tenant_id: str,
+        fleet_id: str | None,
+        window_start: datetime,
+        window_end: datetime,
+        threshold: int,
+        run_id: str | None = None,
+        agent_id: str | None = None,
+    ) -> list[dict]:
+        return await self._post(  # type: ignore[return-value]
+            "/outcome-signals/cross-agent-reuse",
+            {
+                "tenant_id": tenant_id,
+                "fleet_id": fleet_id,
+                "window_start": window_start.isoformat(),
+                "window_end": window_end.isoformat(),
+                "threshold": threshold,
+                "run_id": run_id,
+                "agent_id": agent_id,
+            },
+            read=True,
+        )
+
+    async def outcome_terminal_memory_signals(
+        self,
+        *,
+        tenant_id: str,
+        fleet_id: str | None,
+        window_start: datetime,
+        window_end: datetime,
+        run_id: str | None = None,
+        agent_id: str | None = None,
+    ) -> list[dict]:
+        return await self._post(  # type: ignore[return-value]
+            "/outcome-signals/terminal-memory",
+            {
+                "tenant_id": tenant_id,
+                "fleet_id": fleet_id,
+                "window_start": window_start.isoformat(),
+                "window_end": window_end.isoformat(),
+                "run_id": run_id,
+                "agent_id": agent_id,
+            },
+            read=True,
+        )
+
+    # =====================================================================
+    # Insights (Fix 2 Ph5b)
+    # =====================================================================
+    #
+    # Analytic memory reads (one per focus), the discover-sample row fetch
+    # (embedding included; numpy k-means stays client-side), the
+    # supersede/restore priors writes, and the lifecycle activity gate. The 6
+    # reads + the gate route to the replica (post-commit analytics — replica
+    # lag is harmless); the two priors writes hit the primary. Each takes an
+    # explicit tenant_id (+ scope params) — there are no RLS GUCs server-side.
+    # ``max_memories`` / ``sample_size`` forward the core-api tuning constants
+    # so they stay the single source of truth here.
+
+    async def insights_query_contradictions(
+        self, *, tenant_id: str, fleet_id: str | None, agent_id: str, scope: str, max_memories: int
+    ) -> list[dict]:
+        return await self._post(  # type: ignore[return-value]
+            "/insights/contradictions",
+            {
+                "tenant_id": tenant_id,
+                "fleet_id": fleet_id,
+                "agent_id": agent_id,
+                "scope": scope,
+                "max_memories": max_memories,
+            },
+            read=True,
+        )
+
+    async def insights_query_failures(
+        self, *, tenant_id: str, fleet_id: str | None, agent_id: str, scope: str, max_memories: int
+    ) -> list[dict]:
+        return await self._post(  # type: ignore[return-value]
+            "/insights/failures",
+            {
+                "tenant_id": tenant_id,
+                "fleet_id": fleet_id,
+                "agent_id": agent_id,
+                "scope": scope,
+                "max_memories": max_memories,
+            },
+            read=True,
+        )
+
+    async def insights_query_stale(
+        self,
+        *,
+        tenant_id: str,
+        fleet_id: str | None,
+        agent_id: str,
+        scope: str,
+        thirty_days_ago: datetime,
+        fourteen_days_ago: datetime,
+        max_memories: int,
+    ) -> list[dict]:
+        return await self._post(  # type: ignore[return-value]
+            "/insights/stale",
+            {
+                "tenant_id": tenant_id,
+                "fleet_id": fleet_id,
+                "agent_id": agent_id,
+                "scope": scope,
+                "thirty_days_ago": thirty_days_ago.isoformat(),
+                "fourteen_days_ago": fourteen_days_ago.isoformat(),
+                "max_memories": max_memories,
+            },
+            read=True,
+        )
+
+    async def insights_query_divergence(
+        self, *, tenant_id: str, fleet_id: str | None, agent_id: str, scope: str, max_memories: int
+    ) -> list[dict]:
+        return await self._post(  # type: ignore[return-value]
+            "/insights/divergence",
+            {
+                "tenant_id": tenant_id,
+                "fleet_id": fleet_id,
+                "agent_id": agent_id,
+                "scope": scope,
+                "max_memories": max_memories,
+            },
+            read=True,
+        )
+
+    async def insights_query_patterns(
+        self, *, tenant_id: str, fleet_id: str | None, agent_id: str, scope: str, max_memories: int
+    ) -> list[dict]:
+        return await self._post(  # type: ignore[return-value]
+            "/insights/patterns",
+            {
+                "tenant_id": tenant_id,
+                "fleet_id": fleet_id,
+                "agent_id": agent_id,
+                "scope": scope,
+                "max_memories": max_memories,
+            },
+            read=True,
+        )
+
+    async def insights_discover_sample(
+        self, *, tenant_id: str, fleet_id: str | None, agent_id: str, scope: str, sample_size: int
+    ) -> list[dict]:
+        """Sample active memories WITH embeddings for client-side k-means."""
+        return await self._post(  # type: ignore[return-value]
+            "/insights/discover-sample",
+            {
+                "tenant_id": tenant_id,
+                "fleet_id": fleet_id,
+                "agent_id": agent_id,
+                "scope": scope,
+                "sample_size": sample_size,
+            },
+            read=True,
+        )
+
+    async def insights_supersede_priors(
+        self, *, tenant_id: str, agent_id: str, focus: str, scope: str, fleet_id: str | None = None
+    ) -> dict:
+        """Atomically select + outdate prior active insights; primary write."""
+        return await self._post(  # type: ignore[return-value]
+            "/insights/supersede-priors",
+            {
+                "tenant_id": tenant_id,
+                "agent_id": agent_id,
+                "focus": focus,
+                "scope": scope,
+                "fleet_id": fleet_id,
+            },
+            read=False,
+        )
+
+    async def insights_restore_priors(self, *, tenant_id: str, prior_ids: list[str]) -> dict:
+        """Restore previously-outdated priors to active; primary write."""
+        return await self._post(  # type: ignore[return-value]
+            "/insights/restore-priors",
+            {"tenant_id": tenant_id, "prior_ids": prior_ids},
+            read=False,
+        )
+
+    async def insights_activity_gate(self, *, tenant_id: str, fleet_id: str | None) -> dict:
+        """MAX(created_at) for non-insight vs insight memories (lifecycle gate)."""
+        return await self._post(  # type: ignore[return-value]
+            "/insights/activity-gate",
+            {"tenant_id": tenant_id, "fleet_id": fleet_id},
+            read=True,
+        )
+
+    # =====================================================================
+    # Evolve (Fix 2 Ph5b, PR2)
+    # =====================================================================
+    #
+    # The scope-filter SELECT (read → replica; the filter is a pre-write
+    # visibility check and replica lag is harmless) and the atomic
+    # weight-adjust + rule→outcome backfill (write → primary, ONE txn). Each
+    # takes an explicit tenant_id (+ scope params) — there are no RLS GUCs
+    # server-side. The dedup / UUID-parse / cap / rounding / skip-reason logic
+    # stays client-side in ``evolve_service``; only the DB passes route here.
+
+    async def evolve_filter_by_scope(
+        self,
+        *,
+        tenant_id: str,
+        caller_agent_id: str,
+        fleet_id: str | None,
+        scope: str,
+        ids: list[str],
+    ) -> list[str]:
+        """Return the subset of ``ids`` the caller can touch under ``scope``."""
+        resp = await self._post(
+            "/evolve/filter-by-scope",
+            {
+                "tenant_id": tenant_id,
+                "caller_agent_id": caller_agent_id,
+                "fleet_id": fleet_id,
+                "scope": scope,
+                "ids": ids,
+            },
+            read=True,
+        )
+        return resp["allowed_ids"]  # type: ignore[index,return-value]
+
+    async def evolve_apply_weights(
+        self,
+        *,
+        tenant_id: str,
+        ids: list[str],
+        delta: float,
+        floor: float,
+        cap: float,
+        rule_id: str | None = None,
+        outcome_id: str | None = None,
+    ) -> dict:
+        """Clamp-adjust weights + (atomically) backfill the rule→outcome link;
+        primary write, ONE transaction. Returns
+        ``{adjustments:[{id, old_weight, new_weight}], backfilled}``."""
+        return await self._post(  # type: ignore[return-value]
+            "/evolve/apply-weights",
+            {
+                "tenant_id": tenant_id,
+                "ids": ids,
+                "delta": delta,
+                "floor": floor,
+                "cap": cap,
+                "rule_id": rule_id,
+                "outcome_id": outcome_id,
+            },
+            read=False,
         )
 
     # =====================================================================
@@ -1187,11 +2028,15 @@ class CoreStorageClient:
         if agent_id is not None:
             params["agent_id"] = agent_id
         headers = await self._auth_headers(read=True)
-        resp = await self._read_http.get(
-            f"{self._read_prefix}/keystones",
-            params=params,
-            headers=headers,
-        )
+
+        def _do() -> Awaitable[httpx.Response]:
+            return self._read_http.get(
+                f"{self._read_prefix}/keystones",
+                params=params,
+                headers=headers,
+            )
+
+        resp = await self._execute(_do, retry=with_retry, label="GET /keystones")
         self._maybe_evict_on_auth_error(resp, read=True)
         resp.raise_for_status()
         truncated = resp.headers.get("X-Truncated", "").lower() == "true"
@@ -1290,6 +2135,28 @@ class CoreStorageClient:
     async def delete_fleet(self, tenant_id: str, fleet_id: str) -> bool:
         return await self._delete(f"/fleet/{fleet_id}", tenant_id=tenant_id)
 
+    async def fleet_in_flight_deploy(self, *, node_id: UUID, since: datetime) -> bool:
+        result = await self._get(
+            "/fleet/commands/in-flight-deploy",
+            # primary, not replica: read-after-write deploy-dedup gate — it must see
+            # a deploy command queued by a prior heartbeat, or replica lag lets a
+            # duplicate through (the acked-stuck-queue storm this gate prevents).
+            read=False,
+            node_id=str(node_id),
+            since=since.isoformat(),
+        )
+        return bool((result or {}).get("in_flight"))
+
+    async def fleet_deploy_attempt_count(self, *, node_id: UUID, target_version: str, since: datetime) -> int:
+        result = await self._get(
+            "/fleet/commands/deploy-attempt-count",
+            read=False,  # primary: attempt budget must count just-queued deploys (see fleet_in_flight_deploy)
+            node_id=str(node_id),
+            target_version=target_version,
+            since=since.isoformat(),
+        )
+        return int((result or {}).get("count", 0))
+
     # =====================================================================
     # Idempotency inbox
     # =====================================================================
@@ -1329,8 +2196,8 @@ class CoreStorageClient:
         """
         headers = await self._auth_headers(read=False)
 
-        async def _do() -> httpx.Response:
-            return await self._http.post(
+        def _do() -> Awaitable[httpx.Response]:
+            return self._http.post(
                 f"{self._prefix}/idempotency/claim",
                 json={
                     "tenant_id": tenant_id,
@@ -1341,7 +2208,7 @@ class CoreStorageClient:
                 headers=headers,
             )
 
-        resp = await _post_with_retry(_do, label="POST /idempotency/claim")
+        resp = await self._execute(_do, retry=with_connect_phase_retry, label="POST /idempotency/claim")
         self._maybe_evict_on_auth_error(resp, read=False)
         if resp.status_code == 201:
             return True, resp.json()
@@ -1393,8 +2260,17 @@ class CoreStorageClient:
     async def create_audit_logs_bulk(self, events: list[dict]) -> dict:
         """Batched audit insert (CAURA-628). One HTTP POST + one
         multi-row INSERT regardless of batch size, vs N round-trips +
-        N table-lock acquisitions on the legacy single-event path."""
-        return await self._post("/audit-logs/bulk", {"events": events})  # type: ignore[return-value]
+        N table-lock acquisitions on the legacy single-event path.
+
+        ``idempotent=True``: each event carries a ``client_event_id`` (minted in
+        ``log_action``) and storage dedups on it under the per-tenant chain-head
+        lock, so a retry on ReadTimeout / 5xx re-sends the same ids and any
+        already-committed events are skipped — no double-append to the
+        tamper-evident chain. This recovers the lost-ack case that previously
+        dropped a whole tenant's audit slice (connect-phase-only retry)."""
+        return await self._post(  # type: ignore[return-value]
+            "/audit-logs/bulk", {"events": events}, idempotent=True
+        )
 
     async def list_audit_logs(
         self,
@@ -1414,6 +2290,21 @@ class CoreStorageClient:
         if resource_type is not None:
             params["resource_type"] = resource_type
         return await self._get_list("/audit-logs", **params)
+
+    async def verify_audit_chain(self, tenant_id: str, limit: int = 100_000) -> dict:
+        """Verify a tenant's tamper-evident audit hash chain.
+
+        Returns ``{valid, verified_count, head_seq}`` (or ``first_broken``
+        on a detected break). Used by the enterprise governance UI's
+        "chain intact" check.
+        """
+        result = await self._get("/audit-logs/verify", tenant_id=tenant_id, limit=limit)
+        # Propagate failures: a None here means a network/5xx error. Returning
+        # {} would hand callers a dict with no "valid" key, turning the real
+        # error into a confusing KeyError downstream.
+        if result is None:
+            raise RuntimeError("verify_audit_chain: empty response from storage service")
+        return result
 
     # =====================================================================
     # Lifecycle audit (CAURA-655)
@@ -1472,6 +2363,74 @@ class CoreStorageClient:
             since_hours=since_hours,
         )
         return bool((result or {}).get("has_recent_success"))
+
+    # =====================================================================
+    # Organization settings (Fix 2 Phase 0)
+    # =====================================================================
+
+    async def get_org_settings(self, org_id: str) -> dict:
+        """Return the org's raw setting overrides (``{}`` when unset).
+
+        Read path (rides the connect-phase retry budget). core-api fronts
+        this with a 5-min TTL cache, so it's hit only on a cache miss.
+        """
+        result = await self._get(f"/organization-settings/{org_id}")
+        return (result or {}).get("settings", {})
+
+    async def update_org_settings(
+        self, org_id: str, settings: dict, *, changed_by: str | None = None
+    ) -> dict:
+        """Transactional upsert + audit, server-side. Returns
+        ``{"settings": <merged overrides>, "changed": bool}``.
+
+        Non-idempotent ``_post`` (connection-phase retry only): a write whose
+        response was lost is never replayed. Re-applying the same payload is a
+        no-op anyway — the server diffs it to empty and writes nothing.
+        """
+        result = await self._post(
+            f"/organization-settings/{org_id}",
+            {"settings": settings, "changed_by": changed_by},
+        )
+        # _post is typed dict | list; the endpoint always returns an object.
+        # Guard so an unexpected shape (error envelope, schema drift) fails with
+        # a diagnostic here rather than a bare TypeError on result["settings"]
+        # in the caller — and the narrowing lets us drop the return-value ignore.
+        if not isinstance(result, dict):
+            raise ValueError(
+                f"core-storage-api returned unexpected type for org-settings update: "
+                f"{type(result).__name__!r}"
+            )
+        return result
+
+    # =====================================================================
+    # Tenant discovery (Fix 2 Phase 1) — lifecycle-fanout target lists
+    # =====================================================================
+
+    # ``_get`` returns None on HTTP 404. These endpoints always return 200 with
+    # an envelope (an empty list when there are no tenants), so None means the
+    # endpoint is MISSING (wrong prefix / version skew / routing). Raise rather
+    # than degrade to [] — a silent empty list would make the lifecycle fanout
+    # publish zero messages and report success, hiding the misconfiguration.
+    async def list_active_tenants(self) -> list[str]:
+        """Orgs with at least one live (non-soft-deleted) memory."""
+        result = await self._get("/tenants/active")
+        if result is None:
+            raise RuntimeError("core-storage-api /tenants/active returned 404")
+        return result.get("tenant_ids", [])
+
+    async def list_purgeable_tenants(self) -> list[str]:
+        """Orgs with soft-deleted memories older than the max retention window."""
+        result = await self._get("/tenants/purgeable")
+        if result is None:
+            raise RuntimeError("core-storage-api /tenants/purgeable returned 404")
+        return result.get("tenant_ids", [])
+
+    async def list_skills_factory_enabled_orgs(self) -> list[str]:
+        """Orgs whose ``skills_factory.enabled`` setting is True."""
+        result = await self._get("/tenants/skills-factory-enabled")
+        if result is None:
+            raise RuntimeError("core-storage-api /tenants/skills-factory-enabled returned 404")
+        return result.get("org_ids", [])
 
     # =====================================================================
     # Reports

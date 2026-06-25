@@ -7,15 +7,12 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
-from sqlalchemy.ext.asyncio import AsyncSession
 
 logger = logging.getLogger(__name__)
 
 from core_api.auth import AuthContext, get_auth_context
 from core_api.clients.storage_client import get_storage_client
 from core_api.constants import NODE_OFFLINE_SECONDS, NODE_STALE_SECONDS
-from core_api.db.session import get_db
-from core_api.repositories import fleet_repo
 from core_api.services.audit_service import log_action
 from core_api.services.organization_settings import get_raw_settings
 from core_api.version_compat import (
@@ -32,6 +29,27 @@ from core_api.version_compat import (
 # 10 min is generous slack that still recovers genuinely-abandoned
 # commands without needing operator intervention.
 DEPLOY_IN_FLIGHT_WINDOW = timedelta(minutes=10)
+
+# CAURA-000: per-(node, target_version) auto-upgrade attempt budget.
+# The in-flight window above only suppresses concurrent storms; it does
+# nothing to stop a node being re-queued every heartbeat (~60s) forever
+# when it never converges to the target. That happens for failure modes
+# the plugin can't self-detect (persistent /plugin-source fetch errors,
+# unsafe-filename manifest aborts) and — most insidiously — when a deploy
+# "succeeds" but the served manifest version sits below MIN_RECOMMENDED,
+# so every attempt reports success, clears the plugin's cooldown, and
+# still never advances the version. After AUTO_UPGRADE_MAX_ATTEMPTS
+# deploys for the same target within AUTO_UPGRADE_ATTEMPT_WINDOW the gate
+# stops queuing and logs a warning for operator follow-up.
+#
+# A healthy upgrade converges in ONE attempt — the next heartbeat reports
+# the new version and the gate exits at the ``_semver_lt`` check before
+# this budget is ever consulted — so the budget is invisible to
+# legitimate upgrades. 5 attempts absorbs transient flakiness (a one-off
+# network blip on /plugin-source, a transient build OOM) while capping a
+# true wedge at 5 deploys/day instead of ~1,440.
+AUTO_UPGRADE_ATTEMPT_WINDOW = timedelta(hours=24)
+AUTO_UPGRADE_MAX_ATTEMPTS = 5
 
 router = APIRouter(tags=["Fleet"])
 
@@ -152,7 +170,6 @@ class CommandResultIn(BaseModel):
 async def create_fleet(
     body: FleetCreateIn,
     auth: AuthContext = Depends(get_auth_context),
-    db: AsyncSession = Depends(get_db),
 ):
     """Explicitly create a fleet (team) within a tenant."""
     auth.enforce_read_only()
@@ -183,13 +200,11 @@ async def create_fleet(
         }
     )
     await log_action(
-        db,
         tenant_id=body.tenant_id,
         action="create",
         resource_type="fleet",
         detail={"fleet_id": body.fleet_id, "display_name": body.display_name},
     )
-    await db.commit()
     return {"ok": True, "fleet_id": body.fleet_id, "tenant_id": body.tenant_id}
 
 
@@ -222,7 +237,6 @@ async def delete_fleet(
     fleet_id: str,
     tenant_id: str = Query(...),
     auth: AuthContext = Depends(get_auth_context),
-    db: AsyncSession = Depends(get_db),
 ):
     """Delete a fleet and all its nodes. Memories are NOT deleted (they retain fleet_id for history)."""
     auth.enforce_read_only()
@@ -238,13 +252,11 @@ async def delete_fleet(
     # Delete all commands for fleet nodes, then delete nodes
     await sc.delete_fleet(tenant_id=tenant_id, fleet_id=fleet_id)
     await log_action(
-        db,
         tenant_id=tenant_id,
         action="delete",
         resource_type="fleet",
         detail={"fleet_id": fleet_id, "nodes_deleted": node_count},
     )
-    await db.commit()
 
 
 @router.post("/fleet/{fleet_id}/purge")
@@ -252,7 +264,6 @@ async def purge_fleet(
     fleet_id: str,
     tenant_id: str = Query(...),
     auth: AuthContext = Depends(get_auth_context),
-    db: AsyncSession = Depends(get_db),
 ):
     """Permanently purge a fleet's entire footprint within a tenant.
 
@@ -277,13 +288,11 @@ async def purge_fleet(
     sc = get_storage_client()
     counts = await sc.purge_fleet_data(tenant_id, fleet_id)
     await log_action(
-        db,
         tenant_id=tenant_id,
         action="purge",
         resource_type="fleet",
         detail={"fleet_id": fleet_id, "deleted": counts},
     )
-    await db.commit()
     return {"ok": True, "tenant_id": tenant_id, "fleet_id": fleet_id, "deleted": counts}
 
 
@@ -334,12 +343,12 @@ def _semver_lt(a: str | None, b: str | None) -> bool:
         return False
 
 
-async def _auto_upgrade_enabled_for_tenant(db: AsyncSession, tenant_id: str) -> bool:
+async def _auto_upgrade_enabled_for_tenant(tenant_id: str) -> bool:
     """Default true; per-tenant flip via
     ``organization_settings.memclaw.auto_upgrade_enabled = false``.
     """
     try:
-        raw = await get_raw_settings(db, tenant_id)
+        raw = await get_raw_settings(tenant_id)
         flag = raw.get("memclaw", {}).get("auto_upgrade_enabled")
         # None (no override) → use the global default (true).
         return flag is not False
@@ -381,7 +390,6 @@ def _has_recent_deploy_command_from_list(pending: list) -> bool:
 
 async def _maybe_queue_auto_upgrade(
     *,
-    db: AsyncSession,
     sc,
     body: "HeartbeatIn",
     pending_commands: list,
@@ -450,7 +458,7 @@ async def _maybe_queue_auto_upgrade(
         and body.deploy_blocked_until < now_ms + MAX_BLOCK_MS
     ):
         return False
-    if not await _auto_upgrade_enabled_for_tenant(db, body.tenant_id):
+    if not await _auto_upgrade_enabled_for_tenant(body.tenant_id):
         return False
     if _has_recent_deploy_command_from_list(pending_commands):
         return False
@@ -466,8 +474,7 @@ async def _maybe_queue_auto_upgrade(
     # doesn't break the upgrade path entirely (the pending check above
     # is already a safety net).
     try:
-        in_flight = await fleet_repo.has_recent_in_flight_deploy(
-            db,
+        in_flight = await sc.fleet_in_flight_deploy(
             node_id=UUID(node_id),
             since=datetime.now(UTC) - DEPLOY_IN_FLIGHT_WINDOW,
         )
@@ -487,6 +494,41 @@ async def _maybe_queue_auto_upgrade(
             "deploy is already in flight within the last %s",
             body.node_name,
             DEPLOY_IN_FLIGHT_WINDOW,
+        )
+        return False
+    # CAURA-000: attempt budget — stop re-queuing against a node that
+    # never converges to the target. See AUTO_UPGRADE_MAX_ATTEMPTS for
+    # the full rationale. Placed after the cheaper in-flight check so
+    # the count query only runs on the rare
+    # outdated-eligible-and-not-in-flight path. Fail-open on DB error,
+    # consistent with the in-flight check above: a transient hiccup must
+    # not permanently wedge a legitimate upgrade.
+    try:
+        recent_attempts = await sc.fleet_deploy_attempt_count(
+            node_id=UUID(node_id),
+            target_version=target_version,
+            since=datetime.now(UTC) - AUTO_UPGRADE_ATTEMPT_WINDOW,
+        )
+    except Exception:
+        logger.warning(
+            "fleet.heartbeat: count_recent_deploys_for_target lookup failed "
+            "node=%s tenant=%s — falling back to allow",
+            body.node_name,
+            body.tenant_id,
+            exc_info=True,
+        )
+        recent_attempts = 0
+    if recent_attempts >= AUTO_UPGRADE_MAX_ATTEMPTS:
+        logger.warning(
+            "fleet.heartbeat: auto-upgrade budget exhausted for node=%s "
+            "target=%s (%d attempts in %s) — not re-queuing. Node is not "
+            "converging to the target version; manual intervention likely "
+            "required (check the node's deploy command results and plugin "
+            "logs).",
+            body.node_name,
+            target_version,
+            recent_attempts,
+            AUTO_UPGRADE_ATTEMPT_WINDOW,
         )
         return False
 
@@ -529,7 +571,6 @@ async def _maybe_queue_auto_upgrade(
 async def heartbeat(
     body: HeartbeatIn,
     auth: AuthContext = Depends(get_auth_context),
-    db: AsyncSession = Depends(get_db),
 ):
     """Plugin pushes status; receives pending commands in response."""
     auth.enforce_tenant(body.tenant_id)
@@ -635,7 +676,6 @@ async def heartbeat(
             display_name = raw_dn[:255] if isinstance(raw_dn, str) else None
             try:
                 await get_or_create_agent(
-                    db,
                     tenant_id=body.tenant_id,
                     agent_id=agent_key,
                     fleet_id=body.fleet_id,
@@ -653,36 +693,6 @@ async def heartbeat(
                     exc_info=True,
                 )
                 failed_agents.append(str(agent_key))
-                # Clear any ``PendingRollbackError`` left on the session
-                # by the failed call (e.g. a flush that hit
-                # IntegrityError) so subsequent iterations of the loop
-                # can use the session normally instead of cascading
-                # rollback errors. Best-effort — if the rollback itself
-                # fails the session is still poisoned, but we can't do
-                # better than swallow and continue.
-                try:
-                    await db.rollback()
-                except Exception:
-                    pass
-        # Persist any audit rows (``agent_registered``) that
-        # ``get_or_create_agent`` queued on the local session. The
-        # storage-api's agent row was already committed by the HTTP
-        # call inside the loop; this is just for the audit side-effect.
-        # Guarded because a per-agent failure inside the loop above can
-        # leave the SQLAlchemy session in an error state — without the
-        # try/except, a ``PendingRollbackError`` here would 500 the
-        # heartbeat and drop the pending-commands response, which is
-        # the route's actual contract. Same posture as the per-agent
-        # exception swallow: best-effort observability, never break
-        # the heartbeat.
-        try:
-            await db.commit()
-        except Exception:
-            logger.warning(
-                "fleet.heartbeat: failed to commit audit rows for tenant=%s",
-                body.tenant_id,
-                exc_info=True,
-            )
         # Summary log so the committed audit trail is recoverable: the
         # individual per-agent warnings above are stack-traced but not
         # easy to correlate; this single line tells the on-call exactly
@@ -738,7 +748,7 @@ async def heartbeat(
     node_id_for_queue = node.get("id") if isinstance(node, dict) else None
     if node_id_for_queue:
         queued_new = await _maybe_queue_auto_upgrade(
-            db=db, sc=sc, body=body, pending_commands=pending, node_id=str(node_id_for_queue)
+            sc=sc, body=body, pending_commands=pending, node_id=str(node_id_for_queue)
         )
     else:
         queued_new = False

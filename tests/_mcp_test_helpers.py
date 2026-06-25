@@ -84,6 +84,35 @@ def is_error_envelope(result: Any) -> bool:
     return isinstance(result, CallToolResult) and result.isError is True
 
 
+def stub_storage_client(monkeypatch, **method_returns):
+    """Replace ``get_storage_client`` with a MagicMock whose methods return
+    the requested values. Each kwarg is the method name (e.g. ``get_agent``,
+    ``list_document_collections``) and the value is the awaited result.
+
+    Fix 2 Phase 4 routed the 9 ready MCP tools through the core-storage-api
+    HTTP client, so the handlers resolve their DB access via
+    ``get_storage_client().<method>`` rather than the old ``db``-bound repo /
+    service calls. Unit tests that want deterministic returns / call-arg
+    assertions stub the client here. (The conftest's autouse ASGI bridge would
+    otherwise serve real in-process storage on the test engine — fine for
+    integration coverage, but these unit tests assert on the exact storage
+    interaction.) Mirrors the helper ``test_mcp_keystones`` introduced for the
+    already-routed keystone tools.
+    """
+    sc = MagicMock(name="storage_client")
+    for name, ret in method_returns.items():
+        setattr(sc, name, AsyncMock(return_value=ret))
+
+    def _factory():
+        return sc
+
+    # The handler binds ``get_storage_client`` at module import time, so the
+    # test must patch the alias on ``mcp_server`` (where Python resolves it at
+    # call time) — not the original module path.
+    monkeypatch.setattr("core_api.mcp_server.get_storage_client", _factory)
+    return sc
+
+
 @pytest.fixture
 def mcp_env(monkeypatch):
     """Patch the common MCP handler dependencies and yield a control dict.
@@ -117,14 +146,19 @@ def mcp_env(monkeypatch):
 
     monkeypatch.setattr(mcp_server, "_check_auth", lambda: None)
     monkeypatch.setattr(mcp_server, "_get_tenant", lambda: tenant)
-    monkeypatch.setattr(mcp_server, "_mcp_session", fake_session)
+    # Fix 2 Ph5b (PR2): ``_mcp_session`` was deleted once ``memclaw_evolve`` —
+    # its last consumer — migrated to ``_no_db()``. Every MCP handler now opens
+    # ``_no_db()`` (yields None; storage-routed services carry tenant context
+    # explicitly). Patch it with the MagicMock-yielding session so handlers that
+    # still bind ``async with _no_db() as db`` get a harmless stand-in.
+    monkeypatch.setattr(mcp_server, "_no_db", fake_session)
 
     # Stub out usage metering so it doesn't hit the DB.
     monkeypatch.setattr(mcp_server, "check_and_increment", AsyncMock(return_value=None))
 
     # `_require_trust` is exercised directly in tests that need it; here we
     # pre-emptively bypass it so handlers under test don't fail on agent lookup.
-    async def _always_allow(db, tenant_id, agent_id, min_level):
+    async def _always_allow(tenant_id, agent_id, min_level):
         return 3, False, None  # max trust, not_found=False, no error
 
     monkeypatch.setattr(mcp_server, "_require_trust", _always_allow)
@@ -133,7 +167,7 @@ def mcp_env(monkeypatch):
     # in unit tests there's no real DB, so stub it as a no-op returning the
     # caller's identity. Tests that want to assert the call replace this via
     # ``service("enforce_fleet_write")``.
-    async def _stub_enforce_fleet_write(db, tenant_id, agent_id, fleet_id):
+    async def _stub_enforce_fleet_write(tenant_id, agent_id, fleet_id):
         return {
             "agent_id": agent_id,
             "tenant_id": tenant_id,

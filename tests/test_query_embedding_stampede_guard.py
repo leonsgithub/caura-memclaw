@@ -17,6 +17,8 @@ from unittest.mock import patch
 
 import pytest
 
+from core_api.config import settings
+from core_api.middleware import per_tenant_concurrency
 from core_api.services import memory_service
 
 pytestmark = [pytest.mark.unit]
@@ -243,3 +245,96 @@ async def test_timeout_propagates_to_all_waiters():
     for r in results:
         assert isinstance(r, asyncio.TimeoutError)
     assert memory_service._inflight_embeddings == {}
+
+
+async def test_solo_leader_failure_future_exception_is_consumed():
+    """REGRESSION (prod 2026-06-12): with NO joiners — the common
+    single-caller case — the leader's ``set_exception`` on the inflight
+    future was never retrieved, so the future's GC logged ERROR
+    "Future exception was never retrieved" through the loop exception
+    handler on every solo search-embed timeout. The leader must mark
+    the exception retrieved after setting it; joiners still see the
+    raise from ``await fut``.
+    """
+    import gc
+
+    async def _boom(query, tenant_config):
+        raise TimeoutError
+
+    async def _miss(_key):
+        return None
+
+    handler_calls: list[dict] = []
+    loop = asyncio.get_running_loop()
+    prev_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, ctx: handler_calls.append(ctx))
+    try:
+        with (
+            patch.object(memory_service, "get_query_embedding", new=_boom),
+            patch("core_api.cache.cache_get", new=_miss),
+        ):
+            with pytest.raises(TimeoutError):
+                await memory_service._get_or_cache_embedding(
+                    "q-solo-timeout", "t1", None
+                )
+        # The orphaned future only logs at GC time — force it, then yield
+        # once so anything the handler scheduled gets to run.
+        gc.collect()
+        await asyncio.sleep(0)
+        gc.collect()
+    finally:
+        loop.set_exception_handler(prev_handler)
+
+    unretrieved = [
+        c for c in handler_calls if "never retrieved" in (c.get("message") or "")
+    ]
+    assert not unretrieved, unretrieved
+
+
+async def test_embed_slot_only_held_by_leader(monkeypatch):
+    """The per-tenant embed slot (noisy-neighbor-search guard) is taken
+    only by the single-flight leader. With the cap pinned to 1, N
+    concurrent cold callers for the SAME query must all succeed: the
+    leader holds the one slot and joiners await its future without
+    touching the slot. If joiners each tried to acquire, callers 2..N
+    would 429 — so a clean run proves joiners are slot-free.
+    """
+    monkeypatch.setattr(settings, "per_tenant_embed_concurrency", 1)
+    per_tenant_concurrency._reset_for_tests()
+
+    embed_calls = 0
+
+    async def _slow_embed(query, tenant_config):
+        nonlocal embed_calls
+        embed_calls += 1
+        await asyncio.sleep(0.05)
+        return _FAKE_EMBED
+
+    async def _miss(_key):
+        return None
+
+    async def _noop_set(_key, _value, ttl=0):
+        return None
+
+    try:
+        with (
+            patch.object(memory_service, "get_query_embedding", new=_slow_embed),
+            patch("core_api.cache.cache_get", new=_miss),
+            patch("core_api.cache.cache_set", new=_noop_set),
+        ):
+            results = await asyncio.gather(
+                *[
+                    memory_service._get_or_cache_embedding("novel q", "tenant-A", None)
+                    for _ in range(5)
+                ],
+                return_exceptions=True,
+            )
+        # Leader released its single slot — a fresh acquire succeeds (cap=1).
+        async with per_tenant_concurrency.per_tenant_slot("embed", "tenant-A"):
+            pass
+    finally:
+        per_tenant_concurrency._reset_for_tests()
+
+    # No 429s despite cap=1: joiners never tried to take the slot.
+    assert all(r == _FAKE_EMBED for r in results), results
+    assert embed_calls == 1

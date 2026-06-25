@@ -82,6 +82,13 @@ MEMORY_FIELDS: list[str] = [
     "supersedes_id",
 ]
 
+# Same as MEMORY_FIELDS minus the two large columns (a 1536-dim ``embedding``
+# vector + the ``search_vector`` tsvector). Use for list/bundle endpoints whose
+# core-api consumers don't read the vector (admin list, contradiction rows):
+# serialising the full vector ships ~hundreds of KB per row over the internal
+# network only for ``_memory_to_out`` to discard it.
+MEMORY_LIST_FIELDS: list[str] = [f for f in MEMORY_FIELDS if f not in ("embedding", "search_vector")]
+
 ENTITY_FIELDS: list[str] = [
     "id",
     "tenant_id",
@@ -185,6 +192,10 @@ AUDIT_LOG_FIELDS: list[str] = [
     "resource_id",
     "detail",
     "created_at",
+    # Chain seq surfaces in list responses (JSON-safe int); the raw
+    # ``prev_hash``/``event_hash`` bytes are intentionally NOT listed
+    # here — the /verify endpoint hex-encodes them in its own response.
+    "seq",
 ]
 
 REPORT_FIELDS: list[str] = [

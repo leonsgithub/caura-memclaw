@@ -17,8 +17,6 @@ import uuid as _uuid
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from core_api.cache import cache_set_nx
 from core_api.clients.storage_client import get_storage_client
 from core_api.config import settings
@@ -201,7 +199,7 @@ async def detect_contradictions_async(
         if not new_memory or new_memory.get("deleted_at") is not None:
             return
 
-        tenant_config = await resolve_config(None, tenant_id)
+        tenant_config = await resolve_config(tenant_id)
         contradictions = await _detect(new_memory, embedding, tenant_config)
         n_conflicts = len(contradictions) if contradictions else 0
 
@@ -231,7 +229,6 @@ async def detect_contradictions_async(
 
 
 async def detect_contradictions(
-    db: AsyncSession,
     new_memory,
     embedding: list[float],
     tenant_config=None,
@@ -428,7 +425,9 @@ async def _detect(
             )
 
         if rdf_updates:
-            rdf_result = await sc.batch_update_status({"updates": list(rdf_updates.values())})
+            rdf_result = await sc.batch_update_status(
+                {"updates": list(rdf_updates.values())}, tenant_id=tenant_id
+            )
             if rdf_result.get("skipped"):
                 # ``skipped`` carries rows the storage-side dropped — CAS
                 # gate fail (caller-supplied ``expected_supersedes_id``
@@ -586,7 +585,9 @@ async def _detect(
                     )
 
             if updates:
-                sem_result = await sc.batch_update_status({"updates": list(updates.values())})
+                sem_result = await sc.batch_update_status(
+                    {"updates": list(updates.values())}, tenant_id=tenant_id
+                )
                 if sem_result.get("skipped"):
                     # See RDF path above for the ``skipped`` semantics.
                     logger.warning(
@@ -1214,6 +1215,31 @@ def _extract_subject_canonical_identity(
     return None
 
 
+_ENTITY_CTX_FANOUT_LIMIT = 8
+
+
+async def _bounded_gather(coros, limit=_ENTITY_CTX_FANOUT_LIMIT):
+    """``asyncio.gather`` capped at ``limit`` concurrent coroutines.
+
+    The Path-C entity-context fan-out (one ``_fetch_entity_context`` per
+    candidate — up to ``_ENTITY_LINKS_DETECTION_FETCH_MAX_CANDIDATES`` — each
+    hydrating N entity links) would otherwise open dozens of simultaneous
+    storage handshakes that saturate the Cloud Run VPC connector and surface as
+    ``ConnectTimeout`` storms. Capping concurrency keeps each burst within the
+    connector's handshake headroom; combined with the storage client's warm
+    keep-alive pool the calls reuse connections instead of re-handshaking. A
+    fresh semaphore per call (bound to the running loop) sidesteps cross-loop
+    binding issues in tests. Order is preserved (``gather`` semantics).
+    """
+    sem = asyncio.Semaphore(limit)
+
+    async def _run(coro):
+        async with sem:
+            return await coro
+
+    return await asyncio.gather(*(_run(c) for c in coros))
+
+
 async def _fetch_entity_context(sc, memory_id: str) -> list[dict]:
     """Fetch and denormalise ``MemoryEntityLink`` rows for a single memory.
 
@@ -1269,7 +1295,7 @@ async def _fetch_entity_context(sc, memory_id: str) -> list[dict]:
             "entity_id": str(entity_id),
         }
 
-    hydrated = await asyncio.gather(*(_hydrate(link) for link in links))
+    hydrated = await _bounded_gather([_hydrate(link) for link in links])
     return [h for h in hydrated if h is not None]
 
 
@@ -1517,12 +1543,28 @@ async def _attempt_path_c_retraction(
         )
         return False
 
-    # Two-step retraction via A4 #10.
-    await sc.update_memory_status(str(candidate.get("id")), "active")
+    # Two-step retraction via A4 #10. Each write is scoped to the HOME tenant
+    # of the row it touches — the candidate and new_memory live in the same
+    # (trigger) tenant, but we pass each row's own ``tenant_id`` so the
+    # storage-layer cross-tenant guard never silently no-ops a legitimate write.
+    # Extract each row's home tenant explicitly. ``get_memory`` always
+    # serialises ``tenant_id`` (NOT NULL column in MEMORY_FIELDS), so this
+    # never fires in practice — but raising beats ``str(None)`` -> "None",
+    # which would silently match no row and turn the retraction into a
+    # no-op rather than surfacing the broken invariant.
+    cand_tenant = candidate.get("tenant_id")
+    new_tenant = new_memory.get("tenant_id")
+    if not cand_tenant or not new_tenant:
+        raise ValueError(
+            f"Path C retraction missing tenant_id (candidate={candidate.get('id')}, "
+            f"new_memory={new_memory.get('id')})"
+        )
+    await sc.update_memory_status(str(candidate.get("id")), "active", tenant_id=cand_tenant)
     try:
         await sc.update_memory_status(
             str(new_memory.get("id")),
             new_memory.get("status", "active"),
+            tenant_id=new_tenant,
             unset_supersedes=True,
             expected_supersedes_id=str(candidate.get("id")),
         )
@@ -1591,7 +1633,7 @@ async def detect_contradictions_by_entities_async(
         if not new_memory or new_memory.get("deleted_at") is not None:
             return
 
-        tenant_config = await resolve_config(None, tenant_id)
+        tenant_config = await resolve_config(tenant_id)
 
         # A4 #13 — re-judge Path A's verdict (if any) before the
         # standard entity-overlap detection. Phases are independent:
@@ -1739,9 +1781,11 @@ async def detect_contradictions_by_entities_async(
         else:
             try:
                 fetched = await asyncio.wait_for(
-                    asyncio.gather(
-                        _fetch_entity_context(sc, str(memory_id)),
-                        *(_fetch_entity_context(sc, str(c.get("id"))) for c in candidates),
+                    _bounded_gather(
+                        [
+                            _fetch_entity_context(sc, str(memory_id)),
+                            *(_fetch_entity_context(sc, str(c.get("id"))) for c in candidates),
+                        ]
                     ),
                     timeout=_CONTEXT_FETCH_TIMEOUT_SECONDS,
                 )
@@ -1971,7 +2015,9 @@ async def detect_contradictions_by_entities_async(
                 )
 
         if updates:
-            path_c_result = await sc.batch_update_status({"updates": list(updates.values())})
+            path_c_result = await sc.batch_update_status(
+                {"updates": list(updates.values())}, tenant_id=tenant_id
+            )
             if path_c_result.get("skipped"):
                 # See RDF path in ``_detect`` for the ``skipped`` semantics.
                 logger.warning(

@@ -6,6 +6,152 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Subsequent releases are produced by [release-please](https://github.com/googleapis/release-please-action)
 from [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [2.17.0](https://github.com/caura-ai/caura-memclaw/compare/backend-v2.16.0...backend-v2.17.0) (2026-06-24)
+
+
+### Features
+
+* **audit:** tamper-evident per-tenant hash chain for audit_log (eToro governance) ([#397](https://github.com/caura-ai/caura-memclaw/issues/397)) ([baaa493](https://github.com/caura-ai/caura-memclaw/commit/baaa493cdc8a2bf71d031b0f457844d389c8f6c4))
+* **core-api:** cross-worker settings-cache invalidation (CAURA-571) ([#418](https://github.com/caura-ai/caura-memclaw/issues/418)) ([86bbe9e](https://github.com/caura-ai/caura-memclaw/commit/86bbe9ec0aa061741df0422bdc5b8dec286fa654))
+* **core-api:** fast business/personal pre-gate before enrichment (opt-in) ([#403](https://github.com/caura-ai/caura-memclaw/issues/403)) ([095c360](https://github.com/caura-ai/caura-memclaw/commit/095c36043ebeeb1c13e7cde79895bfda6aa324f6))
+* **core-api:** install-skill ?skill= selector + company-brain import path ([#483](https://github.com/caura-ai/caura-memclaw/issues/483)) ([a2a764e](https://github.com/caura-ai/caura-memclaw/commit/a2a764e83f6f42d5bf8122adebecb86227170081))
+* **core-api:** route documents + fleet residuals through core-storage-api (Fix 2 Phase 3) ([#431](https://github.com/caura-ai/caura-memclaw/issues/431)) ([ad2a2d9](https://github.com/caura-ai/caura-memclaw/commit/ad2a2d9f91d6802a8a66d8935befef39cafa9346))
+* **core-api:** route mcp_server's 9 ready tools through core-storage-api (Fix 2 Phase 4) ([#432](https://github.com/caura-ai/caura-memclaw/issues/432)) ([dc0b674](https://github.com/caura-ai/caura-memclaw/commit/dc0b674287b7fd523a598b1277e9a4bbf2d40ed5))
+* **core-api:** route memory REST surface through core-storage-api (Fix 2 Phase 2) ([#429](https://github.com/caura-ai/caura-memclaw/issues/429)) ([1e39c59](https://github.com/caura-ai/caura-memclaw/commit/1e39c59a0d2366023e4065c46926deb94b13c247))
+* **core-api:** route organization_settings through core-storage-api (Fix 2 Phase 0) ([#427](https://github.com/caura-ai/caura-memclaw/issues/427)) ([4450ec0](https://github.com/caura-ai/caura-memclaw/commit/4450ec0cbcdd3e297bdc350d5ec74f05b9cc1583))
+* **core-api:** route tenant-discovery through core-storage-api (Fix 2 Phase 1) ([#428](https://github.com/caura-ai/caura-memclaw/issues/428)) ([f05f498](https://github.com/caura-ai/caura-memclaw/commit/f05f4982d70449db5de6e21c1239ff57c53e1562))
+* **core-storage-api:** crystallizer entity-coverage + audit-usage reads (Fix 2 final-cleanup PR3a) ([#486](https://github.com/caura-ai/caura-memclaw/issues/486)) ([0737b6a](https://github.com/caura-ai/caura-memclaw/commit/0737b6a3d134dd03f3cf3ea316011d9eee4dc2cf))
+* **core-storage-api:** recall/capability/ingest endpoints for Fix-2 final cleanup (PR1) ([#484](https://github.com/caura-ai/caura-memclaw/issues/484)) ([d8b18d0](https://github.com/caura-ai/caura-memclaw/commit/d8b18d0893ba2e3400630d9ded328b87589c2410))
+* **core-storage-api:** route entity-linking pipeline through storage (Fix 2 Ph6) ([#477](https://github.com/caura-ai/caura-memclaw/issues/477)) ([74a18d7](https://github.com/caura-ai/caura-memclaw/commit/74a18d7c7ecbfdf643929e78c08beeb54d461d39))
+* **core-storage-api:** route evolve through storage + delete _mcp_session (Fix 2 Ph5b, PR2) ([#472](https://github.com/caura-ai/caura-memclaw/issues/472)) ([44743e1](https://github.com/caura-ai/caura-memclaw/commit/44743e19b1972a4439b9f43c8f7919df282363e0))
+* **core-storage-api:** route insights_service through storage (Fix 2 Ph5b, PR1 — insights) ([#471](https://github.com/caura-ai/caura-memclaw/issues/471)) ([2655b84](https://github.com/caura-ai/caura-memclaw/commit/2655b84a91624b0acf38be564181b3c8dd06e866))
+* **core-storage-api:** route the skill-factory pipeline through storage (Fix 2 Ph5a) ([#470](https://github.com/caura-ai/caura-memclaw/issues/470)) ([81e79be](https://github.com/caura-ai/caura-memclaw/commit/81e79be5bd64e047c229b955d8717e8e7de04af8))
+* **governance:** ingestion-boundary PII + business/personal gate (eToro) ([#398](https://github.com/caura-ai/caura-memclaw/issues/398)) ([12860af](https://github.com/caura-ai/caura-memclaw/commit/12860af951539ea2b097f2f2dd9ee7615b1c9464))
+* **plugin:** additive-mode skill reconcile with ownership marker (PR2) ([#417](https://github.com/caura-ai/caura-memclaw/issues/417)) ([3d970ef](https://github.com/caura-ai/caura-memclaw/commit/3d970ef2cbd26c4ab3830101bb4ae313409545bd))
+* **plugin:** auto-register additive skill dirs on OpenClaw's load path (PR3b) ([#425](https://github.com/caura-ai/caura-memclaw/issues/425)) ([819a77f](https://github.com/caura-ai/caura-memclaw/commit/819a77f9110352ad5008c7d1160a60a43b5451fa))
+* **plugin:** per-target reconcile observability (PR3a) ([#424](https://github.com/caura-ai/caura-memclaw/issues/424)) ([04120f2](https://github.com/caura-ai/caura-memclaw/commit/04120f241f6083615dcab2de49fca661d692c334))
+* **recall:** opt-in logging of agent-chosen recalls ([#480](https://github.com/caura-ai/caura-memclaw/issues/480)) ([953ec33](https://github.com/caura-ai/caura-memclaw/commit/953ec336c052f88a9f630394c6dfac0e68d0d389))
+* **skills:** refresh canonical + plugin memclaw skills, add company-brain ([#482](https://github.com/caura-ai/caura-memclaw/issues/482)) ([aa03c03](https://github.com/caura-ai/caura-memclaw/commit/aa03c03c47aaeef4da3390d2b810ae3b46045bfd))
+
+
+### Bug Fixes
+
+* **audit:** idempotent bulk flush via client_event_id — stop dropping audit rows ([#407](https://github.com/caura-ai/caura-memclaw/issues/407)) ([bf87e64](https://github.com/caura-ai/caura-memclaw/commit/bf87e64146303865c75cdbb65c08a7c95cbd4afb))
+* **core-api:** cut prod connect-timeout + rate-limit-Redis log noise ([#426](https://github.com/caura-ai/caura-memclaw/issues/426)) ([a082f3f](https://github.com/caura-ai/caura-memclaw/commit/a082f3fa470eb7503f7f7c39961af657a7610180))
+* **core-api:** harden business/personal pre-gate (timeout, audit truth, fail-closed, audit durability) ([#416](https://github.com/caura-ai/caura-memclaw/issues/416)) ([aa4be8e](https://github.com/caura-ai/caura-memclaw/commit/aa4be8e913da5f8d643ca1f98d6d9aaa0f821931))
+* **core-api:** keep-alive pool + bounded entity-context fan-out (VPC-connector ConnectTimeout residual) ([#434](https://github.com/caura-ai/caura-memclaw/issues/434)) ([0ba51b4](https://github.com/caura-ai/caura-memclaw/commit/0ba51b43d7bbaa8b52b97eee7ec6dcf7f05c3331))
+* **core-api:** per-tenant embed concurrency cap (noisy-neighbor-search) ([#464](https://github.com/caura-ai/caura-memclaw/issues/464)) ([043c02e](https://github.com/caura-ai/caura-memclaw/commit/043c02e5df4a109881dabf902c1969371cf3b08e))
+* **core-api:** re-route third-party loggers from the ASGI lifespan startup ([#473](https://github.com/caura-ai/caura-memclaw/issues/473)) ([8f8f39e](https://github.com/caura-ai/caura-memclaw/commit/8f8f39ef85360e37c1aca510feab770de9b926fe))
+* **core-api:** resolve home fleet on omitted fleet_id for MCP writes ([#465](https://github.com/caura-ai/caura-memclaw/issues/465)) ([56db1f5](https://github.com/caura-ai/caura-memclaw/commit/56db1f5fadb7e3abc24cf2ef6aec7df3d35abd70))
+* **core-api:** route recall/capability writes through storage (Fix-2 cleanup PR2) ([#485](https://github.com/caura-ai/caura-memclaw/issues/485)) ([592b231](https://github.com/caura-ai/caura-memclaw/commit/592b231d395ff8787c9ad82c91a4b5262432b95d))
+* **core-api:** self-heal storage pool + cancellation-safe requests (CAURA-000) ([#415](https://github.com/caura-ai/caura-memclaw/issues/415)) ([5889e3f](https://github.com/caura-ai/caura-memclaw/commit/5889e3facbba3f66b517644ff3d011ea226960f9))
+* **core-api:** stamp version into image so /api/v1/version stops serving "dev" (CAURA-000) ([#414](https://github.com/caura-ai/caura-memclaw/issues/414)) ([4d1c486](https://github.com/caura-ai/caura-memclaw/commit/4d1c486bf7c28fddcc0cad2d93cd53589460831a))
+* **core-api:** surface write-pipeline step failures instead of masking as KeyError ([#474](https://github.com/caura-ai/caura-memclaw/issues/474)) ([5d359b2](https://github.com/caura-ai/caura-memclaw/commit/5d359b291a7340383bac95e8dd81e908c94bf476))
+* **core-storage-api:** 404 (not silent 200) on wrong-tenant embedding write ([#468](https://github.com/caura-ai/caura-memclaw/issues/468)) ([bec8229](https://github.com/caura-ai/caura-memclaw/commit/bec8229785741b95424718a5fd38a387bbf8c373))
+* **core-storage-api:** 422 on missing/non-list embedding in /entities/set-embeddings ([#478](https://github.com/caura-ai/caura-memclaw/issues/478)) ([6268725](https://github.com/caura-ai/caura-memclaw/commit/62687253000a1f0fbb37206c9f538aa7f3bdc270))
+* **core-storage-api:** followers skip the migration lock once schema is at head ([#487](https://github.com/caura-ai/caura-memclaw/issues/487)) ([8a7ac37](https://github.com/caura-ai/caura-memclaw/commit/8a7ac3758347e04960e942dc81e907a425df7780))
+* **core-storage-api:** tenant-guard by-id memory UPDATEs ([#467](https://github.com/caura-ai/caura-memclaw/issues/467)) ([4248b4d](https://github.com/caura-ai/caura-memclaw/commit/4248b4db51f5be46d47260fb5b6cc34da075fd2e))
+* **extraction:** re-fold split-off subject discriminators (A33) ([#412](https://github.com/caura-ai/caura-memclaw/issues/412)) ([ab0d2d6](https://github.com/caura-ai/caura-memclaw/commit/ab0d2d6b126841f82af397d5b64d84d9f98c960c))
+* **http-retry:** widen connection-phase retry to ride out storage cold starts ([#406](https://github.com/caura-ai/caura-memclaw/issues/406)) ([5bbede7](https://github.com/caura-ai/caura-memclaw/commit/5bbede7481032397ec50400f166f12f132b5fc4a))
+* **logging:** demote handler-less reroute 'no-op' to DEBUG (records aren't lost) ([#488](https://github.com/caura-ai/caura-memclaw/issues/488)) ([9bdbe44](https://github.com/caura-ai/caura-memclaw/commit/9bdbe44f05aa3b2e90e309b66cdf8baddad5b791))
+* **prompts:** stop brace-escaping content before str.format ([#404](https://github.com/caura-ai/caura-memclaw/issues/404)) ([ba94a54](https://github.com/caura-ai/caura-memclaw/commit/ba94a54b2ade8641fa58cbf447db2759cc550604))
+* **rate-limit:** fail open on Redis outage instead of 500 (view_rate_limit AttributeError) ([#410](https://github.com/caura-ai/caura-memclaw/issues/410)) ([53b467d](https://github.com/caura-ai/caura-memclaw/commit/53b467d2c622da7d339d7c390624f37aacf9c427))
+* **recall:** tighten recall-brief grounding to stop invented details ([#489](https://github.com/caura-ai/caura-memclaw/issues/489)) ([6794f3e](https://github.com/caura-ai/caura-memclaw/commit/6794f3e60d177cd7d60058eba7b7641326bf4b79))
+* **search:** dampen recall_boost so it can't hijack rankings (A26) ([#411](https://github.com/caura-ai/caura-memclaw/issues/411)) ([1de219c](https://github.com/caura-ai/caura-memclaw/commit/1de219c8a4078f971102dcb6c82fc10028e025f0))
+* **search:** rank entity-lookup fan-out cap by query-match count (A30) ([#409](https://github.com/caura-ai/caura-memclaw/issues/409)) ([8f809c0](https://github.com/caura-ai/caura-memclaw/commit/8f809c0914e83271a108c5cfeba53d794a664c6b))
+* **storage:** harden migration advisory-lock so a slow migration can't crash booting writers ([#408](https://github.com/caura-ai/caura-memclaw/issues/408)) ([54cbe1a](https://github.com/caura-ai/caura-memclaw/commit/54cbe1acd1e48431b3974c828a47d0a86ce597d1))
+
+
+### Performance
+
+* **core-api:** make document-ingest (kreuzberg) an opt-in extra to cut cold start ([#469](https://github.com/caura-ai/caura-memclaw/issues/469)) ([1f082d8](https://github.com/caura-ai/caura-memclaw/commit/1f082d8783a0f4de03cd629b79d66e9782026172))
+
+
+### Documentation
+
+* **core-api:** clarify memclaw_recall top_k is soft-capped, not rejected ([#481](https://github.com/caura-ai/caura-memclaw/issues/481)) ([6938f08](https://github.com/caura-ai/caura-memclaw/commit/6938f08fd52dd9a9c9efdb3fba42f7b20c4b65d0))
+* **core-api:** document LLM free-form PII recall limit (recommend a capable enrichment model) ([#419](https://github.com/caura-ai/caura-memclaw/issues/419)) ([36b1b30](https://github.com/caura-ai/caura-memclaw/commit/36b1b30ad92deb987aac0427b068c0250d4f66f7))
+* point all memclaw.dev links to memclaw.net ([#475](https://github.com/caura-ai/caura-memclaw/issues/475)) ([a6f9ad1](https://github.com/caura-ai/caura-memclaw/commit/a6f9ad1581bd30c60a125de1159ffe3918bf3222))
+
+
+### Code Refactoring
+
+* **core-storage-api:** consolidate router validation guards into _validation ([#479](https://github.com/caura-ai/caura-memclaw/issues/479)) ([e9dd9ca](https://github.com/caura-ai/caura-memclaw/commit/e9dd9caa18c291630f7f2d39af9a6cddc546088f))
+* **plugin:** configurable skill-reconcile targets (PR1 — refactor + config plumbing) ([#413](https://github.com/caura-ai/caura-memclaw/issues/413)) ([57e5e96](https://github.com/caura-ai/caura-memclaw/commit/57e5e962cbc5a0f95555e0bfe762e5a3ae309b49))
+
+## [2.16.0](https://github.com/caura-ai/caura-memclaw/compare/backend-v2.15.0...backend-v2.16.0) (2026-06-15)
+
+
+### Features
+
+* **core-api:** capability-usage adoption counters (MCP + REST) ([#353](https://github.com/caura-ai/caura-memclaw/issues/353)) ([0421ceb](https://github.com/caura-ai/caura-memclaw/commit/0421ceb0addadd71833f2ddce42cf973edd9fd75))
+
+
+### Bug Fixes
+
+* **compose:** stop shadowing .env provider keys with empty "${VAR:-}" passthroughs ([#346](https://github.com/caura-ai/caura-memclaw/issues/346)) ([8ab95d8](https://github.com/caura-ai/caura-memclaw/commit/8ab95d8e416862153410942bdf1bfcf51fcad2c1))
+* **core-api:** make the CAURA-602 startup guard FastAPI-0.137-proof ([#364](https://github.com/caura-ai/caura-memclaw/issues/364)) ([65de110](https://github.com/caura-ai/caura-memclaw/commit/65de110ac996fe7bd79c5823b92e3852934cc112))
+* **deps:** cap fastapi &lt;0.137 to unbreak CI ([#359](https://github.com/caura-ai/caura-memclaw/issues/359)) ([561d5c9](https://github.com/caura-ai/caura-memclaw/commit/561d5c96fee6be698cc0d2077a7e80f0aadbbb0c))
+* **fleet:** cap auto-upgrade re-queue with a per-(node,target) attempt budget (CAURA-000) ([#351](https://github.com/caura-ai/caura-memclaw/issues/351)) ([22a3ac0](https://github.com/caura-ai/caura-memclaw/commit/22a3ac064ecafc912180767890399a2ce93ac531))
+* **keystones:** let the standalone operator author keystones out-of-the-box (F-7) ([#354](https://github.com/caura-ai/caura-memclaw/issues/354)) ([d62c36a](https://github.com/caura-ai/caura-memclaw/commit/d62c36a9fa900426d70276f0950de318d1bdffb1))
+* **plugin:** send X-Bulk-Attempt-Id header on bulk memory writes ([#355](https://github.com/caura-ai/caura-memclaw/issues/355)) ([a4515ed](https://github.com/caura-ai/caura-memclaw/commit/a4515ed1e5f5f7679daea36c99e58d1d331b3934))
+* **search:** return raw cosine in similarity, not the ranking composite (F-14) ([#392](https://github.com/caura-ai/caura-memclaw/issues/392)) ([3865600](https://github.com/caura-ai/caura-memclaw/commit/3865600ce73a9273e4fd5db4f0b218f454b99422))
+* **search:** surface conflicted memories that exactly match the query ([#357](https://github.com/caura-ai/caura-memclaw/issues/357)) ([c00a3f7](https://github.com/caura-ai/caura-memclaw/commit/c00a3f76f6f390024567f6d23acef062f304dca9))
+
+
+### Documentation
+
+* add top-level BENCHMARKS.md as a citable benchmark asset ([#349](https://github.com/caura-ai/caura-memclaw/issues/349)) ([fc6d563](https://github.com/caura-ai/caura-memclaw/commit/fc6d563b171264fc2bc1578a708fc9ad3104cc4a))
+* comparison table — "PII detection & flagging", not "quarantine" ([#345](https://github.com/caura-ai/caura-memclaw/issues/345)) ([3bb7b1c](https://github.com/caura-ai/caura-memclaw/commit/3bb7b1c8903e90b77630324222956eb9d83fc4b9))
+* **core-api:** document the redis&lt;9 cap rationale (review follow-up) ([#395](https://github.com/caura-ai/caura-memclaw/issues/395)) ([cd5420c](https://github.com/caura-ai/caura-memclaw/commit/cd5420c255594d3f0e80798b65847d11d51db17d))
+* lead Quick Start with a no-key, no-signup local quickstart ([#348](https://github.com/caura-ai/caura-memclaw/issues/348)) ([91ee613](https://github.com/caura-ai/caura-memclaw/commit/91ee613c46cdf9e0f81c7249ab2b3c75601c110a))
+* README write-response field names match payload ([#361](https://github.com/caura-ai/caura-memclaw/issues/361)) ([2ecc098](https://github.com/caura-ai/caura-memclaw/commit/2ecc098f099c333655d922b08ea7bc03ca699c4f))
+
+
+### Code Refactoring
+
+* **api:** unify evolve/insights caller-identity resolution; close F-7 tail (§2) ([#400](https://github.com/caura-ai/caura-memclaw/issues/400)) ([f4af240](https://github.com/caura-ai/caura-memclaw/commit/f4af240917061bc568c8177ea9fcb8db004036a4))
+
+## [2.15.0](https://github.com/caura-ai/caura-memclaw/compare/backend-v2.14.0...backend-v2.15.0) (2026-06-13)
+
+
+### Features
+
+* **skills:** gate the OpenClaw install path to active-only skills ([#317](https://github.com/caura-ai/caura-memclaw/issues/317)) ([50488fc](https://github.com/caura-ai/caura-memclaw/commit/50488fc6eb07d244297ad1d3e065887c8cb3e47e))
+* **skills:** per-node skill-reconcile observability on the heartbeat ([#325](https://github.com/caura-ai/caura-memclaw/issues/325)) ([d806114](https://github.com/caura-ai/caura-memclaw/commit/d806114bc943a1d97480584192091e0583d41545))
+
+
+### Bug Fixes
+
+* **api:** close cross-tenant and caller-asserted-identity authz gaps ([#320](https://github.com/caura-ai/caura-memclaw/issues/320)) ([fcf96c7](https://github.com/caura-ai/caura-memclaw/commit/fcf96c74c28022415d1f691d3507c96ba8c99b22))
+* **api:** default agent_id to "mcp-agent" on standalone POST /memories ([#339](https://github.com/caura-ai/caura-memclaw/issues/339)) ([4d2d6ef](https://github.com/caura-ai/caura-memclaw/commit/4d2d6ef008de5c743b848f566b51f461d117e06a))
+* **core-worker:** retry connection-phase failures on storage calls — shared policy in common/http_retry ([#334](https://github.com/caura-ai/caura-memclaw/issues/334)) ([43b3d81](https://github.com/caura-ai/caura-memclaw/commit/43b3d8191b3567beba9cc6025f2df8e9aabb02de))
+* **cross-links:** single multi-VALUES insert — executemany cannot RETURN rows ([#337](https://github.com/caura-ai/caura-memclaw/issues/337)) ([8bbdeed](https://github.com/caura-ai/caura-memclaw/commit/8bbdeedb84c5a85655a88485583dcabd7b21d9a6))
+* cross-tenant search widening, non-default LLM structured-output kwargs, event deploy safety ([#322](https://github.com/caura-ai/caura-memclaw/issues/322)) ([f161607](https://github.com/caura-ai/caura-memclaw/commit/f1616070b72efbfba712de4095f6f556669368cc))
+* **embedding:** fall back to default model when OPENAI_EMBEDDING_MODEL is empty ([#336](https://github.com/caura-ai/caura-memclaw/issues/336)) ([d1f1f5a](https://github.com/caura-ai/caura-memclaw/commit/d1f1f5a6f8ac4a631b4bb8dfa89801384e4aea44))
+* **entities:** scope-filter relations in get_entity and drop the per-memory agent lookup ([#321](https://github.com/caura-ai/caura-memclaw/issues/321)) ([e355f87](https://github.com/caura-ai/caura-memclaw/commit/e355f87fba54ca45b634bf2affd4b9893a0e3528))
+* **entity-linking:** bind reinforce weight directly — LEAST over untyped params coerced to text ([#341](https://github.com/caura-ai/caura-memclaw/issues/341)) ([b4a5712](https://github.com/caura-ai/caura-memclaw/commit/b4a57120107c2319013e8ac64aa6aaecc87d0751))
+* **entity-linking:** synchronize_session=False on the entity-embedding backfill bulk update ([#342](https://github.com/caura-ai/caura-memclaw/issues/342)) ([c310ecf](https://github.com/caura-ai/caura-memclaw/commit/c310ecfd61ee14b0545234b7bb4773fbc0e1685e))
+* **events:** publisher candidate cleanups also called the nonexistent close() ([#331](https://github.com/caura-ai/caura-memclaw/issues/331)) ([610fe8e](https://github.com/caura-ai/caura-memclaw/commit/610fe8e385c38237cf22276a02ef35e9345772d2))
+* **events:** pubsub shutdown never flushed the publisher — final batches silently lost ([#330](https://github.com/caura-ai/caura-memclaw/issues/330)) ([1c2aba5](https://github.com/caura-ai/caura-memclaw/commit/1c2aba577a1a7cd4347faff3118d7179c39a7368))
+* **llm:** explicit httpx per-phase timeouts — 5s connect too tight behind VPC connector ([#332](https://github.com/caura-ai/caura-memclaw/issues/332)) ([ea89a61](https://github.com/caura-ai/caura-memclaw/commit/ea89a61cb3b6b4331b92183dfe09f3bbfc24e879))
+* **logging:** reroute idempotency guard mis-keys on captured handlers ([#328](https://github.com/caura-ai/caura-memclaw/issues/328)) ([352689d](https://github.com/caura-ai/caura-memclaw/commit/352689d3f18c2d00b4444cca62d80d1b4b340109))
+* **mcp:** enforce gateway perimeter on the /mcp header-trust path ([#319](https://github.com/caura-ai/caura-memclaw/issues/319)) ([109d837](https://github.com/caura-ai/caura-memclaw/commit/109d837950550a577f4fcb8e585e76105b961d9b))
+* **mcp:** memclaw_tune crashed with 'dict' object has no attribute 'id' ([#338](https://github.com/caura-ai/caura-memclaw/issues/338)) ([30e3cff](https://github.com/caura-ai/caura-memclaw/commit/30e3cff097c73d0af6faec739f638c5fecf46aef))
+* **plugin:** point agents at the memclaw skill by name, not by filesystem path (CAURA-000) ([#323](https://github.com/caura-ai/caura-memclaw/issues/323)) ([ec3fcaf](https://github.com/caura-ai/caura-memclaw/commit/ec3fcaf45a7545568e9f713a6f1db631dfa1c2f3))
+* **release:** keep plugin/src/version.ts in sync on release-please PRs ([#335](https://github.com/caura-ai/caura-memclaw/issues/335)) ([e26a3c5](https://github.com/caura-ai/caura-memclaw/commit/e26a3c561b542fbf58b4fd556ec2919e87286dfd))
+* **search:** consume the inflight embedding future's exception when no joiner awaits it ([#340](https://github.com/caura-ai/caura-memclaw/issues/340)) ([a06ec53](https://github.com/caura-ai/caura-memclaw/commit/a06ec539449d89fc3d3f58e45c645ed3ca456ae1))
+* **search:** skip entity hop-boost when classifier declined the entity match as over-broad ([#327](https://github.com/caura-ai/caura-memclaw/issues/327)) ([4744732](https://github.com/caura-ai/caura-memclaw/commit/4744732196c05fb1fd207f53f5bd03a849472f7d))
+* **storage-client:** retry POSTs on connection-phase failures — never-sent requests cannot double-insert ([#333](https://github.com/caura-ai/caura-memclaw/issues/333)) ([2d91e33](https://github.com/caura-ai/caura-memclaw/commit/2d91e33baa968459443005fd5a86d127c6c0c4d1))
+
+
+### Documentation
+
+* add eToro proof, comparison table, FAQ, and star ask to README ([#326](https://github.com/caura-ai/caura-memclaw/issues/326)) ([e6395b5](https://github.com/caura-ai/caura-memclaw/commit/e6395b535f58fd92906138c83b45a5c40a67be89))
+* bump eToro memory count 21,500 → 26,500 + social card ([#329](https://github.com/caura-ai/caura-memclaw/issues/329)) ([ea0e52b](https://github.com/caura-ai/caura-memclaw/commit/ea0e52b3fe43e72a279f365f38cd81301f1a6fce))
+* correct Claude Code MCP setup — claude mcp add -s user, not settings.json ([#343](https://github.com/caura-ai/caura-memclaw/issues/343)) ([fc6324b](https://github.com/caura-ai/caura-memclaw/commit/fc6324b6c60206efe814c3e9cdfc42d0f85266f4))
+* fix README/AGENT-INSTALL inaccuracies (PII, health shape, write response) ([#344](https://github.com/caura-ai/caura-memclaw/issues/344)) ([2dea567](https://github.com/caura-ai/caura-memclaw/commit/2dea567b802e9effaad3455284a7aab8e1cf124d))
+
 ## [2.14.0](https://github.com/caura-ai/caura-memclaw/compare/backend-v2.13.0...backend-v2.14.0) (2026-06-10)
 
 

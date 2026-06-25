@@ -55,7 +55,7 @@ class TestTenantFilter:
                 "core_api.routes.lifecycle.list_active_tenant_ids",
                 new=AsyncMock(return_value=["all-other-tenants"]),
             ) as active_all:
-                result = await _list_tenants_for_action("forge-distill", db=None)
+                result = await _list_tenants_for_action("forge-distill")
         assert result == ["tenant-a", "tenant-c"]
         opted_in.assert_awaited_once()
         # Critical invariant: the broad "active tenants" helper MUST NOT
@@ -78,7 +78,7 @@ class TestTenantFilter:
                 "core_api.routes.lifecycle.list_tenants_with_skills_factory_enabled",
                 new=AsyncMock(return_value=["should-not-be-called"]),
             ) as opted_in:
-                result = await _list_tenants_for_action("archive-expired", db=None)
+                result = await _list_tenants_for_action("archive-expired")
         assert result == ["a", "b"]
         active_all.assert_awaited_once()
         opted_in.assert_not_awaited()
@@ -132,7 +132,7 @@ class TestForgeConfigResolution:
             "core_api.services.forge.cron_handler.get_settings_for_display",
             new=AsyncMock(return_value=fake_settings),
         ):
-            cfg = await _resolve_forge_config(db=None, org_id="tenant-1")
+            cfg = await _resolve_forge_config(org_id="tenant-1")
         assert cfg.min_cluster_size == 5
         assert cfg.min_distinct_agents == 4
         assert cfg.freshness_window_days == 7
@@ -147,7 +147,7 @@ class TestForgeConfigResolution:
             "core_api.services.forge.cron_handler.get_settings_for_display",
             new=AsyncMock(return_value={}),
         ):
-            cfg = await _resolve_forge_config(db=None, org_id="empty-tenant")
+            cfg = await _resolve_forge_config(org_id="empty-tenant")
         defaults = ForgeConfig()
         assert cfg.min_cluster_size == defaults.min_cluster_size
         assert cfg.body_max_bytes == defaults.body_max_bytes
@@ -237,7 +237,6 @@ class TestRunForgeCronTick:
             ),
         ):
             stats = await run_forge_cron_tick(
-                db=AsyncMock(),
                 tenant_id="t1",
                 fleet_id=None,
                 run_label="forge-cron-t1-20260608T2100",
@@ -339,7 +338,6 @@ class TestRunForgeCronTick:
             ),
         ):
             stats = await run_forge_cron_tick(
-                db=AsyncMock(),
                 tenant_id="t1",
                 fleet_id=None,
                 run_label="forge-cron-t1-20260610T0000",

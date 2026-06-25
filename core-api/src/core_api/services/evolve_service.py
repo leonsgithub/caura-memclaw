@@ -10,9 +10,6 @@ import logging
 import time
 from uuid import UUID
 
-from sqlalchemy import bindparam, select, text
-from sqlalchemy.ext.asyncio import AsyncSession
-
 from core_api.constants import (
     EVOLVE_FAILURE_DELTA,
     EVOLVE_MAX_RELATED_IDS,
@@ -142,48 +139,17 @@ Respond with JSON:
 
 
 # -- Weight adjustment --------------------------------------------------------
-
-
-_ADJUST_WEIGHTS_BULK_SQL = text(
-    """
-    WITH old_vals AS (
-        SELECT id, weight AS old_weight
-          FROM memories
-         WHERE id IN :mids
-           AND tenant_id = :tid
-           AND deleted_at IS NULL
-    )
-    UPDATE memories
-       SET weight = GREATEST(:floor, LEAST(:cap, weight + :delta))
-      FROM old_vals
-     WHERE memories.id = old_vals.id
-       AND memories.tenant_id = :tid
-       AND memories.deleted_at IS NULL
-    RETURNING memories.id AS id, old_vals.old_weight AS old_weight,
-              memories.weight AS new_weight
-    """
-).bindparams(bindparam("mids", expanding=True))
-
-
-# Backfill the rule memory's metadata.source_outcome_id after the outcome
-# exists. Rule persistence happens before outcome persistence (so the outcome
-# can record the rule_memory_id), so at rule-write time the outcome_id is
-# unknown. This UPDATE completes the rule→outcome traceability link.
-_BACKFILL_RULE_OUTCOME_SQL = text(
-    """
-    UPDATE memories
-       SET metadata = jsonb_set(
-           COALESCE(metadata, '{}'::jsonb),
-           '{source_outcome_id}',
-           to_jsonb(CAST(:outcome_id AS text))
-       )
-     WHERE id = :rule_id AND tenant_id = :tid
-    """
-)
+#
+# Fix 2 Ph5b (PR2): the weight-clamp CTE and the rule→outcome jsonb_set backfill
+# moved to core-storage-api (``sc.evolve_apply_weights`` — they were ported
+# VERBATIM there and now run in ONE atomic storage transaction). The
+# scope-filter SELECT moved too (``sc.evolve_filter_by_scope``). The module no
+# longer holds those SQL constants or a direct ``db.execute`` against
+# ``memories``; the dedup / UUID-parse / cap / rounding / skip-reason logic
+# stays here on the client side.
 
 
 async def _filter_by_scope(
-    db: AsyncSession,
     tenant_id: str,
     caller_agent_id: str,
     fleet_id: str | None,
@@ -207,8 +173,13 @@ async def _filter_by_scope(
     Returns (in_scope_ids, out_of_scope_count). The returned list is
     deduplicated and preserves first-seen order of the input so downstream
     consumers get a stable, canonical view of the caller's intent.
+
+    Fix 2 Ph5b (PR2): the scope SELECT moved to core-storage-api
+    (``sc.evolve_filter_by_scope``); the UUID-parse + first-seen dedup +
+    ``out_of_scope_count`` arithmetic stays here. ``db`` is retained in the
+    signature for REST back-compat but is ignored.
     """
-    from common.models.memory import Memory
+    from core_api.clients.storage_client import get_storage_client
 
     if not related_ids:
         return [], 0
@@ -238,25 +209,21 @@ async def _filter_by_scope(
         # ``len(related_ids) - len(valid_uuids) = len(related_ids) - 0``.
         return [], len(related_ids)
 
-    # Build the scope filter via SQLAlchemy's expression API rather than
-    # interpolating a SQL fragment. All user-derived values remain bound
-    # parameters and the query plan is visible to tooling (EXPLAIN, SQLA
-    # event hooks). Comparing UUID objects — not stringified forms — also
-    # eliminates the canonical-form mismatch that ``id::text`` would have
-    # produced for callers passing uppercase or unhyphenated UUIDs.
-    stmt = (
-        select(Memory.id)
-        .where(Memory.id.in_(list(valid_uuids.values())))
-        .where(Memory.tenant_id == tenant_id)
-        .where(Memory.deleted_at.is_(None))
+    # The scope SELECT runs storage-side (``sc.evolve_filter_by_scope`` ports it
+    # VERBATIM — UUID-object comparison via ``select(Memory.id).in_(...)``, so
+    # the canonical-form mismatch that ``id::text`` would produce for uppercase
+    # or unhyphenated callers is still avoided). The allowed ids come back as
+    # canonical strings; normalise to UUID so membership against the caller's
+    # ``valid_uuids`` (also UUIDs) doesn't miss on string-vs-UUID identity.
+    sc = get_storage_client()
+    allowed_strs = await sc.evolve_filter_by_scope(
+        tenant_id=tenant_id,
+        caller_agent_id=caller_agent_id,
+        fleet_id=fleet_id,
+        scope=scope,
+        ids=[str(u) for u in valid_uuids.values()],
     )
-    if scope == "agent":
-        stmt = stmt.where(Memory.agent_id == caller_agent_id)
-    elif scope == "fleet":
-        stmt = stmt.where(Memory.fleet_id == fleet_id)
-
-    result = await db.execute(stmt)
-    allowed: set[UUID] = {row[0] for row in result}
+    allowed: set[UUID] = {UUID(s) for s in allowed_strs}
 
     in_scope = [s for s, uid in valid_uuids.items() if uid in allowed]
     # out_of_scope_count has two components we keep separate so the name
@@ -286,42 +253,49 @@ async def _filter_by_scope(
 
 
 async def _adjust_weights(
-    db: AsyncSession,
     tenant_id: str,
     related_ids: list[str],
     outcome_type: str,
     agent_id: str,
+    *,
+    rule_id: str | None = None,
+    outcome_id: str | None = None,
 ) -> tuple[str | None, list[str], list[dict]]:
     """Adjust weights on related memories atomically.
 
-    Executes a CTE-based UPDATE per memory so each row is read, clamped, and
-    written in a single statement — eliminating the TOCTOU race that existed
-    when the read (via storage-client HTTP) and the write crossed transaction
-    boundaries. The CTE captures the pre-update weight so `old_weight` in the
-    response is exact even when clamping occurs at the floor or cap.
+    Fix 2 Ph5b (PR2): the clamp-and-return CTE now runs storage-side
+    (``sc.evolve_apply_weights`` ports ``_ADJUST_WEIGHTS_BULK_SQL`` VERBATIM and
+    executes it in ONE transaction), eliminating core-api's direct
+    ``db.execute`` against ``memories``. The CTE still captures the pre-update
+    weight so ``old_weight`` is exact even when clamping at the floor or cap.
+    The same storage call folds in the rule→outcome ``jsonb_set`` backfill when
+    ``rule_id`` and ``outcome_id`` are supplied, so the weight clamp and the
+    backfill commit atomically without a second HTTP round-trip — the caller
+    re-sequences so both ids are resolved before invoking this. ``db`` is
+    retained in the signature for REST back-compat but is ignored.
 
-    Concurrency: `related_ids` is deduped and sorted before iteration so all
-    concurrent callers acquire row locks in the same order, preventing the
-    cycle that would otherwise trigger PostgreSQL deadlocks when two evolve
-    calls touch overlapping memory sets.
+    Concurrency: ``related_ids`` is still deduped + sorted before the call so
+    the storage-side UPDATE locks rows in a deterministic global order,
+    avoiding cycle-based deadlocks across concurrent evolve calls.
 
     Audit: update_memory's audit hook is bypassed; the outcome memory's
-    metadata (`weight_adjustments`) records the change as a compensating trail.
+    metadata records the change as a compensating trail.
 
     Returns a tuple of (skip_reason, processed_ids, adjustments):
     - skip_reason: A15 — ``None`` when at least one row was updated;
       ``"no_rows_updated"`` when every supplied id failed UUID parsing,
-      the bulk UPDATE returned no rows (row deleted between filter and
-      update), or the bulk UPDATE raised an exception. Callers feed this
-      into ``report_outcome``'s ``weight_adjustment_skipped_reason``
-      response field so a 200 OK with empty adjustments is no longer
-      indistinguishable from success.
+      the apply-weights call returned no rows (row deleted between filter and
+      update), or the call raised. Callers feed this into ``report_outcome``'s
+      ``weight_adjustment_skipped_reason`` response field so a 200 OK with
+      empty adjustments is no longer indistinguishable from success.
     - processed_ids: IDs whose weights were actually updated in the DB.
       Excludes invalid UUIDs, missing rows, and rows whose UPDATE raised.
       Callers persist this in the outcome metadata so it reflects reality
       rather than the caller's optimistic input.
     - adjustments: [{memory_id, old_weight, new_weight, delta}].
     """
+    from core_api.clients.storage_client import get_storage_client
+
     # Dedup + sort first so the cap counts unique IDs (truncating before
     # dedup can leave fewer than EVOLVE_MAX_RELATED_IDS distinct items when
     # the caller passes duplicates). Sorted order also ensures every
@@ -355,43 +329,32 @@ async def _adjust_weights(
 
     valid_uuids = [u for _, u in parsed]
 
-    # Single bulk UPDATE keyed by the validated UUID set; collapses the
-    # prior N+1 round-trips and N savepoint pairs into one statement
-    # (audit finding #25). Single savepoint isolates the entire weight-
-    # adjustment batch from the outer evolve transaction; per-row
-    # isolation is not preserved — a DB error aborts all weight updates
-    # as a unit. The outer evolve transaction still gets to persist the
-    # outcome / rule memory rows downstream regardless.
+    # Single atomic storage call: the clamp-and-return CTE (+ the conditional
+    # rule→outcome backfill) commits in ONE transaction storage-side. A failure
+    # is surfaced as the ``no_rows_updated`` slug rather than aborting the whole
+    # evolve call — the rule/outcome memories were already persisted.
+    sc = get_storage_client()
     try:
-        async with db.begin_nested():
-            result = await db.execute(
-                _ADJUST_WEIGHTS_BULK_SQL,
-                {
-                    "mids": valid_uuids,
-                    "tid": tenant_id,
-                    "floor": EVOLVE_WEIGHT_FLOOR,
-                    "cap": EVOLVE_WEIGHT_CAP,
-                    "delta": delta,
-                },
-            )
-            rows = result.fetchall()
+        resp = await sc.evolve_apply_weights(
+            tenant_id=tenant_id,
+            ids=[str(u) for u in valid_uuids],
+            delta=delta,
+            floor=EVOLVE_WEIGHT_FLOOR,
+            cap=EVOLVE_WEIGHT_CAP,
+            rule_id=rule_id,
+            outcome_id=outcome_id,
+        )
     except Exception:
         logger.warning("evolve: bulk weight update failed for %d memories", len(valid_uuids), exc_info=True)
         return "no_rows_updated", [], []
 
-    # Map returned rows by id so we can preserve the caller's input
-    # ordering when building the response. Rows missing from the
-    # result set correspond to ids not found (or filtered by the
-    # tenant + deleted_at predicate); skip them with the same
-    # warning the per-row path emitted previously.
-    #
-    # ``UUID(str(row.id))`` normalises the key — some DB drivers /
-    # cursor result shapes hand ``row.id`` back as ``str`` rather than
-    # ``uuid.UUID``. Without normalisation the lookup below
-    # (``row_by_id.get(mid)`` with a real ``UUID`` key) silently
-    # misses every row, falling through to the "not found" warning
-    # branch and dropping the whole batch from the response.
-    row_by_id = {UUID(str(row.id)): row for row in rows}
+    # Map returned rows by id so we can preserve the caller's input ordering
+    # when building the response. Rows missing from the result correspond to
+    # ids not found (or filtered by the tenant + deleted_at predicate); skip
+    # them with the same warning the prior path emitted. ``UUID(row["id"])``
+    # normalises the canonical string back to a UUID so the lookup against the
+    # parsed ``UUID`` keys can't silently miss.
+    row_by_id = {UUID(row["id"]): row for row in resp.get("adjustments", [])}
     for mid_str, mid in parsed:
         row = row_by_id.get(mid)
         if row is None:
@@ -401,8 +364,8 @@ async def _adjust_weights(
         adjustments.append(
             {
                 "memory_id": mid_str,
-                "old_weight": round(float(row.old_weight), 4),
-                "new_weight": round(float(row.new_weight), 4),
+                "old_weight": round(float(row["old_weight"]), 4),
+                "new_weight": round(float(row["new_weight"]), 4),
                 "delta": round(delta, 4),
             }
         )
@@ -494,16 +457,16 @@ async def _generate_rule(
         return ("no_memories_fetched", None)
 
     memories_text = "\n".join(memories_text_lines)
-    # Escape user-controlled braces before .format() — both outcome (agent input)
-    # and memories_text (DB content/titles) can contain literal {word} that would
-    # otherwise raise KeyError outside the call_with_fallback try/except.
-    # Also cap outcome size to bound prompt tokens.
-    safe_outcome = _sanitize_content(outcome, max_len=2000).replace("{", "{{").replace("}", "}}")
-    safe_memories = memories_text.replace("{", "{{").replace("}", "}}")
+    # ``str.format`` inserts substituted values literally (it never re-scans them
+    # for fields), so outcome/memories must NOT be brace-escaped — escaping would
+    # corrupt literal {word} / JSON / code in agent input or DB content. A
+    # substituted value never raises KeyError. Still cap the outcome to bound
+    # prompt tokens.
+    safe_outcome = _sanitize_content(outcome, max_len=2000)
     prompt = _RULE_GENERATION_PROMPT.format(
         outcome=safe_outcome,
         outcome_type=outcome_type,
-        memories=safe_memories,
+        memories=memories_text,
         count=len(memories_text_lines),
     )
 
@@ -549,7 +512,6 @@ async def _generate_rule(
 
 
 async def _persist_outcome(
-    db: AsyncSession,
     tenant_id: str,
     agent_id: str,
     fleet_id: str | None,
@@ -570,6 +532,11 @@ async def _persist_outcome(
     `scope` determines the outcome memory's visibility via _SCOPE_TO_VISIBILITY
     so scope='agent' outcomes stay private and scope='all' outcomes are visible
     tenant-wide.
+
+    Fix 2 Ph5b (PR2): ``create_memory`` is fully storage-routed and commits
+    independently, so ``db`` may be ``None`` (MCP ``_no_db`` path). The savepoint
+    only isolates a real REST-path session; with ``db=None`` there is no session
+    to protect, so the savepoint is skipped via ``nullcontext``.
     """
     from core_api.schemas import MemoryCreate
     from core_api.services.memory_service import create_memory
@@ -599,13 +566,11 @@ async def _persist_outcome(
         write_mode="fast",
     )
 
-    # Savepoint isolates a DB error inside create_memory so the outer
-    # transaction stays usable. Outcome persistence is mandatory (unlike
-    # the rule), so re-raise after the savepoint rolls back to signal
-    # failure to the caller.
+    # Outcome persistence is mandatory (unlike the rule): create_memory commits
+    # independently via the storage client, so re-raise on failure to signal
+    # the caller.
     try:
-        async with db.begin_nested():
-            result = await create_memory(db, data)
+        result = await create_memory(data)
     except Exception:
         logger.exception("evolve: failed to persist outcome")
         raise
@@ -613,7 +578,6 @@ async def _persist_outcome(
 
 
 async def _persist_rule(
-    db: AsyncSession,
     tenant_id: str,
     agent_id: str,
     fleet_id: str | None,
@@ -664,13 +628,11 @@ async def _persist_rule(
         write_mode="fast",
     )
 
-    # Savepoint isolates the rule write: if create_memory raises after dirtying
-    # the session (e.g. a side-effect DB write fails before the HTTP call), the
-    # outer transaction can still proceed with weight adjustments and the
-    # outcome write without the session being in a failed state.
+    # Rule persistence is best-effort: create_memory commits independently via
+    # the storage client, so a failure here is logged and swallowed (returns
+    # None) without blocking the weight adjustments and outcome write.
     try:
-        async with db.begin_nested():
-            result = await create_memory(db, data)
+        result = await create_memory(data)
         return str(result.id)
     except Exception:
         logger.exception("evolve: failed to persist rule")
@@ -681,7 +643,6 @@ async def _persist_rule(
 
 
 async def report_outcome(
-    db: AsyncSession,
     tenant_id: str,
     outcome: str,
     outcome_type: str,
@@ -753,7 +714,6 @@ async def report_outcome(
     else:
         original_count = len(related_ids)
         related_ids, out_of_scope_count = await _filter_by_scope(
-            db,
             tenant_id=tenant_id,
             caller_agent_id=agent_id,
             fleet_id=fleet_id,
@@ -779,7 +739,7 @@ async def report_outcome(
     # Resolve tenant config up front so ``_maybe_generate_rule`` can be
     # called without any DB dependency. Both REST (here) and MCP
     # (``memclaw_evolve``) feed config in the same way.
-    config = await resolve_config(db, tenant_id)
+    config = await resolve_config(tenant_id)
 
     # Phase 1: Generate rule BEFORE touching weights. The MCP tool
     # closes its DB session between this phase and ``_apply_outcome_to_db``
@@ -797,7 +757,6 @@ async def report_outcome(
     )
 
     return await _apply_outcome_to_db(
-        db,
         tenant_id=tenant_id,
         agent_id=agent_id,
         fleet_id=fleet_id,
@@ -858,7 +817,6 @@ async def _maybe_generate_rule(
 
 
 async def _apply_outcome_to_db(
-    db: AsyncSession,
     *,
     tenant_id: str,
     agent_id: str,
@@ -873,36 +831,31 @@ async def _apply_outcome_to_db(
     weight_adjustment_skipped_reason: str | None,
     t0: float,
 ) -> dict:
-    """Phases 2-5 + commit: the entire DB-bound write side of evolve.
+    """Phases 2-5: the entire write side of evolve, fully storage-routed.
 
-    Audit P3 (evolve): split out of ``report_outcome`` so the MCP tool
-    can call it from a fresh DB session, opened AFTER the LLM rule
-    generation. Atomicity contract is preserved — every local write
-    (weight UPDATEs, backfill UPDATE) commits in this one session;
-    the storage-api writes (rule + outcome memories) commit eagerly
-    via HTTP and are not rolled back if the local commit fails, same
-    as before.
+    Audit P3 (evolve): split out of ``report_outcome`` so the MCP tool can call
+    it from a fresh session opened AFTER the LLM rule generation.
+
+    Fix 2 Ph5b (PR2): every write now routes through core-storage-api — the rule
+    + outcome memories via ``create_memory`` (storage-committed independently,
+    as before), and the weight clamp + the rule→outcome ``jsonb_set`` backfill
+    via ONE ``sc.evolve_apply_weights`` call (ONE atomic storage transaction).
+    There is no local ``db`` session to commit, so the final ``db.commit()`` is
+    gone. The phases are RE-SEQUENCED so ``rule_id``/``outcome_id`` are resolved
+    BEFORE the single apply-weights call (the backfill needs the outcome_id, and
+    the source-outcome link is folded into the same transaction as the clamp):
+      1. persist rule (if confident)        → rule_memory_id
+      2. persist outcome                    → outcome_id
+      3. apply-weights (clamp + backfill)   → adjustments
+
+    Split-commit contract (unchanged in spirit): the rule/outcome memories are
+    storage-committed before the apply-weights call; if apply-weights fails the
+    memories remain and the weights/backfill are lost — surfaced as the
+    ``no_rows_updated`` slug rather than a raised exception.
     """
-    # Phase 2: Adjust weights atomically. Row locks are acquired and released
-    # entirely within this block — no long-running work runs while locks are held.
-    processed_ids: list[str] = []
-    weight_adjustments: list[dict] = []
-    if related_ids:
-        adjust_skip_reason, processed_ids, weight_adjustments = await _adjust_weights(
-            db, tenant_id, related_ids, outcome_type, agent_id
-        )
-        # A15: the deeper stage's slug wins. The upstream slug from
-        # ``report_outcome`` only fires when the scope filter dropped
-        # every id; if we got here, the filter passed at least one
-        # but the bulk UPDATE didn't update any (race / parse error).
-        if adjust_skip_reason is not None:
-            weight_adjustment_skipped_reason = adjust_skip_reason
-            _log_weight_adjustment_skip(
-                adjust_skip_reason, tenant_id, scope, related_ids_count=len(related_ids)
-            )
-
-    # Phase 3: Persist rule memory if confidence meets threshold. outcome_id
-    # is not known yet; it is backfilled in Phase 5 after the outcome exists.
+    # Phase 2: Persist rule memory if confidence meets threshold. The outcome_id
+    # is not known yet; the rule→outcome link is backfilled inside the
+    # apply-weights call in Phase 4 once the outcome exists.
     rule_memory_id: str | None = None
     if rule_result is not None:
         confidence = rule_result.get("confidence", 0)
@@ -916,66 +869,64 @@ async def _apply_outcome_to_db(
                 threshold=EVOLVE_RULE_CONFIDENCE_THRESHOLD,
             )
         else:
-            rule_memory_id = await _persist_rule(db, tenant_id, agent_id, fleet_id, rule_result, scope=scope)
+            rule_memory_id = await _persist_rule(tenant_id, agent_id, fleet_id, rule_result, scope=scope)
             if rule_memory_id is None:
                 rule_skipped_reason = "persist_failed"
                 _log_rule_skip(rule_skipped_reason, tenant_id, outcome_type)
 
-    # Phase 4: Persist outcome memory — records rule_memory_id and the IDs
-    # that actually got their weights updated.
+    # Phase 3: Persist outcome memory. It must exist before the apply-weights
+    # call so the rule→outcome backfill (folded into that single atomic call)
+    # has the outcome_id. The outcome records the rule_memory_id and the
+    # in-scope related_ids. ``weight_adjustments`` is persisted EMPTY here BY
+    # DESIGN: the post-clamp deltas aren't known until Phase 4, and writing them
+    # back would need a second outcome-memory write that we deliberately skip to
+    # keep the clamp + rule→outcome backfill in one atomic apply-weights txn. The
+    # real deltas live in the report_outcome response built below and in the
+    # audit log; nothing reads the persisted ``metadata.weight_adjustments``.
     outcome_id = await _persist_outcome(
-        db,
         tenant_id,
         agent_id,
         fleet_id,
         outcome,
         outcome_type,
-        processed_ids,
-        weight_adjustments,
+        related_ids,
+        [],
         rule_memory_id,
         scope=scope,
     )
 
-    # Phase 5: Backfill the rule's source_outcome_id so rules are queryable
-    # back to their originating outcome without scanning every outcome's
-    # related_memory_ids list. Best-effort — a failure here doesn't abort
-    # the whole call since the outcome already references the rule.
-    if rule_memory_id and outcome_id:
-        # Savepoint isolates the backfill: a failure here (e.g. snapshot
-        # visibility race when the rule was committed on a separate connection)
-        # would otherwise abort the outer transaction and surface as a
-        # `RELEASE SAVEPOINT` error on the final db.commit().
-        try:
-            async with db.begin_nested():
-                await db.execute(
-                    _BACKFILL_RULE_OUTCOME_SQL,
-                    {
-                        "rule_id": UUID(rule_memory_id),
-                        "outcome_id": outcome_id,
-                        "tid": tenant_id,
-                    },
-                )
-        except Exception:
-            logger.exception("evolve: failed to backfill source_outcome_id on rule %s", rule_memory_id)
-
-    # Commit local DB-session writes (weight UPDATEs + the rule→outcome
-    # backfill UPDATE). Split-commit contract: rule/outcome memories were
-    # already persisted independently by storage-api over HTTP and are NOT
-    # rolled back if this commit fails. On commit failure the outcome and
-    # rule remain in storage but weight adjustments are lost and the rule
-    # lacks source_outcome_id — log loudly so operators can reconcile.
-    try:
-        await db.commit()
-    except Exception:
-        logger.error(
-            "evolve: db.commit() failed after storage-api writes succeeded; "
-            "rule_memory_id=%s outcome_id=%s — weights and rule→outcome backfill "
-            "are lost but the memories remain in storage",
-            rule_memory_id,
-            outcome_id,
-            exc_info=True,
+    # Phase 4: Adjust weights + (atomically) backfill the rule→outcome link in
+    # ONE storage transaction. rule_id/outcome_id are now resolved, so the
+    # backfill rides along with the clamp rather than a second HTTP call.
+    weight_adjustments: list[dict] = []
+    if related_ids:
+        # ``_processed_ids`` (the subset actually clamped) is intentionally
+        # discarded, not merely unused: the outcome memory was already persisted
+        # in Phase 3 with the scope-filtered ``related_ids`` and is deliberately
+        # not rewritten, and the per-id post-clamp deltas live in the response's
+        # ``weight_adjustments`` below.
+        adjust_skip_reason, _processed_ids, weight_adjustments = await _adjust_weights(
+            tenant_id,
+            related_ids,
+            outcome_type,
+            agent_id,
+            rule_id=rule_memory_id,
+            outcome_id=outcome_id,
         )
-        raise
+        # A15: the deeper stage's slug wins. The upstream slug from
+        # ``report_outcome`` only fires when the scope filter dropped every id;
+        # if we got here, the filter passed at least one but the bulk UPDATE
+        # didn't update any (race / parse error).
+        if adjust_skip_reason is not None:
+            weight_adjustment_skipped_reason = adjust_skip_reason
+            _log_weight_adjustment_skip(
+                adjust_skip_reason, tenant_id, scope, related_ids_count=len(related_ids)
+            )
+    # Note: a rule is only ever generated when related_ids is non-empty
+    # (``_maybe_generate_rule`` returns the ``no_related_ids`` skip otherwise),
+    # so the rule→outcome backfill always rides along with a non-empty clamp
+    # call above — there is no no-related-ids-with-rule backfill path to drive
+    # separately. The backfill therefore commits atomically with the clamp.
 
     return {
         "outcome_id": outcome_id,

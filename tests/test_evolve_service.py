@@ -30,7 +30,7 @@ class TestOutcomeTypeValidation:
         from core_api.services.evolve_service import report_outcome
 
         with pytest.raises(ValueError) as exc_info:
-            await report_outcome(None, "t1", outcome="test", outcome_type="invalid")
+            await report_outcome("t1", outcome="test", outcome_type="invalid")
         assert "invalid" in str(exc_info.value).lower()
 
     @pytest.mark.asyncio
@@ -175,27 +175,87 @@ async def _create_test_memory_via_sc(
     return str(mem["id"]), tag
 
 
-async def _create_test_memory(
-    db, tenant_id, agent_id="evolve-test-agent", weight=0.5, fleet_id=None
+async def _seed_memory_committed(
+    tenant_id, agent_id="evolve-test-agent", weight=0.5, fleet_id=None
 ):
-    """Create a memory directly in DB session (for tests that don't need cross-session visibility)."""
-    from common.models.memory import Memory
+    """Seed a committed memory visible to core-storage-api.
+
+    Fix 2 Ph5b (PR2): the evolve service now routes ``_filter_by_scope`` and
+    ``_adjust_weights`` through core-storage-api, so seeds MUST be committed and
+    visible across sessions — the conftest ``db`` fixture rolls back on its own
+    connection and storage would never see ``db.add`` rows. Uses a raw committed
+    INSERT on an independent storage session so fields the public create
+    endpoint doesn't expose (agent_id / fleet_id / weight) are set directly,
+    without the agent-upsert HTTP dance ``_create_test_memory_via_sc`` requires.
+    """
+    from uuid import uuid4
+
+    from sqlalchemy import text
+
+    from core_storage_api.services.postgres_service import get_session
 
     tag = _uid()
-    mem = Memory(
-        tenant_id=tenant_id,
-        agent_id=agent_id,
-        fleet_id=fleet_id or f"evolve-fleet-{tag}",
-        memory_type="fact",
-        content=f"Test memory for evolve [{tag}]",
-        weight=weight,
-        status="active",
-        recall_count=0,
-        visibility="scope_team",
-    )
-    db.add(mem)
-    await db.flush()
-    return str(mem.id), tag
+    mem_id = str(uuid4())
+    async with get_session() as session:
+        await session.execute(
+            text(
+                """
+                INSERT INTO memories
+                    (id, tenant_id, fleet_id, agent_id, content, memory_type,
+                     status, weight, recall_count, visibility)
+                VALUES
+                    (CAST(:id AS uuid), :tenant_id, :fleet_id, :agent_id, :content, 'fact',
+                     'active', :weight, 0, 'scope_team')
+                """
+            ),
+            {
+                "id": mem_id,
+                "tenant_id": tenant_id,
+                "fleet_id": fleet_id or f"evolve-fleet-{tag}",
+                "agent_id": agent_id,
+                "content": f"Test memory for evolve [{tag}]",
+                "weight": weight,
+            },
+        )
+    return mem_id, tag
+
+
+async def _outcome_memories(tenant_id):
+    """Fetch committed outcome-type memories for a tenant from storage.
+
+    Returns lightweight namespaces with ``content`` / ``metadata`` (parsed to a
+    dict regardless of whether the asyncpg JSONB codec hands it back as a dict
+    or a JSON string) / ``visibility`` so the assertions read uniformly.
+    """
+    import json as _json
+    from types import SimpleNamespace
+
+    from sqlalchemy import text
+
+    from core_storage_api.services.postgres_service import get_session
+
+    async with get_session() as session:
+        rows = (
+            await session.execute(
+                text(
+                    """
+                    SELECT content, metadata, visibility
+                      FROM memories
+                     WHERE tenant_id = :tid AND memory_type = 'outcome'
+                       AND deleted_at IS NULL
+                    """
+                ),
+                {"tid": tenant_id},
+            )
+        ).fetchall()
+
+    out = []
+    for r in rows:
+        meta = r.metadata
+        if isinstance(meta, str):
+            meta = _json.loads(meta)
+        out.append(SimpleNamespace(content=r.content, metadata=meta, visibility=r.visibility))
+    return out
 
 
 @pytest.mark.asyncio
@@ -209,8 +269,7 @@ async def test_evolve_success_increases_weight(db, sc):
 
     from core_api.services.evolve_service import _adjust_weights
 
-    _, _, adjustments = await _adjust_weights(
-        db, tenant_id, [mid], "success", "evolve-test-agent"
+    _, _, adjustments = await _adjust_weights(tenant_id, [mid], "success", "evolve-test-agent"
     )
 
     assert len(adjustments) == 1
@@ -232,8 +291,7 @@ async def test_evolve_failure_decreases_weight(db, sc):
 
     from core_api.services.evolve_service import _adjust_weights
 
-    _, _, adjustments = await _adjust_weights(
-        db, tenant_id, [mid], "failure", "evolve-test-agent"
+    _, _, adjustments = await _adjust_weights(tenant_id, [mid], "failure", "evolve-test-agent"
     )
 
     assert len(adjustments) == 1
@@ -254,8 +312,7 @@ async def test_evolve_partial_slight_increase(db, sc):
 
     from core_api.services.evolve_service import _adjust_weights
 
-    _, _, adjustments = await _adjust_weights(
-        db, tenant_id, [mid], "partial", "evolve-test-agent"
+    _, _, adjustments = await _adjust_weights(tenant_id, [mid], "partial", "evolve-test-agent"
     )
 
     assert len(adjustments) == 1
@@ -275,8 +332,7 @@ async def test_evolve_weight_floor(db, sc):
 
     from core_api.services.evolve_service import _adjust_weights
 
-    _, _, adjustments = await _adjust_weights(
-        db, tenant_id, [mid], "failure", "evolve-test-agent"
+    _, _, adjustments = await _adjust_weights(tenant_id, [mid], "failure", "evolve-test-agent"
     )
 
     assert len(adjustments) == 1
@@ -294,8 +350,7 @@ async def test_evolve_weight_cap(db, sc):
 
     from core_api.services.evolve_service import _adjust_weights
 
-    _, _, adjustments = await _adjust_weights(
-        db, tenant_id, [mid], "success", "evolve-test-agent"
+    _, _, adjustments = await _adjust_weights(tenant_id, [mid], "success", "evolve-test-agent"
     )
 
     assert len(adjustments) == 1
@@ -311,8 +366,7 @@ async def test_evolve_nonexistent_memory_skipped(db):
 
     from core_api.services.evolve_service import _adjust_weights
 
-    _, _, adjustments = await _adjust_weights(
-        db, tenant_id, [fake_id], "success", "test-agent"
+    _, _, adjustments = await _adjust_weights(tenant_id, [fake_id], "success", "test-agent"
     )
     assert len(adjustments) == 0
 
@@ -325,8 +379,7 @@ async def test_evolve_invalid_uuid_skipped(db):
 
     from core_api.services.evolve_service import _adjust_weights
 
-    _, _, adjustments = await _adjust_weights(
-        db, tenant_id, ["not-a-uuid"], "success", "test-agent"
+    _, _, adjustments = await _adjust_weights(tenant_id, ["not-a-uuid"], "success", "test-agent"
     )
     assert len(adjustments) == 0
 
@@ -345,8 +398,7 @@ async def test_evolve_truncates_related_ids_above_cap(db, caplog):
     oversized = [f"not-a-uuid-{i}" for i in range(EVOLVE_MAX_RELATED_IDS + 10)]
 
     with caplog.at_level(logging.WARNING, logger="core_api.services.evolve_service"):
-        _, _, adjustments = await _adjust_weights(
-            db, tenant_id, oversized, "success", "test-agent"
+        _, _, adjustments = await _adjust_weights(tenant_id, oversized, "success", "test-agent"
         )
 
     assert adjustments == []
@@ -376,16 +428,14 @@ class TestConfidenceParsing:
 
 
 @pytest.mark.asyncio
-async def test_evolve_no_related_ids(db):
+async def test_evolve_no_related_ids():
     """Reporting outcome with no related_ids → only outcome memory, no adjustments."""
     tag = _uid()
     tenant_id = f"test-tenant-{tag}"
 
     from core_api.services.evolve_service import report_outcome
 
-    result = await report_outcome(
-        db,
-        tenant_id=tenant_id,
+    result = await report_outcome(tenant_id=tenant_id,
         outcome=f"Something happened [{tag}]",
         outcome_type="success",
         related_ids=None,
@@ -400,20 +450,19 @@ async def test_evolve_no_related_ids(db):
 
 
 @pytest.mark.asyncio
-async def test_evolve_persists_outcome_memory(db):
-    """Outcome is persisted as a memory of type 'outcome'."""
-    from sqlalchemy import select
+async def test_evolve_persists_outcome_memory():
+    """Outcome is persisted as a memory of type 'outcome'.
 
-    from common.models.memory import Memory
-
+    Fix 2 Ph5b (PR2): the outcome ``create_memory`` is storage-committed, so the
+    assertion reads from storage (``_outcome_memories``) rather than the
+    rolled-back ``db`` fixture.
+    """
     tag = _uid()
     tenant_id = f"test-tenant-{tag}"
 
     from core_api.services.evolve_service import report_outcome
 
-    result = await report_outcome(
-        db,
-        tenant_id=tenant_id,
+    result = await report_outcome(tenant_id=tenant_id,
         outcome=f"Test outcome [{tag}]",
         outcome_type="failure",
         related_ids=None,
@@ -421,23 +470,16 @@ async def test_evolve_persists_outcome_memory(db):
     )
     assert result["outcome_id"] is not None
 
-    # Query for the outcome memory
-    stmt = select(Memory).where(
-        Memory.tenant_id == tenant_id,
-        Memory.memory_type == "outcome",
-    )
-    rows = (await db.execute(stmt)).scalars().all()
+    rows = await _outcome_memories(tenant_id)
     assert len(rows) >= 1
-
     outcome_mem = rows[0]
-    assert outcome_mem.memory_type == "outcome"
     assert tag in outcome_mem.content
-    assert outcome_mem.metadata_ is not None
-    assert outcome_mem.metadata_.get("outcome_type") == "failure"
+    assert outcome_mem.metadata is not None
+    assert outcome_mem.metadata.get("outcome_type") == "failure"
 
 
 @pytest.mark.asyncio
-async def test_evolve_generate_rule_returns_valid_structure(db, sc):
+async def test_evolve_generate_rule_returns_valid_structure(sc):
     """_generate_rule with fake LLM returns a valid rule structure."""
     tag = _uid()
     tenant_id = f"test-tenant-{tag}"
@@ -449,7 +491,8 @@ async def test_evolve_generate_rule_returns_valid_structure(db, sc):
     # Audit P3 (evolve): ``_generate_rule`` no longer takes ``db`` —
     # callers resolve the tenant config first and pass it in. This
     # lets the MCP tool close its session before the LLM round-trip.
-    config = await resolve_config(db, tenant_id)
+    # Fix 2 Ph5b (PR2): resolve_config is storage-routed; db=None.
+    config = await resolve_config(tenant_id)
 
     # A10: _generate_rule now returns (skip_reason, rule_dict) tuple.
     reason, rule = await _generate_rule(
@@ -486,21 +529,15 @@ class TestFakeRuleFallback:
 
 
 @pytest.mark.asyncio
-async def test_evolve_failure_with_related_ids_adjusts_and_records(db, sc):
+async def test_evolve_failure_with_related_ids_adjusts_and_records(sc):
     """Failure with related_ids adjusts weights and persists outcome."""
-    from sqlalchemy import select
-
-    from common.models.memory import Memory
-
     tag = _uid()
     tenant_id = f"test-tenant-{tag}"
     mid, _ = await _create_test_memory_via_sc(sc, tenant_id, weight=0.5)
 
     from core_api.services.evolve_service import report_outcome
 
-    result = await report_outcome(
-        db,
-        tenant_id=tenant_id,
+    result = await report_outcome(tenant_id=tenant_id,
         outcome=f"Failed because of bad info [{tag}]",
         outcome_type="failure",
         related_ids=[mid],
@@ -513,18 +550,14 @@ async def test_evolve_failure_with_related_ids_adjusts_and_records(db, sc):
     assert result["outcome_id"] is not None
     assert result["outcome_type"] == "failure"
 
-    # Outcome memory should exist
-    stmt = select(Memory).where(
-        Memory.tenant_id == tenant_id,
-        Memory.memory_type == "outcome",
-    )
-    rows = (await db.execute(stmt)).scalars().all()
+    # Outcome memory should exist (storage-committed).
+    rows = await _outcome_memories(tenant_id)
     assert len(rows) >= 1
-    assert rows[0].metadata_.get("outcome_type") == "failure"
+    assert rows[0].metadata.get("outcome_type") == "failure"
 
 
 @pytest.mark.asyncio
-async def test_evolve_success_no_rule(db, sc):
+async def test_evolve_success_no_rule(sc):
     """Success outcome does NOT generate a rule."""
     tag = _uid()
     tenant_id = f"test-tenant-{tag}"
@@ -532,9 +565,7 @@ async def test_evolve_success_no_rule(db, sc):
 
     from core_api.services.evolve_service import report_outcome
 
-    result = await report_outcome(
-        db,
-        tenant_id=tenant_id,
+    result = await report_outcome(tenant_id=tenant_id,
         outcome=f"Worked great [{tag}]",
         outcome_type="success",
         related_ids=[mid],
@@ -545,16 +576,14 @@ async def test_evolve_success_no_rule(db, sc):
 
 
 @pytest.mark.asyncio
-async def test_evolve_response_shape(db):
+async def test_evolve_response_shape():
     """Full response has all expected fields."""
     tag = _uid()
     tenant_id = f"test-tenant-{tag}"
 
     from core_api.services.evolve_service import report_outcome
 
-    result = await report_outcome(
-        db,
-        tenant_id=tenant_id,
+    result = await report_outcome(tenant_id=tenant_id,
         outcome=f"Test shape [{tag}]",
         outcome_type="partial",
         related_ids=None,
@@ -595,7 +624,7 @@ class TestWhitespaceOutcomeRejection:
         from core_api.services.evolve_service import report_outcome
 
         with pytest.raises(ValueError) as exc_info:
-            await report_outcome(None, "t1", outcome="", outcome_type="success")
+            await report_outcome("t1", outcome="", outcome_type="success")
         assert "non-empty" in str(exc_info.value).lower()
 
     @pytest.mark.asyncio
@@ -603,8 +632,7 @@ class TestWhitespaceOutcomeRejection:
         from core_api.services.evolve_service import report_outcome
 
         with pytest.raises(ValueError) as exc_info:
-            await report_outcome(
-                None, "t1", outcome="   \n\t  ", outcome_type="success"
+            await report_outcome("t1", outcome="   \n\t  ", outcome_type="success"
             )
         assert "non-empty" in str(exc_info.value).lower()
 
@@ -623,8 +651,7 @@ class TestScopeValidation:
         from core_api.services.evolve_service import report_outcome
 
         with pytest.raises(ValueError) as exc_info:
-            await report_outcome(
-                None, "t1", outcome="x", outcome_type="success", scope="bogus"
+            await report_outcome("t1", outcome="x", outcome_type="success", scope="bogus"
             )
         assert "scope" in str(exc_info.value).lower()
 
@@ -633,9 +660,7 @@ class TestScopeValidation:
         from core_api.services.evolve_service import report_outcome
 
         with pytest.raises(ValueError) as exc_info:
-            await report_outcome(
-                None,
-                "t1",
+            await report_outcome("t1",
                 outcome="x",
                 outcome_type="success",
                 scope="fleet",
@@ -645,26 +670,23 @@ class TestScopeValidation:
 
 
 @pytest.mark.asyncio
-async def test_filter_by_scope_agent_drops_other_agents_memories(db):
+async def test_filter_by_scope_agent_drops_other_agents_memories():
     """scope='agent' keeps only memories owned by the caller.
 
-    Uses the direct-DB helper (_create_test_memory) rather than the
-    storage-client path so the test doesn't go through the HTTP
-    agent-upsert dance — it only needs rows visible to the ``db``
-    session, which is exactly where ``_filter_by_scope`` queries.
+    Fix 2 Ph5b (PR2): ``_filter_by_scope``'s SELECT is storage-routed, so seeds
+    must be committed and visible across sessions (``_seed_memory_committed``);
+    ``db`` is no longer passed.
     """
     from core_api.services.evolve_service import _filter_by_scope
 
     tag = _uid()
     tenant_id = f"test-tenant-{tag}"
 
-    mine_a, _ = await _create_test_memory(db, tenant_id, agent_id="agent-a")
-    mine_b, _ = await _create_test_memory(db, tenant_id, agent_id="agent-a")
-    other, _ = await _create_test_memory(db, tenant_id, agent_id="agent-b")
+    mine_a, _ = await _seed_memory_committed(tenant_id, agent_id="agent-a")
+    mine_b, _ = await _seed_memory_committed(tenant_id, agent_id="agent-a")
+    other, _ = await _seed_memory_committed(tenant_id, agent_id="agent-b")
 
-    kept, dropped = await _filter_by_scope(
-        db,
-        tenant_id=tenant_id,
+    kept, dropped = await _filter_by_scope(tenant_id=tenant_id,
         caller_agent_id="agent-a",
         fleet_id=None,
         scope="agent",
@@ -675,21 +697,17 @@ async def test_filter_by_scope_agent_drops_other_agents_memories(db):
 
 
 @pytest.mark.asyncio
-async def test_filter_by_scope_fleet_drops_other_fleets(db):
+async def test_filter_by_scope_fleet_drops_other_fleets():
     """scope='fleet' keeps only memories in the caller's fleet_id."""
     from core_api.services.evolve_service import _filter_by_scope
 
     tag = _uid()
     tenant_id = f"test-tenant-{tag}"
 
-    ours, _ = await _create_test_memory(db, tenant_id, agent_id="a", fleet_id="fleet-x")
-    theirs, _ = await _create_test_memory(
-        db, tenant_id, agent_id="b", fleet_id="fleet-y"
-    )
+    ours, _ = await _seed_memory_committed(tenant_id, agent_id="a", fleet_id="fleet-x")
+    theirs, _ = await _seed_memory_committed(tenant_id, agent_id="b", fleet_id="fleet-y")
 
-    kept, dropped = await _filter_by_scope(
-        db,
-        tenant_id=tenant_id,
+    kept, dropped = await _filter_by_scope(tenant_id=tenant_id,
         caller_agent_id="a",
         fleet_id="fleet-x",
         scope="fleet",
@@ -700,19 +718,17 @@ async def test_filter_by_scope_fleet_drops_other_fleets(db):
 
 
 @pytest.mark.asyncio
-async def test_filter_by_scope_all_keeps_everything_in_tenant(db):
+async def test_filter_by_scope_all_keeps_everything_in_tenant():
     """scope='all' keeps any memory in the tenant regardless of owner/fleet."""
     from core_api.services.evolve_service import _filter_by_scope
 
     tag = _uid()
     tenant_id = f"test-tenant-{tag}"
 
-    m1, _ = await _create_test_memory(db, tenant_id, agent_id="a", fleet_id="fa")
-    m2, _ = await _create_test_memory(db, tenant_id, agent_id="b", fleet_id="fb")
+    m1, _ = await _seed_memory_committed(tenant_id, agent_id="a", fleet_id="fa")
+    m2, _ = await _seed_memory_committed(tenant_id, agent_id="b", fleet_id="fb")
 
-    kept, dropped = await _filter_by_scope(
-        db,
-        tenant_id=tenant_id,
+    kept, dropped = await _filter_by_scope(tenant_id=tenant_id,
         caller_agent_id="a",
         fleet_id=None,
         scope="all",
@@ -723,17 +739,15 @@ async def test_filter_by_scope_all_keeps_everything_in_tenant(db):
 
 
 @pytest.mark.asyncio
-async def test_filter_by_scope_drops_invalid_uuid_and_missing(db):
+async def test_filter_by_scope_drops_invalid_uuid_and_missing():
     """Non-parseable UUIDs and missing rows count toward out_of_scope_count."""
     from core_api.services.evolve_service import _filter_by_scope
 
     tag = _uid()
     tenant_id = f"test-tenant-{tag}"
-    mine, _ = await _create_test_memory(db, tenant_id, agent_id="a")
+    mine, _ = await _seed_memory_committed(tenant_id, agent_id="a")
 
-    kept, dropped = await _filter_by_scope(
-        db,
-        tenant_id=tenant_id,
+    kept, dropped = await _filter_by_scope(tenant_id=tenant_id,
         caller_agent_id="a",
         fleet_id=None,
         scope="agent",
@@ -744,13 +758,11 @@ async def test_filter_by_scope_drops_invalid_uuid_and_missing(db):
 
 
 @pytest.mark.asyncio
-async def test_filter_by_scope_empty_input(db):
-    """None / empty input returns ([], 0) without touching the DB."""
+async def test_filter_by_scope_empty_input():
+    """None / empty input returns ([], 0) without touching storage."""
     from core_api.services.evolve_service import _filter_by_scope
 
-    kept, dropped = await _filter_by_scope(
-        db,
-        tenant_id="t1",
+    kept, dropped = await _filter_by_scope(tenant_id="t1",
         caller_agent_id="a",
         fleet_id=None,
         scope="agent",
@@ -761,26 +773,24 @@ async def test_filter_by_scope_empty_input(db):
 
 
 @pytest.mark.asyncio
-async def test_evolve_scope_agent_filters_out_other_agent_ids(db):
+async def test_evolve_scope_agent_filters_out_other_agent_ids():
     """report_outcome with scope='agent' silently drops memories owned by
     other agents — only the caller's memories get weight-adjusted, and
     out_of_scope_count reflects the drop.
 
-    Uses outcome_type='success' so the rule-generation path (which calls
-    storage-api over HTTP) is not exercised — this test cares only about
-    scope filtering + weight adjustment, both of which live on ``db``.
+    Uses outcome_type='success' so the rule-generation path is not exercised —
+    this test cares only about scope filtering + weight adjustment, both of
+    which are storage-routed (so seeds are committed; db=None).
     """
     from core_api.services.evolve_service import report_outcome
 
     tag = _uid()
     tenant_id = f"test-tenant-{tag}"
 
-    mine, _ = await _create_test_memory(db, tenant_id, agent_id="caller-a", weight=0.5)
-    other, _ = await _create_test_memory(db, tenant_id, agent_id="agent-b", weight=0.5)
+    mine, _ = await _seed_memory_committed(tenant_id, agent_id="caller-a", weight=0.5)
+    other, _ = await _seed_memory_committed(tenant_id, agent_id="agent-b", weight=0.5)
 
-    result = await report_outcome(
-        db,
-        tenant_id=tenant_id,
+    result = await report_outcome(tenant_id=tenant_id,
         outcome=f"agent-scope test [{tag}]",
         outcome_type="success",
         related_ids=[mine, other],
@@ -795,19 +805,17 @@ async def test_evolve_scope_agent_filters_out_other_agent_ids(db):
 
 
 @pytest.mark.asyncio
-async def test_evolve_scope_all_adjusts_any_memory(db):
+async def test_evolve_scope_all_adjusts_any_memory():
     """scope='all' lets the caller adjust memories they don't own (within tenant)."""
     from core_api.services.evolve_service import report_outcome
 
     tag = _uid()
     tenant_id = f"test-tenant-{tag}"
 
-    m1, _ = await _create_test_memory(db, tenant_id, agent_id="caller")
-    m2, _ = await _create_test_memory(db, tenant_id, agent_id="other")
+    m1, _ = await _seed_memory_committed(tenant_id, agent_id="caller")
+    m2, _ = await _seed_memory_committed(tenant_id, agent_id="other")
 
-    result = await report_outcome(
-        db,
-        tenant_id=tenant_id,
+    result = await report_outcome(tenant_id=tenant_id,
         outcome=f"all-scope test [{tag}]",
         outcome_type="success",
         related_ids=[m1, m2],
@@ -821,11 +829,12 @@ async def test_evolve_scope_all_adjusts_any_memory(db):
 
 
 @pytest.mark.asyncio
-async def test_evolve_outcome_memory_visibility_matches_scope(db, sc):
-    """The persisted outcome memory's visibility follows _SCOPE_TO_VISIBILITY."""
-    from sqlalchemy import select
+async def test_evolve_outcome_memory_visibility_matches_scope():
+    """The persisted outcome memory's visibility follows _SCOPE_TO_VISIBILITY.
 
-    from common.models.memory import Memory
+    Fix 2 Ph5b (PR2): the outcome ``create_memory`` is storage-committed, so the
+    assertion reads from storage (``_outcome_memories``); db=None.
+    """
     from core_api.services.evolve_service import (
         _SCOPE_TO_VISIBILITY,
         report_outcome,
@@ -835,9 +844,7 @@ async def test_evolve_outcome_memory_visibility_matches_scope(db, sc):
         tag = _uid()
         tenant_id = f"test-tenant-{tag}"
 
-        result = await report_outcome(
-            db,
-            tenant_id=tenant_id,
+        result = await report_outcome(tenant_id=tenant_id,
             outcome=f"vis test {scope} [{tag}]",
             outcome_type="success",
             related_ids=None,
@@ -846,18 +853,14 @@ async def test_evolve_outcome_memory_visibility_matches_scope(db, sc):
             fleet_id="fleet-x" if scope == "fleet" else None,
         )
 
-        stmt = select(Memory).where(
-            Memory.tenant_id == tenant_id,
-            Memory.memory_type == "outcome",
-        )
-        rows = (await db.execute(stmt)).scalars().all()
+        rows = await _outcome_memories(tenant_id)
         assert len(rows) == 1, (
             f"scope={scope}: expected 1 outcome memory, got {len(rows)}"
         )
         assert rows[0].visibility == _SCOPE_TO_VISIBILITY[scope], (
             f"scope={scope}: visibility {rows[0].visibility} != {_SCOPE_TO_VISIBILITY[scope]}"
         )
-        assert rows[0].metadata_.get("scope") == scope
+        assert rows[0].metadata.get("scope") == scope
         assert result["scope"] == scope
 
 
@@ -878,7 +881,7 @@ class TestMCPHandlerTrustGating:
 
         captured: dict = {}
 
-        async def fake_require_trust(db, tenant_id, agent_id, min_level):
+        async def fake_require_trust(tenant_id, agent_id, min_level):
             captured["min_level"] = min_level
             return 3, False, None  # allow
 
@@ -918,7 +921,7 @@ class TestMCPHandlerTrustGating:
 
         captured: dict = {}
 
-        async def fake_require_trust(db, tenant_id, agent_id, min_level):
+        async def fake_require_trust(tenant_id, agent_id, min_level):
             captured["min_level"] = min_level
             return 3, False, None
 
@@ -947,7 +950,7 @@ class TestMCPHandlerTrustGating:
 
         captured: dict = {}
 
-        async def fake_require_trust(db, tenant_id, agent_id, min_level):
+        async def fake_require_trust(tenant_id, agent_id, min_level):
             captured["min_level"] = min_level
             return 3, False, None
 
@@ -974,7 +977,7 @@ class TestMCPHandlerTrustGating:
         from core_api import mcp_server
         from core_api.services import evolve_service
 
-        async def fake_require_trust(db, tenant_id, agent_id, min_level):
+        async def fake_require_trust(tenant_id, agent_id, min_level):
             return 0, False, "Error (403): Agent 'x' (trust_level=0) < required 2."
 
         monkeypatch.setattr(mcp_server, "_require_trust", fake_require_trust)
@@ -1194,3 +1197,25 @@ async def test_evolve_rest_translates_service_valueerror_to_422(monkeypatch, cli
     )
     assert resp.status_code == 422
     assert "synthetic" in resp.json()["detail"]
+
+
+# ---------------------------------------------------------------------------
+# Fix 2 Ph5b (PR2) — _mcp_session is deleted (evolve was its last consumer)
+# ---------------------------------------------------------------------------
+
+
+def test_mcp_session_helper_is_deleted():
+    """``memclaw_evolve`` was the final ``_mcp_session()`` consumer; once it
+    migrated to ``_no_db()`` the RLS-GUC session helper + its ``async_session``
+    import were deleted. Guard against a reintroduction: the symbol must be
+    gone from mcp_server, and the source must not redefine it."""
+    import inspect
+
+    from core_api import mcp_server
+
+    assert not hasattr(mcp_server, "_mcp_session"), (
+        "_mcp_session must be deleted — evolve was its last consumer (Fix 2 Ph5b PR2)"
+    )
+    src = inspect.getsource(mcp_server)
+    assert "async def _mcp_session" not in src
+    assert "from core_api.db.session import async_session" not in src

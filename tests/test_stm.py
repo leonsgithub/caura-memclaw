@@ -15,7 +15,10 @@ from core_api.schemas import MemoryCreate, STMWriteResponse
 
 
 class TestSTMWritePipeline:
-    """Verify the STM write pipeline runs 3 steps and produces STMWriteResponse."""
+    """Verify the STM write pipeline runs 4 steps and produces STMWriteResponse.
+
+    (4 since the deterministic governance gate joined the STM path; it
+    SKIPs when no tenant_config / governance policy is present, as here.)"""
 
     @pytest.mark.asyncio
     async def test_stm_pipeline_notes(self):
@@ -37,14 +40,13 @@ class TestSTMWritePipeline:
             write_mode="stm",
         )
         ctx = PipelineContext(
-            db=None,
-            data={"input": data, "t0": time.perf_counter()},
+                        data={"input": data, "t0": time.perf_counter()},
         )
         pipeline = build_stm_write_pipeline()
         result = await pipeline.run(ctx)
 
         assert not result.failed
-        assert result.step_count == 3
+        assert result.step_count == 4  # + governance_scan_content (skips: no policy)
         resp = ctx.data["stm_response"]
         assert isinstance(resp, STMWriteResponse)
         assert resp.target == "notes"
@@ -72,8 +74,7 @@ class TestSTMWritePipeline:
             write_mode="stm",
         )
         ctx = PipelineContext(
-            db=None,
-            data={"input": data, "t0": time.perf_counter()},
+                        data={"input": data, "t0": time.perf_counter()},
         )
         pipeline = build_stm_write_pipeline()
         result = await pipeline.run(ctx)
@@ -100,8 +101,7 @@ class TestSTMWritePipeline:
             write_mode="stm",
         )
         ctx = PipelineContext(
-            db=None,
-            data={"input": data, "t0": time.perf_counter()},
+                        data={"input": data, "t0": time.perf_counter()},
         )
         pipeline = build_stm_write_pipeline()
         result = await pipeline.run(ctx)
@@ -127,8 +127,7 @@ class TestSTMWritePipeline:
             write_mode="stm",
         )
         ctx = PipelineContext(
-            db=None,
-            data={"input": data, "t0": time.perf_counter()},
+                        data={"input": data, "t0": time.perf_counter()},
         )
         pipeline = build_stm_write_pipeline()
         with pytest.raises(HTTPException) as exc_info:
@@ -203,8 +202,7 @@ class TestSTMService:
             write_mode="stm",
         )
         ctx = PipelineContext(
-            db=None,
-            data={"input": data, "t0": time.perf_counter()},
+                        data={"input": data, "t0": time.perf_counter()},
         )
         await build_stm_write_pipeline().run(ctx)
 
@@ -237,7 +235,7 @@ class TestSTMService:
             visibility="scope_agent",
             write_mode="stm",
         )
-        ctx = PipelineContext(db=None, data={"input": data})
+        ctx = PipelineContext(data={"input": data})
         await ResolveSTMTarget().execute(ctx)
         assert ctx.data["stm_target"] == "notes"
 
@@ -255,7 +253,7 @@ class TestSTMService:
             visibility="scope_team",
             write_mode="stm",
         )
-        ctx = PipelineContext(db=None, data={"input": data})
+        ctx = PipelineContext(data={"input": data})
         await ResolveSTMTarget().execute(ctx)
         assert ctx.data["stm_target"] == "bulletin"
         assert ctx.data["stm_fleet_id"] == "fleet-1"
@@ -274,7 +272,7 @@ class TestSTMService:
             visibility="scope_org",
             write_mode="stm",
         )
-        ctx = PipelineContext(db=None, data={"input": data})
+        ctx = PipelineContext(data={"input": data})
         await ResolveSTMTarget().execute(ctx)
         assert ctx.data["stm_target"] == "bulletin"
 
@@ -310,8 +308,7 @@ class TestInjectSTMContext:
         )
 
         ctx = PipelineContext(
-            db=None,
-            data={
+                        data={
                 "tenant_id": "t1",
                 "caller_agent_id": "agent-1",
                 "fleet_ids": None,
@@ -339,8 +336,7 @@ class TestInjectSTMContext:
         from core_api.pipeline.step import StepOutcome
 
         ctx = PipelineContext(
-            db=None,
-            data={"tenant_id": "t1", "results": []},
+                        data={"tenant_id": "t1", "results": []},
         )
 
         with patch("core_api.config.settings") as mock_settings:
@@ -392,8 +388,7 @@ class TestInjectSTMContext:
         )
 
         ctx = PipelineContext(
-            db=None,
-            data={
+                        data={
                 "tenant_id": "t1",
                 "caller_agent_id": "agent-1",
                 "fleet_ids": None,
