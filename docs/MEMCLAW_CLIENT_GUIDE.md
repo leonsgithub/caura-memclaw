@@ -198,6 +198,108 @@ team/org so other agents benefit.
 
 ---
 
+## 2b. Multi-VM / multi-repo topology
+
+The common deployment: several VMs each running an agent, where multiple VMs may
+work on the **same repo**, and one VM works on **many repos** over time. You want
+memories about a repo **shared** across whoever touches it, while different repos
+stay **separate**. Two independent knobs do this:
+
+| Knob | Meaning | Scope | Set where |
+|------|---------|-------|-----------|
+| `agent_id` | **who/where** wrote it (`claude-vm1`, `hermes-vmC`) | one VM | **static** — `X-Agent-ID` header, once per VM |
+| `fleet_id` | **which repo** the memory belongs to | one repo | **dynamic** — body arg per call, = repo slug |
+
+`fleet_id` can't be a header because a VM hops between repos. In standalone you're
+single-tenant (`default`), so the repo boundary is `fleet_id`, **not** a tenant.
+
+**Verified behaviour:** an agent on `fleet_id=repo-foo` (`scope_team`) is read by
+*any other* agent doing `recall scope=fleet fleet_ids=["repo-foo"]`, with the
+original `agent_id` preserved as provenance; an agent on `repo-bar` sees none of
+it. A plain `recall` (default `scope=agent`) sees only the caller's own memories.
+
+### Setup
+
+**1. Identity header per VM — derive from hostname so it's unique + stable:**
+
+```bash
+# each Claude VM (×3)
+claude mcp add --transport http memclaw http://192.168.1.53:8000/mcp --scope user \
+  --header "X-Tenant-ID: default" \
+  --header "X-Agent-ID: claude-$(hostname -s)"
+# each Hermes VM (×4): same two headers, X-Agent-ID: hermes-<hostname>
+```
+
+**2. Repo = fleet, shared via `scope_team`.** On every memclaw call the agent sets
+`fleet_id` to a stable repo slug (git remote basename or repo folder name):
+
+```
+write   { fleet_id: "<repo>", visibility: "scope_team", content: "..." }
+recall  { fleet_id-via: scope: "fleet", fleet_ids: ["<repo>"], query: "..." }
+```
+
+**3. First write registers the agent** (trust 1 → 2) and unlocks `scope=fleet`
+reads. One throwaway "who am I" memory does it.
+
+### The one discipline
+
+To *read* the shared repo pool you must pass `scope="fleet"` + `fleet_ids=["<repo>"]`.
+A default `recall` only returns the calling agent's own memories. Make the agent
+do this automatically:
+
+- **Claude** — drop this in the repo's `CLAUDE.md` (or a user rule):
+
+  > **MemClaw fleet convention.** Treat the current git repo as the memory
+  > workspace. Compute `REPO` = basename of `git remote get-url origin` (fall back
+  > to the repo folder name). On every `memclaw_*` call: pass `fleet_id: REPO`;
+  > on `memclaw_write` also pass `visibility: "scope_team"`; on `memclaw_recall` /
+  > `memclaw_list` / `memclaw_stats` pass `scope: "fleet"` and
+  > `fleet_ids: ["<REPO>"]`. Do **not** set `agent_id` in the body — identity
+  > comes from the connection header.
+
+- **Hermes** — set it in code from the repo it's driving:
+
+  ```python
+  import subprocess, os, json, httpx
+
+  def repo_slug(path: str = ".") -> str:
+      try:
+          url = subprocess.check_output(
+              ["git", "-C", path, "remote", "get-url", "origin"], text=True).strip()
+          return os.path.splitext(os.path.basename(url))[0]   # ".../acme.git" -> "acme"
+      except Exception:
+          return os.path.basename(os.path.abspath(path))
+
+  FLEET = repo_slug()   # compute once per repo Hermes operates on
+
+  def call(tool, args):
+      if tool == "memclaw_recall":                 # recall: list arg, no fleet_id
+          args.setdefault("scope", "fleet")
+          args.setdefault("fleet_ids", [FLEET])
+      elif tool in ("memclaw_list", "memclaw_stats"):
+          args.setdefault("scope", "fleet")
+          args.setdefault("fleet_id", FLEET)
+      elif tool == "memclaw_write":
+          args.setdefault("fleet_id", FLEET)
+          args.setdefault("visibility", "scope_team")
+      # ... POST with X-Agent-ID: hermes-<host> header (see §1c) ...
+  ```
+
+  Watch the arg name: `memclaw_recall` takes `fleet_ids` (a list) and has **no**
+  `fleet_id`; `memclaw_list` / `memclaw_stats` / `memclaw_write` take a single
+  `fleet_id`. Passing the wrong one is rejected.
+
+### Simpler alternative (no provenance)
+
+If you don't care *who* wrote a memory, set **`agent_id = "<repo>"`** for every
+agent and skip fleets entirely — a plain `recall` then shares within the repo
+automatically (no `scope=fleet`, no trust-2 step). Cost: you can't tell
+`claude-vm1` from `hermes-vmC`, and procedure reliability is tracked per-repo
+instead of per-agent. Still a per-call body arg (the repo is dynamic), so it
+isn't any less work to pass than `fleet_id`.
+
+---
+
 ## 3. Tool catalog (15 tools)
 
 Every tool accepts `agent_id` (defaults to the deployment's seeded
