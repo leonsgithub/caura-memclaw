@@ -3096,7 +3096,12 @@ async def memclaw_procedure_record(
     ] = None,
     latency_ms: Annotated[int | None, Field(description="Observed latency, optional.")] = None,
     validation_passed: Annotated[
-        bool | None, Field(description="Whether output validation passed, optional.")
+        bool | None,
+        Field(
+            description="True only if an INDEPENDENT verifier (separate evaluator "
+            "agent / test run / CI gate) confirmed the outcome. Moves the verified "
+            "counters + verified_reliability. Leave None for self-reported outcomes."
+        ),
     ] = None,
     agent_id: Annotated[str, Field(description="Caller agent.")] = _DEFAULT_AGENT_ID,
 ) -> str:
@@ -3138,15 +3143,37 @@ async def memclaw_procedure_record(
         stats = proc.get("stats") or {}
         success = int(stats.get("success_count", 0))
         failure = int(stats.get("failure_count", 0))
+        # Loop Engineering LE-01: a parallel pair that only moves when the
+        # outcome was INDEPENDENTLY verified (validation_passed=True, set by
+        # the harness's separate evaluator agent — not the generator grading
+        # itself). Subset of success/failure. Defends against the paper's
+        # "Nodding Loop": self-reported wins no longer look like verified ones.
+        verified_success = int(stats.get("verified_success_count", 0))
+        verified_failure = int(stats.get("verified_failure_count", 0))
         now_iso = datetime.now(UTC).isoformat()
         patch: dict = {}
         if outcome_type == "success":
             success += 1
             patch["last_success_at"] = now_iso
+            if validation_passed:
+                verified_success += 1
         else:
             failure += 1
             patch["last_failure_at"] = now_iso
+            if validation_passed:
+                verified_failure += 1
         reliability = compute_reliability(success, failure)
+        # verified_reliability stays null until there is at least one verified
+        # outcome, so callers distinguish "not independently verified yet" from
+        # "verified and mediocre" — the verification-debt signal (§VIII).
+        verified_reliability = (
+            compute_reliability(verified_success, verified_failure)
+            if (verified_success + verified_failure) > 0
+            else None
+        )
+        # Quarantine deliberately keys off the COMBINED counts (unchanged) —
+        # verified counters are additive telemetry this sprint. Letting
+        # verified failures quarantine faster is deferred until there's data.
         quarantined = (
             success + failure >= _PROC_QUARANTINE_MIN_ATTEMPTS
             and reliability < _PROC_QUARANTINE_RELIABILITY
@@ -3155,6 +3182,8 @@ async def memclaw_procedure_record(
             {
                 "success_count": success,
                 "failure_count": failure,
+                "verified_success_count": verified_success,
+                "verified_failure_count": verified_failure,
                 "reliability_score": reliability,
                 "is_quarantined": quarantined,
             }
@@ -3199,6 +3228,7 @@ async def memclaw_procedure_record(
                     "request_id": request_id,
                     "outcome_type": outcome_type,
                     "reliability_score": reliability,
+                    "verified_reliability": verified_reliability,
                     "is_quarantined": quarantined,
                     "stats": updated,
                     "skill_doc_id": skill_doc_id,

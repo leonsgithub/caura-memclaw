@@ -122,6 +122,18 @@ class ProcedureStats(Base):
     failure_count: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default=text("0")
     )
+    # Loop Engineering LE-01: outcomes that were INDEPENDENTLY verified
+    # (record called with validation_passed=True, from the harness's
+    # separate evaluator agent). A subset of success_count/failure_count —
+    # they distinguish a verified-reliable procedure from a self-reported
+    # one (the paper's "Nodding Loop" defence). Telemetry only; quarantine
+    # still keys off the combined counts.
+    verified_success_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
+    verified_failure_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=text("0")
+    )
     last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_failure_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     reliability_score: Mapped[float] = mapped_column(

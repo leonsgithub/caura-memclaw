@@ -16,8 +16,14 @@ _DESCRIPTION = (
     "Report the outcome of following a procedure. procedure_id = the id from a "
     "memclaw_procedure_suggest result; outcome_type: success|failure. Updates the "
     "procedure's reliability_score and quarantines it once it has ≥3 attempts and a "
-    "score below 0.3 (after which it stops being suggested). Optional request_id "
-    "(from suggest), latency_ms, and validation_passed are recorded for telemetry. "
+    "score below 0.3 (after which it stops being suggested). "
+    "Set validation_passed=True ONLY when the outcome was checked by an INDEPENDENT "
+    "verifier (a separate evaluator agent / test run / CI gate — not the same agent "
+    "that ran the procedure self-grading). Verified outcomes additionally move a "
+    "verified-counter pair and surface 'verified_reliability' in the response, "
+    "distinguishing a proven-reliable procedure from one with only self-reported "
+    "wins. Leave validation_passed unset/None for self-reported outcomes. "
+    "Optional request_id (from suggest) and latency_ms are recorded for telemetry. "
     "Trust ≥ 1 — agents can only record against procedures in their own tenant."
 )
 

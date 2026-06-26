@@ -248,6 +248,8 @@ PROCEDURE_STATS_FIELDS: list[str] = [
     "procedure_id",
     "success_count",
     "failure_count",
+    "verified_success_count",
+    "verified_failure_count",
     "last_success_at",
     "last_failure_at",
     "reliability_score",

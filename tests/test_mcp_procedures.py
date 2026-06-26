@@ -165,6 +165,77 @@ async def test_record_success_raises_reliability(proc_env):
     assert last["is_quarantined"] is False
 
 
+# ── LE-01: verified-vs-claimed outcome reliability (Nodding-Loop defence) ──
+
+
+@pytest.mark.asyncio
+async def test_record_self_reported_leaves_verified_null(proc_env):
+    """validation_passed unset → self-reported path unchanged, no verified data.
+
+    Proves the existing behaviour is preserved byte-for-byte: success_count
+    moves, verified_success_count stays 0, and verified_reliability is null
+    (not 0.5) so callers can tell 'never independently verified'.
+    """
+    created = parse_envelope(await _write_proc())
+    pid = created["id"]
+
+    out = parse_envelope(
+        await mcp_server.memclaw_procedure_record(
+            procedure_id=pid, outcome_type="success"
+        )
+    )
+    assert out["reliability_score"] > 0.5
+    assert out["verified_reliability"] is None
+    stats = out["stats"]
+    assert stats["success_count"] == 1
+    assert stats["verified_success_count"] == 0
+    assert stats["verified_failure_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_record_verified_success_moves_verified_counters(proc_env):
+    """validation_passed=True on a success → verified_success + verified_reliability."""
+    created = parse_envelope(await _write_proc())
+    pid = created["id"]
+
+    # One self-reported success, then one independently-verified success.
+    await mcp_server.memclaw_procedure_record(
+        procedure_id=pid, outcome_type="success"
+    )
+    out = parse_envelope(
+        await mcp_server.memclaw_procedure_record(
+            procedure_id=pid, outcome_type="success", validation_passed=True
+        )
+    )
+    stats = out["stats"]
+    assert stats["success_count"] == 2  # both move the combined counter
+    assert stats["verified_success_count"] == 1  # only the verified one moves this
+    assert stats["verified_failure_count"] == 0
+    # verified_reliability now computed from (1 verified success, 0 failure).
+    assert out["verified_reliability"] is not None
+    assert out["verified_reliability"] > 0.5
+
+
+@pytest.mark.asyncio
+async def test_record_verified_failure_drops_verified_reliability(proc_env):
+    """validation_passed=True on a failure → verified_failure moves, verified_reliability falls."""
+    created = parse_envelope(await _write_proc())
+    pid = created["id"]
+
+    out = parse_envelope(
+        await mcp_server.memclaw_procedure_record(
+            procedure_id=pid, outcome_type="failure", validation_passed=True
+        )
+    )
+    stats = out["stats"]
+    assert stats["failure_count"] == 1
+    assert stats["verified_failure_count"] == 1
+    assert stats["verified_success_count"] == 0
+    # (0 verified success, 1 verified failure) → compute_reliability = 1/3.
+    assert out["verified_reliability"] is not None
+    assert out["verified_reliability"] < 0.5
+
+
 @pytest.mark.asyncio
 async def test_record_failures_quarantine_and_drop_from_suggest(proc_env):
     created = parse_envelope(await _write_proc())
