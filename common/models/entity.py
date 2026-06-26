@@ -1,7 +1,7 @@
 import uuid
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import Float, ForeignKey, Index, Text, UniqueConstraint, text
+from sqlalchemy import DDL, Float, ForeignKey, Index, Text, UniqueConstraint, event, text
 from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -22,6 +22,43 @@ class Entity(Base):
     attributes: Mapped[dict | None] = mapped_column(JSONB)
     name_embedding = mapped_column(Vector(VECTOR_DIM))
     search_vector = mapped_column(TSVECTOR)
+
+
+# ``search_vector`` is maintained by a Postgres trigger, not the ORM —
+# ``Entity`` writes never set it directly; FTS reads (``fts_search_entities``)
+# depend on it being populated. The trigger + function + GIN index are created
+# by migration 001 in real deployments, but ``Base.metadata.create_all`` (used
+# to build test/dev schemas) only knows ORM-declared objects and would leave
+# ``search_vector`` perpetually NULL. These ``after_create`` hooks replay the
+# migration-001 DDL onto any create_all-built schema so FTS behaves identically.
+# Keep this in lock-step with migration 001 (entities_search_vector_update).
+event.listen(
+    Entity.__table__,
+    "after_create",
+    DDL(
+        "CREATE INDEX IF NOT EXISTS ix_entities_search_vector "
+        "ON entities USING GIN (search_vector)"
+    ),
+)
+event.listen(
+    Entity.__table__,
+    "after_create",
+    DDL(
+        "CREATE OR REPLACE FUNCTION entities_search_vector_update() "
+        "RETURNS trigger AS $$ BEGIN "
+        "NEW.search_vector := to_tsvector('english', coalesce(NEW.canonical_name, '')); "
+        "RETURN NEW; END $$ LANGUAGE plpgsql"
+    ),
+)
+event.listen(
+    Entity.__table__,
+    "after_create",
+    DDL(
+        "CREATE TRIGGER entities_search_vector_trigger "
+        "BEFORE INSERT OR UPDATE OF canonical_name ON entities "
+        "FOR EACH ROW EXECUTE FUNCTION entities_search_vector_update()"
+    ),
+)
 
 
 class Relation(Base):

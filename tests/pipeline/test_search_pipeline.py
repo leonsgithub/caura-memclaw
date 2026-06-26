@@ -219,6 +219,7 @@ async def test_load_and_serialize_uses_preloaded_entity_links():
     mem.content = "test content"
     mem.weight = 0.5
     mem.source_uri = None
+    mem.source_type = None
     mem.run_id = None
     mem.metadata_ = None
     mem.created_at = datetime.now(timezone.utc)

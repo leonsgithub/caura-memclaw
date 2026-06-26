@@ -31,7 +31,17 @@ FIXTURES = Path(__file__).parent / "fixtures"
 # external dev who wrote the v3 friction report lost ~10 minutes total
 # to those two misreads; the +155 tokens per session are worth more than
 # that across the install base.
-CEILING_TOKENS = 5200
+#
+# 2026-06-26: 7353 cl100k. The 5200 ceiling silently lapsed — this gate is
+# ``pytest.importorskip("tiktoken")``-guarded and tiktoken was absent from the
+# CI/dev env while the surface grew from 12 tools to 20: the 4 procedural-memory
+# tools, memclaw_env (BP-03), memclaw_export (BP-04), memclaw_review (BP-05), and
+# memclaw_session_start (UX-03). Those 8 tools are the bulk of the +2292; the
+# Loop Engineering validation_passed guidance on memclaw_procedure_record added
+# 82. Re-baselined to 7500 (current + ~150 headroom) so the gate guards against
+# the NEXT silent regression. If trimming is wanted, the procedure/keystones
+# descriptions are the longest and the first place to cut.
+CEILING_TOKENS = 7500
 
 
 def _count(path: Path) -> int:
