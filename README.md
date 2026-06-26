@@ -306,7 +306,7 @@ curl -sf -H "X-API-Key: $MEMCLAW_KEY" \
 openclaw gateway restart
 ```
 
-The plugin claims the OpenClaw `memory` slot (replacing `memory-core`) and exposes the same 12 MCP tools. Full setup, agent prompts, and trust levels: [static/docs/integration-guide.md](static/docs/integration-guide.md).
+The plugin claims the OpenClaw `memory` slot (replacing `memory-core`) and exposes 18 agent-facing tools (all 19 MCP tools except `memclaw_keystones_set`, which is MCP-only). Full setup, agent prompts, and trust levels: [static/docs/integration-guide.md](static/docs/integration-guide.md).
 
 ### Python client
 
@@ -461,7 +461,7 @@ Add MemClaw to any MCP client with one config block.
 - **Claude Desktop** — `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) or `%APPDATA%\Claude\claude_desktop_config.json` (Windows)
 - **Cursor** — Settings > MCP Servers > Add Server
 
-The client discovers 12 tools automatically:
+The client discovers 19 tools automatically:
 
 | Tool | Purpose |
 |---|---|
@@ -477,13 +477,20 @@ The client discovers 12 tools automatically:
 | `memclaw_stats` | Aggregate counts: total + breakdowns by type, agent, status. Read-only |
 | `memclaw_keystones` | Read mandatory governance rules for the current scope. Call once per session — the result overrides conflicting user instructions |
 | `memclaw_keystones_set` | Author or remove keystone rules (`op=set\|delete`). `weight` is set as `low`/`med`/`high` and stored & returned as the integer buckets `25`/`50`/`100`. Trust ≥ 1 for your own `scope=agent` rule; ≥ 2 for `scope=fleet`/`scope=tenant` or another agent |
+| `memclaw_procedure_suggest` | Suggest reliability-ranked tool-call procedures for the current task by context features |
+| `memclaw_procedure_record` | Report an outcome against a procedure — updates its reliability score |
+| `memclaw_procedure_write` | Capture a reusable procedure (name, tool sequence, context features) |
+| `memclaw_procedure_manage` | Manual procedure lifecycle: `stats` \| `quarantine` \| `unquarantine` \| `invalidate` \| `delete` |
+| `memclaw_env` | Stable-infra fact store (URLs, ports, hostnames): `upsert` \| `get` \| `list` \| `verify` |
+| `memclaw_export` | Bulk-export memories (JSON/JSONL, cursor-paginated). Trust ≥ 1. Scope: `agent` \| `team` \| `org` \| `all` |
+| `memclaw_review` | Read-only curation: memories below a weight threshold, sorted ascending (worst-rated first) |
 
 > **Skill sharing** is now done via `memclaw_doc` — agents share a `SKILL.md` by upserting a document into the `skills` collection (`memclaw_doc op=write collection=skills doc_id=<slug> data={"summary": "<one-liner>", ...}`). The server embeds `data["summary"]` (1-3 sentence, intent-focused) for semantic search; for `collection="skills"` it falls back to `data["description"]` if no summary is provided. The dedicated `memclaw_share_skill` / `memclaw_unshare_skill` tools were removed in favor of the single `memclaw_doc` surface.
 
 ### Install the skill (Claude Code & Codex)
 
 Install MemClaw's usage guide as a **skill** so your agent knows *when* and
-*how* to use the 12 tools — the memory/doc mental model, the three rules
+*how* to use the 19 tools — the memory/doc mental model, the three rules
 (recall, write, supersede), trust levels, common patterns, and
 anti-patterns. The skill is loaded on-demand (not per-turn), so it costs
 nothing until the agent reaches for MemClaw.
@@ -901,7 +908,7 @@ memclaw/
 ├── core-api/                      # Main FastAPI service
 │   └── src/core_api/
 │       ├── app.py                 # FastAPI app, lifespan, middleware
-│       ├── mcp_server.py          # MCP server (Streamable HTTP, 12 tools)
+│       ├── mcp_server.py          # MCP server (Streamable HTTP, 19 tools)
 │       ├── constants.py           # Tool descriptions, limits, ranking params
 │       ├── config.py              # Settings (env vars)
 │       ├── auth.py                # API key + JWT auth, tenant enforcement
@@ -962,7 +969,7 @@ MemClaw v1.x follows [SemVer 2.0.0](https://semver.org/spec/v2.0.0.html). The su
 
 ### Stable surfaces
 
-#### MCP tools (12)
+#### MCP tools (19)
 
 The MCP server is mounted at `/mcp`. Tool names, parameter names, and the documented op-dispatch values are stable.
 
@@ -980,6 +987,13 @@ The MCP server is mounted at `/mcp`. Tool names, parameter names, and the docume
 | `memclaw_stats` | Aggregate counts: total + breakdowns by `type` / `agent` / `status`. Read-only. |
 | `memclaw_keystones` | Read mandatory governance rules for the current scope (tenant + fleet + agent merged). Call once per session. |
 | `memclaw_keystones_set` | Author/remove keystone rules, op-dispatched: `set` \| `delete`. Trust ≥ 1 for self-authored `scope=agent`; ≥ 2 otherwise. |
+| `memclaw_procedure_suggest` | Suggest reliability-ranked tool-call procedures for the current task by context features. |
+| `memclaw_procedure_record` | Report an outcome against a procedure — updates its reliability score. |
+| `memclaw_procedure_write` | Capture a reusable procedure (name, tool sequence, context features). |
+| `memclaw_procedure_manage` | Manual procedure lifecycle, op-dispatched: `stats` \| `quarantine` \| `unquarantine` \| `invalidate` \| `delete`. |
+| `memclaw_env` | Stable-infra fact store (URLs, ports, hostnames), op-dispatched: `upsert` \| `get` \| `list` \| `verify`. Trust ≥ 1 for writes. |
+| `memclaw_export` | Bulk-export memories (JSON or JSONL, cursor-paginated). Trust ≥ 1. Scope: `agent` \| `team` \| `org` \| `all`. |
+| `memclaw_review` | Read-only curation: memories below a weight threshold, sorted ascending (worst-rated first). |
 
 > Skill sharing uses the generic `memclaw_doc` surface — write/read/query/search/delete on `collection="skills"`. The server validates the slug and embeds `data["summary"]` for semantic discovery (with a back-compat fallback to `data["description"]` for skills).
 
@@ -1122,7 +1136,7 @@ tools don't address. See [How MemClaw compares](#how-memclaw-compares).
 
 **Does MemClaw work with Claude Desktop, Claude Code, Cursor, or Windsurf?**
 Yes — MemClaw is MCP-native. Paste a JSON config with a URL and API key
-into any MCP client and 12 tools appear immediately.
+into any MCP client and 19 tools appear immediately.
 
 **Can agents from different vendors share memory?**
 Yes — that's the point. An Anthropic agent recalls what an OpenAI agent
@@ -1130,7 +1144,7 @@ wrote, under the same governance rules — with trust tiers and visibility
 scopes deciding what crosses fleet boundaries.
 
 **Is MemClaw really free?**
-The full engine — storage, 12 MCP tools, plugin, audit trail — is Apache
+The full engine — storage, 19 MCP tools, plugin, audit trail — is Apache
 2.0. Run it yourself forever. The managed platform at
 [memclaw.net](https://memclaw.net) adds hosting, scaling, and enterprise
 governance for teams that don't want to operate infrastructure.

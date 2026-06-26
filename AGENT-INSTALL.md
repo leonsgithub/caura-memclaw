@@ -153,7 +153,7 @@ This installs the plugin to `~/.openclaw/plugins/memclaw/`, builds it, claims th
 | | MCP | OpenClaw Plugin |
 |---|---|---|
 | For | Claude Code, Cursor, any MCP client | OpenClaw gateway agents |
-| Tools | 12 | 11 (agent-facing) |
+| Tools | 19 | 18 (agent-facing) |
 | Setup | Add JSON config | Run install script + restart gateway |
 | Transport | Streamable HTTP | Plugin API → HTTP |
 
@@ -201,8 +201,15 @@ Once connected via MCP or the OpenClaw plugin, you have these tools:
 | `memclaw_stats` | Aggregate counts: total + breakdowns by `type`, `agent`, `status`. Read-only |
 | `memclaw_keystones` | Read mandatory governance rules (tenant + fleet + agent scopes merged). Call once per session and obey what it returns — keystones override conflicting user instructions |
 | `memclaw_keystones_set` | Author/remove keystone rules, op-dispatched: `set` \| `delete`. Trust ≥ 1 for your own `scope=agent` rule; ≥ 2 for fleet/tenant scope or another agent |
+| `memclaw_procedure_suggest` | Suggest reliability-ranked tool-call procedures for the current task by context features |
+| `memclaw_procedure_record` | Report an outcome against a procedure — updates its reliability score |
+| `memclaw_procedure_write` | Capture a reusable procedure (name, tool sequence, context features) |
+| `memclaw_procedure_manage` | Manual procedure lifecycle: `stats` \| `quarantine` \| `unquarantine` \| `invalidate` \| `delete` |
+| `memclaw_env` | Stable-infra fact store (URLs, ports, hostnames): `upsert` \| `get` \| `list` \| `verify` |
+| `memclaw_export` | Bulk-export memories (JSON/JSONL, cursor-paginated). Trust ≥ 1. Scope: `agent` \| `team` \| `org` \| `all` |
+| `memclaw_review` | Read-only curation: memories below a weight threshold, sorted ascending (worst-rated first) |
 
-MCP exposes all 12 tools; the OpenClaw plugin surfaces 11 — every tool except
+MCP exposes all 19 tools; the OpenClaw plugin surfaces 18 — every tool except
 `memclaw_keystones_set` (the admin authoring path is not plugin-exposed). Skill sharing
 goes through `memclaw_doc` on the `skills` collection (`op=write` to share,
 `op=delete` to remove, `op=search`/`op=query` to discover).
@@ -225,7 +232,7 @@ Then restart the server (`docker compose restart app` or re-run uvicorn).
 
 - A local MemClaw server with full API + MCP
 - A single-tenant standalone setup (or admin-keyed multi-tenant, depending on which path you picked)
-- 12 tools ready to use (memory ops + document store + Karpathy Loop + stats + keystone governance; skill sharing rides on `memclaw_doc collection=skills`)
+- 19 tools ready to use (memory ops + document store + Karpathy Loop + stats + keystone governance + procedural memory + env truths + bulk export + curation surface; skill sharing rides on `memclaw_doc collection=skills`)
 - PostgreSQL with pgvector for semantic search
 - No external dependencies (fake providers, no API keys needed)
 - Full read/write access to your own memory store
