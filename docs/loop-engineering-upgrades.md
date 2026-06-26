@@ -1,3 +1,34 @@
+> ## ⚠️ SUPERSEDED — 2026-06-26
+>
+> **This design was scrapped before implementation. Five-sixths of it was a category error. Kept as a historical record; do not build from it.**
+>
+> The premise below — "elevate MemClaw to **100% support** for Loop Engineering" — is the wrong goal. After re-reading the source paper (`/home/leon/dev/research/learningsystem/Loop-Engineering-IEEE.pdf`), the load-bearing thesis is explicit (Table V, §VII.E, §XII):
+>
+> > **"Loop engineering is a set of capabilities, not a product."**
+>
+> A loop has **six organs**, and they live in the **harness**, not in any one tool:
+>
+> | Organ | Move | Where it lives |
+> |---|---|---|
+> | Automations | Scheduling | Claude Code `/loop`, Cloud Routines, GH Actions |
+> | Worktrees | Handoff | git `--worktree` |
+> | Skills | Discovery | `SKILL.md` |
+> | Connectors | Persistence/Discovery | MCP |
+> | Sub-agents | Verification | `.claude/agents/reviewer.md` + `/goal` |
+> | **Memory** | **Persistence** | **on-disk state — this is MemClaw** |
+>
+> MemClaw is **one** organ: **Memory**. This doc had the memory store grow three organs the harness already owns:
+>
+> - **Upgrade A (`verify_run`)** — put a subprocess-sandbox *evaluator* inside the memory store. But the evaluator is a separate **agent** (Fig. 3), a harness organ — not a function call in MemClaw. **Dropped.**
+> - **Upgrade B (`cost_audit` / TDCF)** — instrumented an **invented** formula, `base_cost × 2^(turn_distance/10)`. The paper's "cost scales with turns survived" (§II.C) is *motivational intuition for why verification matters*, not a mechanism it proposes building. Speculative gold-plating. **Dropped.**
+> - **Upgrade C (`schedule_loop`)** — reinvented the harness's **scheduling** organ (`/loop` + Cloud Routines) inside a memory server; the worker even punted payload execution back to the harness, making it pure duplication. **Dropped.**
+>
+> **What survived:** the one genuinely in-lane gap — the paper's *Nodding Loop* (§VI.A), an agent grading its own homework. `memclaw_procedure_record` already accepts `validation_passed` but **silently drops it**, so procedure reliability moves on self-reported `outcome_type` alone. The replacement sprint wires that one field through so an *independent* evaluator's verdict is distinguishable from a self-graded one — MemClaw staying in its Memory lane and being honest about what verified vs. merely claimed.
+>
+> **Replacement plan:** [`sprints/sprint-loop-engineering/capability_tasks.json`](../sprints/sprint-loop-engineering/capability_tasks.json) (LE-01 + signoff). Reframed goal: *MemClaw is the best possible Memory organ in someone else's loop, not the whole loop.*
+>
+> ---
+
 # Loop Engineering Capability Upgrades for MemClaw
 
 This design document outlines three discrete architectural and feature additions to MemClaw, elevating it to 100% support for the Loop Engineering paradigm. These upgrades specifically address the major gaps in **Isolated Verification (Idea 3)**, **Turn-Distance Cost Optimization (Idea 4)**, and **Proactive Propulsion/Scheduling (Idea 2 & 5)**.
