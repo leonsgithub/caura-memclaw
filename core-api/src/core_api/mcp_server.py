@@ -2979,6 +2979,119 @@ async def memclaw_procedure_write(
         return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
 
 
+_PROC_MANAGE_OPS = ("quarantine", "unquarantine", "invalidate", "delete", "stats")
+
+
+async def memclaw_procedure_manage(
+    op: Annotated[
+        str, Field(description="quarantine | unquarantine | invalidate | delete | stats.")
+    ],
+    procedure_id: Annotated[
+        str, Field(description="Procedure UUID (from a memclaw_procedure_suggest result).")
+    ],
+    reason: Annotated[
+        str | None, Field(description="op=invalidate: audit note for the retirement.")
+    ] = None,
+    agent_id: Annotated[str, Field(description="Caller agent.")] = _DEFAULT_AGENT_ID,
+) -> str:
+    """Manual procedure lifecycle: quarantine | unquarantine | invalidate | delete | stats.
+
+    The runtime loop (``memclaw_procedure_record``) auto-quarantines unreliable
+    procedures; this tool is the manual override + curation surface.
+    ``stats`` reads reliability telemetry (trust 0). ``quarantine`` /
+    ``unquarantine`` flip the reversible ``is_quarantined`` flag;
+    ``invalidate`` permanently retires the procedure (status='invalidated') —
+    all three require trust ≥ 2. ``delete`` hard-removes the procedure and its
+    stats and requires trust ≥ 3 (parity with ``memclaw_manage`` op=delete).
+    """
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    if op not in _PROC_MANAGE_OPS:
+        return _with_latency(
+            _error_response(
+                "INVALID_ARGUMENTS",
+                f"Unknown op '{op}'. Expected one of: {list(_PROC_MANAGE_OPS)}.",
+                op=op,
+                expected_ops=list(_PROC_MANAGE_OPS),
+            ),
+            t0,
+        )
+    if op != "stats" and (err := _check_write_scope()):
+        return err
+    try:
+        UUID(procedure_id)
+    except ValueError:
+        return _with_latency(
+            _error_response("INVALID_ARGUMENTS", "Invalid procedure_id — must be a valid UUID."),
+            t0,
+        )
+    tenant_id = _get_tenant()
+    agent_id = _get_agent_id() or agent_id
+    min_level = 3 if op == "delete" else (0 if op == "stats" else 2)
+
+    sc = get_storage_client()
+    async with _no_db():
+        try:
+            if min_level > 0:
+                if refuse := _refuse_default_agent_on_gateway(agent_id):
+                    return _with_latency(refuse, t0)
+                _, not_found, terr = await _require_trust(tenant_id, agent_id, min_level=min_level)
+                if not_found:
+                    return _with_latency(
+                        _error_response(
+                            "FORBIDDEN",
+                            f"Agent '{agent_id}' is not registered. Register the agent by writing one memory first.",
+                        ),
+                        t0,
+                    )
+                if terr:
+                    return _with_latency(_error_response("FORBIDDEN", parse_trust_error(terr)), t0)
+
+            # Tenant-ownership check (parity with memclaw_procedure_record):
+            # never act on another tenant's procedure id.
+            proc = await sc.get_procedure(procedure_id)
+            if proc is None or proc.get("tenant_id") != tenant_id:
+                return _with_latency(
+                    _error_response("NOT_FOUND", f"Procedure '{procedure_id}' not found."), t0
+                )
+
+            if op == "stats":
+                return _with_latency(
+                    json.dumps(
+                        {
+                            "procedure_id": procedure_id,
+                            "name": proc.get("name"),
+                            "status": proc.get("status"),
+                            "stats": proc.get("stats") or {},
+                        },
+                        default=str,
+                    ),
+                    t0,
+                )
+
+            if op in ("quarantine", "unquarantine"):
+                await sc.set_procedure_quarantine(procedure_id, op == "quarantine")
+            elif op == "invalidate":
+                await sc.invalidate_procedure(procedure_id, reason=reason)
+            else:  # delete
+                await sc.delete_procedure(procedure_id)
+
+            await log_action(
+                tenant_id=tenant_id,
+                agent_id=agent_id,
+                action=f"procedure_{op}",
+                resource_type="procedure",
+                detail={"procedure_id": procedure_id, "reason": reason, "via": "mcp"},
+            )
+            return _with_latency(
+                json.dumps({"procedure_id": procedure_id, "op": op, "ok": True}), t0
+            )
+        except Exception as e:
+            logger.exception("Unhandled error in memclaw_procedure_manage")
+            return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
+
+
 # ──────────────────────────────────────────────────────────────────────
 # memclaw_keystones / memclaw_keystones_set — CAURA-000
 # ──────────────────────────────────────────────────────────────────────

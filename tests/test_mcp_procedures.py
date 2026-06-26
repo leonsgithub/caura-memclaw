@@ -53,12 +53,27 @@ class FakeStorage:
                 continue
             if not include_quarantined and p["stats"].get("is_quarantined"):
                 continue
+            # Mirror storage: invalidated procedures are off the ranker path.
+            if not include_quarantined and p.get("status") == "invalidated":
+                continue
             out.append(p)
         return out[:limit]
 
     async def update_procedure_stats(self, pid: str, patch: dict) -> dict:
         self.procs[pid]["stats"].update(patch)
         return self.procs[pid]["stats"]
+
+    # Lifecycle surface (BP-02)
+    async def set_procedure_quarantine(self, pid: str, quarantined: bool) -> dict:
+        self.procs[pid]["stats"]["is_quarantined"] = quarantined
+        return self.procs[pid]["stats"]
+
+    async def invalidate_procedure(self, pid: str, reason: str | None = None) -> dict:
+        self.procs[pid]["status"] = "invalidated"
+        return self.procs[pid]
+
+    async def delete_procedure(self, pid: str) -> bool:
+        return self.procs.pop(pid, None) is not None
 
     # Documents surface (skills telemetry, PM-05)
     def add_skill(self, tenant_id: str, doc_id: str, data: dict | None = None) -> None:
@@ -266,3 +281,121 @@ async def test_record_tolerates_missing_skill_doc(proc_env):
     )
     assert out["reliability_score"] > 0.5  # stats still updated
     assert out["skill_telemetry"] is None  # nowhere to count, tolerated
+
+
+# ── BP-02: memclaw_procedure_manage (manual lifecycle) ────────────
+
+
+@pytest.fixture
+def manage_env(proc_env, monkeypatch):
+    """proc_env + the trust gate (passing) and a no-op audit log."""
+
+    async def _pass_trust(tenant_id, agent_id, min_level):
+        return (3, False, None)
+
+    async def _noop_log(**kwargs):
+        return None
+
+    monkeypatch.setattr(mcp_server, "_require_trust", _pass_trust)
+    monkeypatch.setattr(mcp_server, "log_action", _noop_log)
+    return proc_env
+
+
+async def _suggest_count():
+    out = parse_envelope(
+        await mcp_server.memclaw_procedure_suggest(
+            context_features={"framework": "terraform", "region": "eu-west"}
+        )
+    )
+    return out["count"]
+
+
+@pytest.mark.asyncio
+async def test_manage_stats_reads_telemetry(manage_env):
+    pid = parse_envelope(await _write_proc())["id"]
+    out = parse_envelope(
+        await mcp_server.memclaw_procedure_manage(op="stats", procedure_id=pid)
+    )
+    assert out["procedure_id"] == pid
+    assert out["stats"]["reliability_score"] == 0.5
+    assert out["stats"]["is_quarantined"] is False
+
+
+@pytest.mark.asyncio
+async def test_manage_quarantine_cycle_then_delete(manage_env):
+    """suggest -> quarantine -> absent -> unquarantine -> present -> delete -> NOT_FOUND."""
+    pid = parse_envelope(await _write_proc())["id"]
+    assert await _suggest_count() == 1
+
+    await mcp_server.memclaw_procedure_manage(op="quarantine", procedure_id=pid)
+    assert await _suggest_count() == 0
+
+    await mcp_server.memclaw_procedure_manage(op="unquarantine", procedure_id=pid)
+    assert await _suggest_count() == 1
+
+    deleted = parse_envelope(
+        await mcp_server.memclaw_procedure_manage(op="delete", procedure_id=pid)
+    )
+    assert deleted["ok"] is True
+    # Stats read on a deleted procedure is NOT_FOUND.
+    gone = parse_envelope(
+        await mcp_server.memclaw_procedure_manage(op="stats", procedure_id=pid)
+    )
+    assert gone.get("error", {}).get("code") == "NOT_FOUND"
+
+
+@pytest.mark.asyncio
+async def test_manage_invalidate_excludes_from_suggest(manage_env):
+    pid = parse_envelope(await _write_proc())["id"]
+    assert await _suggest_count() == 1
+    out = parse_envelope(
+        await mcp_server.memclaw_procedure_manage(
+            op="invalidate", procedure_id=pid, reason="tool removed"
+        )
+    )
+    assert out["ok"] is True
+    assert await _suggest_count() == 0
+
+
+@pytest.mark.asyncio
+async def test_manage_low_trust_denied(manage_env, monkeypatch):
+    """A sub-threshold caller cannot quarantine/delete — gets FORBIDDEN, no mutation."""
+    pid = parse_envelope(await _write_proc())["id"]
+
+    async def _deny(tenant_id, agent_id, min_level):
+        return (1, False, "Error (403): trust 1 < required %d" % min_level)
+
+    monkeypatch.setattr(mcp_server, "_require_trust", _deny)
+    out = parse_envelope(
+        await mcp_server.memclaw_procedure_manage(op="quarantine", procedure_id=pid)
+    )
+    assert out.get("error", {}).get("code") == "FORBIDDEN"
+    # Mutation did NOT happen — still suggestable.
+    assert await _suggest_count() == 1
+
+
+@pytest.mark.asyncio
+async def test_manage_unknown_op_and_bad_id(manage_env):
+    pid = parse_envelope(await _write_proc())["id"]
+    bad_op = parse_envelope(
+        await mcp_server.memclaw_procedure_manage(op="frobnicate", procedure_id=pid)
+    )
+    assert bad_op.get("error", {}).get("code") == "INVALID_ARGUMENTS"
+
+    bad_id = parse_envelope(
+        await mcp_server.memclaw_procedure_manage(op="stats", procedure_id="not-a-uuid")
+    )
+    assert bad_id.get("error", {}).get("code") == "INVALID_ARGUMENTS"
+
+
+@pytest.mark.asyncio
+async def test_manage_cross_tenant_not_found(manage_env):
+    """A procedure in another tenant is invisible (NOT_FOUND), never mutated."""
+    storage = manage_env["storage"]
+    pid = parse_envelope(await _write_proc())["id"]
+    storage.procs[pid]["tenant_id"] = "other-tenant"
+    out = parse_envelope(
+        await mcp_server.memclaw_procedure_manage(op="delete", procedure_id=pid)
+    )
+    assert out.get("error", {}).get("code") == "NOT_FOUND"
+    assert pid in storage.procs  # not deleted

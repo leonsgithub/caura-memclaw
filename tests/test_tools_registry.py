@@ -37,6 +37,11 @@ EXPECTED_PLUGIN_EXPOSED = {
     # (``memclaw_keystones_set``) is MCP-only — authoring is an
     # admin/governance path, not an agent path.
     "memclaw_keystones",
+    # Procedural-memory sprint + BP-02: manual lifecycle surface.
+    "memclaw_procedure_suggest",
+    "memclaw_procedure_record",
+    "memclaw_procedure_write",
+    "memclaw_procedure_manage",
 }
 
 # MCP-only tools — not surfaced through the plugin. ``memclaw_keystones_set``

@@ -624,6 +624,248 @@
     "trust_required": 0
   },
   {
+    "description": "Manual procedure lifecycle. op: stats|quarantine|unquarantine|invalidate|delete. stats reads reliability telemetry (success/failure counts, reliability_score, is_quarantined). quarantine/unquarantine flip the reversible quarantine flag (manual override of the auto-quarantine the record path applies); invalidate permanently retires a procedure (status='invalidated'); delete hard-removes it. Agents can only manage procedures in their own tenant.",
+    "error_codes": [
+      "INVALID_ARGUMENTS",
+      "FORBIDDEN",
+      "NOT_FOUND"
+    ],
+    "impl_status": "live",
+    "name": "memclaw_procedure_manage",
+    "ops": [
+      {
+        "description": "Read a procedure's reliability stats.",
+        "name": "stats",
+        "required_params": [
+          "procedure_id"
+        ],
+        "trust_required": 0
+      },
+      {
+        "description": "Suspend a procedure from the ranker (reversible).",
+        "name": "quarantine",
+        "required_params": [
+          "procedure_id"
+        ],
+        "trust_required": 2
+      },
+      {
+        "description": "Restore a quarantined procedure to the ranker.",
+        "name": "unquarantine",
+        "required_params": [
+          "procedure_id"
+        ],
+        "trust_required": 2
+      },
+      {
+        "description": "Permanently retire a procedure (status='invalidated').",
+        "name": "invalidate",
+        "required_params": [
+          "procedure_id"
+        ],
+        "trust_required": 2
+      },
+      {
+        "description": "Hard-delete a procedure and its stats.",
+        "name": "delete",
+        "required_params": [
+          "procedure_id"
+        ],
+        "trust_required": 3
+      }
+    ],
+    "params": [
+      {
+        "description": "quarantine | unquarantine | invalidate | delete | stats.",
+        "name": "op",
+        "required": true,
+        "type": "str"
+      },
+      {
+        "description": "Procedure UUID (from a memclaw_procedure_suggest result).",
+        "name": "procedure_id",
+        "required": true,
+        "type": "str"
+      },
+      {
+        "default": null,
+        "description": "op=invalidate: audit note for the retirement.",
+        "name": "reason",
+        "required": false,
+        "type": "str | None"
+      },
+      {
+        "default": "mcp-agent",
+        "description": "Caller agent.",
+        "name": "agent_id",
+        "required": false,
+        "type": "str"
+      }
+    ],
+    "plugin_exposed": true,
+    "trust_required": 0
+  },
+  {
+    "description": "Report the outcome of following a procedure. procedure_id = the id from a memclaw_procedure_suggest result; outcome_type: success|failure. Updates the procedure's reliability_score and quarantines it once it has \u22653 attempts and a score below 0.3 (after which it stops being suggested). Optional request_id (from suggest), latency_ms, and validation_passed are recorded for telemetry. Trust \u2265 1 \u2014 agents can only record against procedures in their own tenant.",
+    "error_codes": [],
+    "impl_status": "live",
+    "name": "memclaw_procedure_record",
+    "ops": [],
+    "params": [
+      {
+        "description": "The procedure's id, from a memclaw_procedure_suggest result.",
+        "name": "procedure_id",
+        "required": true,
+        "type": "str"
+      },
+      {
+        "description": "success | failure.",
+        "name": "outcome_type",
+        "required": true,
+        "type": "str"
+      },
+      {
+        "default": null,
+        "description": "request_id from suggest (telemetry correlation).",
+        "name": "request_id",
+        "required": false,
+        "type": "str | None"
+      },
+      {
+        "default": null,
+        "description": "Observed latency, optional.",
+        "name": "latency_ms",
+        "required": false,
+        "type": "int | None"
+      },
+      {
+        "default": null,
+        "description": "Whether output validation passed, optional.",
+        "name": "validation_passed",
+        "required": false,
+        "type": "bool | None"
+      },
+      {
+        "default": "mcp-agent",
+        "description": "Caller agent.",
+        "name": "agent_id",
+        "required": false,
+        "type": "str"
+      }
+    ],
+    "plugin_exposed": true,
+    "trust_required": 1
+  },
+  {
+    "description": "Suggest reliability-ranked tool-call procedures for the current task. Pass context_features (framework, region, library, \u2026) and an optional task goal; get back a request_id plus ranked procedures (id, name, tools_sequence, score). Follow one, then report how it went with memclaw_procedure_record using that procedure's id. Read-only; quarantined (proven-unreliable) procedures are excluded.",
+    "error_codes": [],
+    "impl_status": "live",
+    "name": "memclaw_procedure_suggest",
+    "ops": [],
+    "params": [
+      {
+        "description": "Current task context (framework, region, library, \u2026).",
+        "name": "context_features",
+        "required": true,
+        "type": "dict"
+      },
+      {
+        "default": null,
+        "description": "Short natural-language goal for the task.",
+        "name": "task",
+        "required": false,
+        "type": "str | None"
+      },
+      {
+        "default": null,
+        "description": "Restrict to a fleet's procedures.",
+        "name": "fleet_id",
+        "required": false,
+        "type": "str | None"
+      },
+      {
+        "default": 5,
+        "description": "Max suggestions (1-20).",
+        "name": "limit",
+        "required": false,
+        "type": "int"
+      },
+      {
+        "default": "mcp-agent",
+        "description": "Caller agent.",
+        "name": "agent_id",
+        "required": false,
+        "type": "str"
+      }
+    ],
+    "plugin_exposed": true,
+    "trust_required": 0
+  },
+  {
+    "description": "Capture a reusable procedure: name, tools_sequence (ordered tool-call ids), and context_features (when it applies). Optionally pass pattern_signature, reasoning_guide, risk_level (low|medium|high), and fleet_id. The procedure is embedded so memclaw_procedure_suggest can surface it, and starts at reliability 0.5 until outcomes are recorded. Trust \u2265 1.",
+    "error_codes": [],
+    "impl_status": "live",
+    "name": "memclaw_procedure_write",
+    "ops": [],
+    "params": [
+      {
+        "description": "Human-readable procedure name.",
+        "name": "name",
+        "required": true,
+        "type": "str"
+      },
+      {
+        "description": "Ordered tool-call identifiers the procedure performs.",
+        "name": "tools_sequence",
+        "required": true,
+        "type": "list"
+      },
+      {
+        "description": "Context this procedure applies to (framework, region, \u2026).",
+        "name": "context_features",
+        "required": true,
+        "type": "dict"
+      },
+      {
+        "default": null,
+        "description": "Stable signature for dedup; derived from name if omitted.",
+        "name": "pattern_signature",
+        "required": false,
+        "type": "str | None"
+      },
+      {
+        "default": null,
+        "description": "Optional teacher strategy summary.",
+        "name": "reasoning_guide",
+        "required": false,
+        "type": "str | None"
+      },
+      {
+        "default": "low",
+        "description": "low | medium | high.",
+        "name": "risk_level",
+        "required": false,
+        "type": "str"
+      },
+      {
+        "default": null,
+        "description": "Fleet scope, optional.",
+        "name": "fleet_id",
+        "required": false,
+        "type": "str | None"
+      },
+      {
+        "default": "mcp-agent",
+        "description": "Caller agent.",
+        "name": "agent_id",
+        "required": false,
+        "type": "str"
+      }
+    ],
+    "plugin_exposed": true,
+    "trust_required": 1
+  },
+  {
     "description": "Find memories by meaning (hybrid semantic+keyword). Set include_brief=true for an LLM summary paragraph. For non-semantic browse use memclaw_list; for read-by-id use memclaw_manage op=read.",
     "error_codes": [],
     "impl_status": "live",
@@ -684,6 +926,41 @@
         "name": "top_k",
         "required": false,
         "type": "int"
+      },
+      {
+        "default": false,
+        "description": "Enable Phase 2 cross-context retrieval (shared scope_team/scope_org memories below Phase 1 threshold).",
+        "name": "cross_context",
+        "required": false,
+        "type": "bool"
+      },
+      {
+        "default": 3,
+        "description": "Max Phase 2 cross-context candidates.",
+        "name": "cc_top_m",
+        "required": false,
+        "type": "int"
+      },
+      {
+        "default": 0.15,
+        "description": "Min vec_sim for Phase 2 hits.",
+        "name": "cc_threshold",
+        "required": false,
+        "type": "float"
+      },
+      {
+        "default": 0.3,
+        "description": "Max fraction of total results from Phase 2.",
+        "name": "cc_ratio",
+        "required": false,
+        "type": "float"
+      },
+      {
+        "default": 0.85,
+        "description": "Score multiplier applied to Phase 2 hits.",
+        "name": "cc_discount",
+        "required": false,
+        "type": "float"
       }
     ],
     "plugin_exposed": true,
