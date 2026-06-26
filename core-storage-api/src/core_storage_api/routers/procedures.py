@@ -99,3 +99,31 @@ async def update_procedure_stats(procedure_id: UUID, request: Request) -> dict:
             status_code=404, detail="procedure or stats not found"
         )
     return orm_to_dict(stats, PROCEDURE_STATS_FIELDS)
+
+
+@router.patch("/{procedure_id}")
+async def patch_procedure(procedure_id: UUID, request: Request) -> dict:
+    """Set a procedure's lifecycle ``status`` (used by invalidate).
+
+    Body: ``{"status": "invalidated"}``. Distinct from the stats PATCH —
+    this is the procedure-level lifecycle marker, not the reversible
+    quarantine flag.
+    """
+    body: dict = await request.json()
+    status = body.get("status")
+    if not isinstance(status, str) or not status:
+        raise HTTPException(status_code=422, detail="status (str) is required")
+    procedure = await _svc.procedure_set_status(procedure_id, status)
+    if procedure is None:
+        raise HTTPException(status_code=404, detail="procedure not found")
+    stats = await _svc.procedure_get_stats(procedure_id)
+    return _with_stats(procedure, stats)
+
+
+@router.delete("/{procedure_id}")
+async def delete_procedure(procedure_id: UUID) -> dict:
+    """Hard-delete a procedure (its 1:1 stats row CASCADEs)."""
+    deleted = await _svc.procedure_delete(procedure_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="procedure not found")
+    return {"deleted": str(procedure_id)}

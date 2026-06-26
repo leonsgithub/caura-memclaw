@@ -119,3 +119,85 @@ async def test_list_excludes_quarantined_by_default(client, tenant_id, fleet_id)
     )
     names_q = {p["name"] for p in with_q.json()}
     assert {"healthy", "bad"} <= names_q
+
+
+@pytest.mark.asyncio
+async def test_quarantine_toggle_then_delete(client, tenant_id, fleet_id):
+    """Manual quarantine hides from the ranker path; unquarantine restores;
+    delete removes the procedure and its stats row (BP-01)."""
+    fleet = f"{fleet_id}-lifecycle"
+    resp = await client.post(
+        "/api/v1/storage/procedures",
+        json=_procedure_body(tenant_id, fleet, name="toggle-me"),
+    )
+    pid = resp.json()["id"]
+
+    async def _listed() -> set[str]:
+        r = await client.get(
+            "/api/v1/storage/procedures",
+            params={"tenant_id": tenant_id, "fleet_id": fleet},
+        )
+        return {p["name"] for p in r.json()}
+
+    # Quarantine → excluded from the default (ranker) list.
+    await client.patch(
+        f"/api/v1/storage/procedures/{pid}/stats",
+        json={"is_quarantined": True},
+    )
+    assert "toggle-me" not in await _listed()
+
+    # Unquarantine → back in the list.
+    await client.patch(
+        f"/api/v1/storage/procedures/{pid}/stats",
+        json={"is_quarantined": False},
+    )
+    assert "toggle-me" in await _listed()
+
+    # Delete → gone, and its stats row 404s.
+    dele = await client.delete(f"/api/v1/storage/procedures/{pid}")
+    assert dele.status_code == 200, dele.text
+    assert dele.json()["deleted"] == pid
+    assert (await client.get(f"/api/v1/storage/procedures/{pid}")).status_code == 404
+    # Second delete is a 404 (idempotent-safe surface).
+    assert (await client.delete(f"/api/v1/storage/procedures/{pid}")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_invalidate_excludes_from_ranker_path(client, tenant_id, fleet_id):
+    """status='invalidated' retires a procedure from the default list but it
+    remains visible with include_quarantined=True (BP-01)."""
+    fleet = f"{fleet_id}-invalidate"
+    resp = await client.post(
+        "/api/v1/storage/procedures",
+        json=_procedure_body(tenant_id, fleet, name="retire-me"),
+    )
+    pid = resp.json()["id"]
+
+    patched = await client.patch(
+        f"/api/v1/storage/procedures/{pid}", json={"status": "invalidated"}
+    )
+    assert patched.status_code == 200, patched.text
+    assert patched.json()["status"] == "invalidated"
+
+    default = await client.get(
+        "/api/v1/storage/procedures",
+        params={"tenant_id": tenant_id, "fleet_id": fleet},
+    )
+    assert "retire-me" not in {p["name"] for p in default.json()}
+
+    with_retired = await client.get(
+        "/api/v1/storage/procedures",
+        params={
+            "tenant_id": tenant_id,
+            "fleet_id": fleet,
+            "include_quarantined": True,
+        },
+    )
+    assert "retire-me" in {p["name"] for p in with_retired.json()}
+
+    # Missing-id PATCH and unknown status handling.
+    assert (
+        await client.patch(
+            f"/api/v1/storage/procedures/{pid}", json={}
+        )
+    ).status_code == 422

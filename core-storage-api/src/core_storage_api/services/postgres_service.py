@@ -2367,6 +2367,10 @@ class PostgresService:
                         ProcedureStats.is_quarantined.is_(None),
                     )
                 )
+                # Invalidated procedures are permanently retired — excluded from
+                # the ranker path alongside quarantined ones. The same
+                # ``include_quarantined`` flag reveals both for admin listing.
+                stmt = stmt.where(Procedure.status != "invalidated")
             stmt = stmt.order_by(Procedure.created_at.desc()).limit(limit)
             result = await session.execute(stmt)
             return [(row[0], row[1]) for row in result.all()]
@@ -2393,6 +2397,37 @@ class PostgresService:
             stats.updated_at = datetime.now(UTC)
             await session.flush()
             return stats
+
+    async def procedure_set_status(
+        self, procedure_id: UUID, status: str
+    ) -> Procedure | None:
+        """Set a procedure's lifecycle status (used by invalidate).
+
+        Unlike quarantine (a reversible ``procedure_stats`` flag), status is
+        the procedure-level lifecycle marker. Setting ``status='invalidated'``
+        permanently retires it from the ranker. Returns the row, or ``None``
+        if the id is unknown.
+        """
+        async with get_session() as session:
+            procedure = await session.get(Procedure, procedure_id)
+            if procedure is None:
+                return None
+            procedure.status = status
+            procedure.updated_at = datetime.now(UTC)
+            await session.flush()
+            return procedure
+
+    async def procedure_delete(self, procedure_id: UUID) -> bool:
+        """Hard-delete a procedure; its 1:1 stats row goes via FK CASCADE.
+
+        Returns True if a row was removed, False if the id was unknown.
+        """
+        async with get_session() as session:
+            procedure = await session.get(Procedure, procedure_id)
+            if procedure is None:
+                return False
+            await session.delete(procedure)
+            return True
 
     # ------------------------------------------------------------------
     # F) Crystallizer hygiene
