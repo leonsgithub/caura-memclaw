@@ -2060,6 +2060,161 @@ async def memclaw_doc(
             return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
 
 
+# ── BP-03: Env Truths ─────────────────────────────────────────────────────────
+_ENV_TRUTHS_COLLECTION = "_env_truths"
+_ENV_TRUTH_OPS = {"upsert", "get", "list", "verify"}
+
+
+async def memclaw_env(
+    op: Annotated[str, Field(description="upsert|get|list|verify.")],
+    name: Annotated[
+        str | None,
+        Field(description="Truth name (key). Required for upsert|get|verify."),
+    ] = None,
+    value: Annotated[
+        str | None,
+        Field(description="op=upsert: the infra fact value (string, URL, port, etc.)."),
+    ] = None,
+    confidence: Annotated[
+        float, Field(description="op=upsert: certainty 0.0–1.0 (default 1.0).")
+    ] = 1.0,
+    agent_id: Annotated[str, Field(description="Caller agent.")] = _DEFAULT_AGENT_ID,
+) -> str:
+    """Stable-infra fact store (env truths). Op-dispatched.
+
+    upsert: write or update a named fact; resets verification_count when value changes.
+    get: retrieve a single truth by name.
+    list: enumerate all truths for this tenant.
+    verify: bump verification_count + verified_at without changing the value.
+    Facts default to tenant-wide scope (fleet_id=None) — all agents see them.
+    """
+    from datetime import UTC, datetime
+
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    if op not in _ENV_TRUTH_OPS:
+        return _with_latency(
+            _error_response(
+                "INVALID_ARGUMENTS",
+                f"Unknown op '{op}'. Expected one of: {sorted(_ENV_TRUTH_OPS)}.",
+            ),
+            t0,
+        )
+    if op in {"upsert", "get", "verify"} and not name:
+        return _with_latency(_error_response("INVALID_ARGUMENTS", f"op={op} requires 'name'."), t0)
+    if op == "upsert" and value is None:
+        return _with_latency(_error_response("INVALID_ARGUMENTS", "op=upsert requires 'value'."), t0)
+    if op in {"upsert"} and (err := _check_write_scope()):
+        return err
+
+    tenant_id = _get_tenant()
+    sc = get_storage_client()
+
+    async with _no_db():
+        try:
+            if op == "get" or op == "verify":
+                existing = await sc.get_document(tenant_id, _ENV_TRUTHS_COLLECTION, name, read=True)
+                if existing is None:
+                    return _with_latency(_error_response("NOT_FOUND", f"Env truth '{name}' not found."), t0)
+
+                if op == "get":
+                    d = existing.get("data") or {}
+                    return _with_latency(
+                        json.dumps(
+                            {
+                                "name": name,
+                                "value": d.get("value"),
+                                "confidence": d.get("confidence", 1.0),
+                                "verified_at": d.get("verified_at"),
+                                "verification_count": d.get("verification_count", 0),
+                            }
+                        ),
+                        t0,
+                    )
+
+                # verify — bump count + timestamp, leave value intact
+                d = dict(existing.get("data") or {})
+                d["verification_count"] = d.get("verification_count", 0) + 1
+                d["verified_at"] = datetime.now(UTC).isoformat()
+                await sc.upsert_document(
+                    {
+                        "tenant_id": tenant_id,
+                        "collection": _ENV_TRUTHS_COLLECTION,
+                        "doc_id": name,
+                        "data": d,
+                    }
+                )
+                return _with_latency(
+                    json.dumps(
+                        {
+                            "name": name,
+                            "value": d.get("value"),
+                            "confidence": d.get("confidence", 1.0),
+                            "verified_at": d["verified_at"],
+                            "verification_count": d["verification_count"],
+                        }
+                    ),
+                    t0,
+                )
+
+            if op == "list":
+                docs = await sc.list_documents(tenant_id, _ENV_TRUTHS_COLLECTION)
+                truths = []
+                for doc in docs:
+                    d = doc.get("data") or {}
+                    truths.append(
+                        {
+                            "name": doc.get("doc_id"),
+                            "value": d.get("value"),
+                            "confidence": d.get("confidence", 1.0),
+                            "verified_at": d.get("verified_at"),
+                            "verification_count": d.get("verification_count", 0),
+                        }
+                    )
+                return _with_latency(json.dumps({"truths": truths, "count": len(truths)}), t0)
+
+            # upsert
+            now = datetime.now(UTC).isoformat()
+            existing = await sc.get_document(tenant_id, _ENV_TRUTHS_COLLECTION, name, read=False)
+            if existing is not None:
+                d = dict(existing.get("data") or {})
+                if d.get("value") != value:
+                    # value changed — reset verification state
+                    d.update({"value": value, "confidence": confidence, "verified_at": now, "verification_count": 0})
+                else:
+                    # same value — keep verification state, update confidence if changed
+                    d["confidence"] = confidence
+            else:
+                d = {"value": value, "confidence": confidence, "verified_at": now, "verification_count": 0}
+
+            await sc.upsert_document(
+                {
+                    "tenant_id": tenant_id,
+                    "collection": _ENV_TRUTHS_COLLECTION,
+                    "doc_id": name,
+                    "data": d,
+                }
+            )
+            return _with_latency(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "name": name,
+                        "value": value,
+                        "confidence": d["confidence"],
+                        "verified_at": d["verified_at"],
+                        "verification_count": d["verification_count"],
+                    }
+                ),
+                t0,
+            )
+
+        except Exception as e:
+            logger.error("MCP env op=%s error: %s", op, e, exc_info=True)
+            return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
+
+
 async def memclaw_list(
     agent_id: Annotated[str, Field(description="Caller agent.")] = _DEFAULT_AGENT_ID,
     scope: Annotated[

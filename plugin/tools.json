@@ -171,6 +171,87 @@
     "trust_required": 0
   },
   {
+    "description": "Stable-infra fact store. op: upsert|get|list|verify. upsert(name, value) writes a named fact (URL, port, hostname) tenant-wide; re-upsert with a new value resets verification_count. verify(name) bumps verification_count and verified_at without changing the value. get(name) returns value + confidence + verified_at + verification_count. list returns all env truths for this tenant.",
+    "error_codes": [
+      "INVALID_ARGUMENTS",
+      "NOT_FOUND",
+      "INTERNAL_ERROR"
+    ],
+    "impl_status": "live",
+    "name": "memclaw_env",
+    "ops": [
+      {
+        "description": "Write or update a named infra fact. Resets verification_count when value changes.",
+        "name": "upsert",
+        "required_params": [
+          "name",
+          "value"
+        ],
+        "trust_required": 1
+      },
+      {
+        "description": "Retrieve a single env truth by name.",
+        "name": "get",
+        "required_params": [
+          "name"
+        ],
+        "trust_required": 0
+      },
+      {
+        "description": "List all env truths for this tenant.",
+        "name": "list",
+        "required_params": [],
+        "trust_required": 0
+      },
+      {
+        "description": "Confirm a fact is still accurate; bumps verification_count and verified_at.",
+        "name": "verify",
+        "required_params": [
+          "name"
+        ],
+        "trust_required": 0
+      }
+    ],
+    "params": [
+      {
+        "description": "upsert|get|list|verify.",
+        "name": "op",
+        "required": true,
+        "type": "str"
+      },
+      {
+        "default": null,
+        "description": "Truth name (key). Required for upsert|get|verify.",
+        "name": "name",
+        "required": false,
+        "type": "str | None"
+      },
+      {
+        "default": null,
+        "description": "op=upsert: the infra fact value (string, URL, port, etc.).",
+        "name": "value",
+        "required": false,
+        "type": "str | None"
+      },
+      {
+        "default": 1.0,
+        "description": "op=upsert: certainty 0.0\u20131.0 (default 1.0).",
+        "name": "confidence",
+        "required": false,
+        "type": "float"
+      },
+      {
+        "default": "mcp-agent",
+        "description": "Caller agent.",
+        "name": "agent_id",
+        "required": false,
+        "type": "str"
+      }
+    ],
+    "plugin_exposed": true,
+    "trust_required": 0
+  },
+  {
     "description": "Report what happened after acting on memories. outcome_type: success|failure|partial. related_ids = the memory UUIDs that influenced the action (use IDs from your most recent memclaw_recall). scope: agent (default, trust \u2265 1)|fleet|all (trust \u2265 2; fleet_id required when scope='fleet'). Weight adjustments and rule generation are scoped \u2014 agents can only evolve memories they own (scope=agent), their fleet (scope=fleet), or any (scope=all).",
     "error_codes": [],
     "impl_status": "live",

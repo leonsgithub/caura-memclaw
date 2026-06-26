@@ -7,6 +7,10 @@
     "description": "Look up an entity by UUID. Use only when you have an entity_id from a prior search.",
     "stm_only": false
   },
+  "memclaw_env": {
+    "description": "Stable-infra fact store. op: upsert|get|list|verify. upsert(name, value) writes a named fact (URL, port, hostname) tenant-wide; re-upsert with a new value resets verification_count. verify(name) bumps verification_count and verified_at without changing the value. get(name) returns value + confidence + verified_at + verification_count. list returns all env truths for this tenant.",
+    "stm_only": false
+  },
   "memclaw_evolve": {
     "description": "Report what happened after acting on memories. outcome_type: success|failure|partial. related_ids = the memory UUIDs that influenced the action (use IDs from your most recent memclaw_recall). scope: agent (default, trust \u2265 1)|fleet|all (trust \u2265 2; fleet_id required when scope='fleet'). Weight adjustments and rule generation are scoped \u2014 agents can only evolve memories they own (scope=agent), their fleet (scope=fleet), or any (scope=all).",
     "stm_only": false
