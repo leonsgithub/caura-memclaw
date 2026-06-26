@@ -6,8 +6,10 @@ Exposes MemClaw tools over Streamable HTTP so any MCP client
 Mounted onto the main FastAPI app at /mcp.
 """
 
+import asyncio
 import contextlib
 import contextvars
+import hashlib
 import hmac as _hmac
 import json
 import logging
@@ -29,6 +31,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from common.enrichment.constants import SERVER_RESERVED_MEMORY_TYPES
 from core_api.agent_ids import DEFAULT_AGENT_ID
 from core_api.auth import get_admin_key
+from core_api.cache import cache_get, cache_set
 from core_api.clients.storage_client import KeystoneUpsertPayload, get_storage_client
 from core_api.constants import (
     DEFAULT_SEARCH_TOP_K,
@@ -617,6 +620,16 @@ async def memclaw_recall(
         return _with_latency(refuse, t0)
     capped_top_k = min(top_k, MAX_SEARCH_TOP_K)
 
+    # Cache layer: skip when cross_context=True or filter_agent_id is set (both
+    # vary by caller state that changes frequently; caching would mask fresh data).
+    _use_cache = not cross_context and filter_agent_id is None
+    _cache_key: str | None = None
+    if _use_cache:
+        _h = hashlib.sha256(f"{query}{capped_top_k}".encode()).hexdigest()[:12]
+        _cache_key = f"recall:{agent_id}:{_h}"
+        if cached := await cache_get(_cache_key):
+            return _with_latency(cached, t0)
+
     # Audit finding P3: prior implementation held ``_mcp_session()``
     # open across the brief-generation LLM round-trip (~5-30s), pinning
     # a pooled DB connection during work that is entirely network-bound
@@ -706,7 +719,10 @@ async def memclaw_recall(
                 config,
                 top_k=capped_top_k,
             )
-        return _with_latency(json.dumps(payload, indent=2, default=str), t0)
+        result_json = json.dumps(payload, indent=2, default=str)
+        if _use_cache and _cache_key:
+            await cache_set(_cache_key, result_json, ttl=300)
+        return _with_latency(result_json, t0)
     except HTTPException as e:
         logger.warning("MCP tool error (%s): %s", e.status_code, e.detail)
         return _with_latency(_error_response(code_for_status(e.status_code), str(e.detail)), t0)
@@ -723,7 +739,7 @@ async def memclaw_write(
     ] = None,
     agent_id: Annotated[str, Field(description="Caller agent.")] = _DEFAULT_AGENT_ID,
     fleet_id: Annotated[str | None, Field(description="Fleet scope.")] = None,
-    visibility: Annotated[str | None, Field(description="scope_team|scope_org|scope_agent.")] = None,
+    visibility: Annotated[str | None, Field(description="scope_team|scope_org|scope_agent.")] = "scope_agent",
     memory_type: Annotated[str | None, Field(description="Type (single only).")] = None,
     weight: Annotated[float | None, Field(description="0-1 (single only).")] = None,
     source_uri: Annotated[str | None, Field(description="Source URI (single only).")] = None,
@@ -3855,6 +3871,58 @@ async def memclaw_keystones_set(
         except Exception as e:
             logger.exception("Unhandled error in memclaw_keystones_set")
             return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
+
+
+async def memclaw_session_start(
+    agent_id: Annotated[str, Field(description="Caller agent.")] = _DEFAULT_AGENT_ID,
+    fleet_id: Annotated[str | None, Field(description="Fleet scope.")] = None,
+) -> str:
+    """Call once at session start. Paste result into system prompt for zero-latency context.
+
+    Returns top-5 memories by weight, active keystone rules, and procedures with reliability >= 0.6.
+    Keys: memories (list), keystones (list), procedures (list).
+    """
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    tenant_id = _get_tenant()
+    agent_id_effective = _get_agent_id() or agent_id
+    if refuse := _refuse_default_agent_on_gateway(agent_id_effective):
+        return _with_latency(refuse, t0)
+
+    sc = get_storage_client()
+    try:
+        mem_payload: dict[str, Any] = {
+            "tenant_id": tenant_id,
+            "caller_agent_id": agent_id_effective,
+            "fleet_id": fleet_id,
+            "written_by": agent_id_effective,
+            "status": "active",
+            "sort": "weight",
+            "order": "desc",
+            "limit": 5,
+        }
+        mem_rows, (ks_rows, _), proc_rows = await asyncio.gather(
+            sc.list_memories_by_filters(mem_payload),
+            sc.list_keystones(tenant_id=tenant_id, fleet_id=fleet_id, agent_id=agent_id_effective),
+            sc.list_procedures(tenant_id=tenant_id, limit=200),
+        )
+        memories = [_memory_to_out(m).model_dump(mode="json") for m in mem_rows]
+        procedures = [
+            p for p in (proc_rows or [])
+            if (p.get("stats") or {}).get("success_rate", 0.0) >= 0.6
+        ]
+        return _with_latency(
+            json.dumps({"memories": memories, "keystones": ks_rows, "procedures": procedures}, indent=2, default=str),
+            t0,
+        )
+    except HTTPException as e:
+        return _with_latency(_error_response(code_for_status(e.status_code), str(e.detail)), t0)
+    except httpx.HTTPStatusError as e:
+        return _storage_error_envelope(e, t0)
+    except Exception as e:
+        logger.exception("Unhandled error in memclaw_session_start")
+        return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
 
 
 # ── Mountable app + lifespan ──

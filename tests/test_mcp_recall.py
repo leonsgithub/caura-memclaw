@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import pytest
 from fastapi import HTTPException
+from unittest.mock import AsyncMock
 
 from core_api import mcp_server
 from tests._mcp_test_helpers import as_text, parse_envelope, stub_storage_client
@@ -189,6 +190,68 @@ async def test_recall_brief_skipped_when_include_brief_false(mcp_env, monkeypatc
     payload = parse_envelope(out)
     assert calls == []
     assert "brief" not in payload
+
+
+# ---------------------------------------------------------------------------
+# Cache hit / miss / bypass tests (UX-02)
+# ---------------------------------------------------------------------------
+
+
+async def test_recall_cache_hit_skips_search(mcp_env, monkeypatch):
+    """Cache hit: cache_get returns a JSON string → search_memories NOT called."""
+    import json as _json
+    cached_payload = _json.dumps({"results": [{"id": "cached-m-1"}]})
+    monkeypatch.setattr(mcp_server, "cache_get", _fake_async_return(cached_payload))
+    cache_set_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(mcp_server, "cache_set", cache_set_mock)
+    search_mock = mcp_env["service"]("search_memories")
+    _wire_recall_deps(monkeypatch)
+
+    out = await mcp_server.memclaw_recall(query="cached query")
+    # The cached payload is returned (latency trailer added but body intact)
+    assert "cached-m-1" in as_text(out)
+    search_mock.assert_not_called()
+    cache_set_mock.assert_not_called()
+
+
+async def test_recall_cache_miss_stores_result(mcp_env, monkeypatch):
+    """Cache miss: search_memories runs and result is stored in cache."""
+    monkeypatch.setattr(mcp_server, "cache_get", _fake_async_return(None))
+    cache_set_mock = AsyncMock(return_value=True)
+    monkeypatch.setattr(mcp_server, "cache_set", cache_set_mock)
+    mcp_env["service"]("search_memories").return_value = [_MemoryStub("m-fresh")]
+    _wire_recall_deps(monkeypatch)
+
+    out = await mcp_server.memclaw_recall(query="fresh query")
+    payload = parse_envelope(out)
+    assert len(payload["results"]) == 1
+    assert cache_set_mock.await_count == 1
+    call_kwargs = cache_set_mock.await_args
+    assert call_kwargs.kwargs.get("ttl") == 300 or call_kwargs.args[2] == 300
+
+
+async def test_recall_cache_bypass_on_cross_context(mcp_env, monkeypatch):
+    """cross_context=True bypasses cache entirely."""
+    cache_get_mock = AsyncMock(return_value=None)
+    monkeypatch.setattr(mcp_server, "cache_get", cache_get_mock)
+    monkeypatch.setattr(mcp_server, "cache_set", AsyncMock(return_value=True))
+    mcp_env["service"]("search_memories").return_value = []
+    _wire_recall_deps(monkeypatch)
+
+    await mcp_server.memclaw_recall(query="cross context query", cross_context=True)
+    cache_get_mock.assert_not_called()
+
+
+async def test_recall_cache_bypass_on_filter_agent_id(mcp_env, monkeypatch):
+    """filter_agent_id set bypasses cache (targeted query, not general recall)."""
+    cache_get_mock = AsyncMock(return_value=None)
+    monkeypatch.setattr(mcp_server, "cache_get", cache_get_mock)
+    monkeypatch.setattr(mcp_server, "cache_set", AsyncMock(return_value=True))
+    mcp_env["service"]("search_memories").return_value = []
+    _wire_recall_deps(monkeypatch)
+
+    await mcp_server.memclaw_recall(query="filtered query", filter_agent_id="other-agent")
+    cache_get_mock.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

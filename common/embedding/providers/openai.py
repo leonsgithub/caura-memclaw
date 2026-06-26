@@ -38,6 +38,7 @@ class OpenAIEmbeddingProvider:
     ) -> None:
         self._api_key = api_key
         self._model = model
+        self._base_url = base_url
         self._send_dimensions = send_dimensions
         self._query_instruction = query_instruction
         self._truncate_to_dim = truncate_to_dim

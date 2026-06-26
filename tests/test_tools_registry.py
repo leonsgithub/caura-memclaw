@@ -48,6 +48,8 @@ EXPECTED_PLUGIN_EXPOSED = {
     "memclaw_export",
     # BP-05: low-weight curation surface.
     "memclaw_review",
+    # UX-03: warm context injection at session start.
+    "memclaw_session_start",
 }
 
 # MCP-only tools — not surfaced through the plugin. ``memclaw_keystones_set``

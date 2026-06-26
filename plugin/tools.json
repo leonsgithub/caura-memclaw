@@ -1140,6 +1140,33 @@
     "trust_required": 0
   },
   {
+    "description": "Call once at session start. Paste result into system prompt for zero-latency context. Returns top-5 memories by weight, active keystone rules, and procedures with reliability >= 0.6. Keys: memories (list), keystones (list), procedures (list). Mirrors Brain's session-start prefill pattern without requiring a separate recall query.",
+    "error_codes": [
+      "INTERNAL_ERROR"
+    ],
+    "impl_status": "live",
+    "name": "memclaw_session_start",
+    "ops": [],
+    "params": [
+      {
+        "default": "mcp-agent",
+        "description": "Caller agent.",
+        "name": "agent_id",
+        "required": false,
+        "type": "str"
+      },
+      {
+        "default": null,
+        "description": "Fleet scope.",
+        "name": "fleet_id",
+        "required": false,
+        "type": "str | None"
+      }
+    ],
+    "plugin_exposed": true,
+    "trust_required": 0
+  },
+  {
     "description": "Aggregate counts of memories: total + breakdowns by type, agent, status. scope='agent' (default) counts only memories visible to YOU (trust \u2265 1); scope='fleet'/'all' aggregates across agents (trust \u2265 2). Counts exclude soft-deleted memories by default; set include_deleted=true for additional 'deleted' and 'total_including_deleted' fields. Read-only \u2014 useful for self-introspection and dashboard-style summaries.",
     "error_codes": [],
     "impl_status": "live",
@@ -1313,7 +1340,7 @@
         "type": "str | None"
       },
       {
-        "default": null,
+        "default": "scope_agent",
         "description": "scope_team|scope_org|scope_agent.",
         "name": "visibility",
         "required": false,

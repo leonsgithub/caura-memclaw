@@ -33,6 +33,7 @@ class ProviderName(StrEnum):
 
     # Embedding-only
     LOCAL = "local"
+    OLLAMA = "ollama"
 
     # Sentinels
     FAKE = "fake"

@@ -341,4 +341,12 @@ def get_embedding_provider(
     if name == ProviderName.LOCAL:
         return LocalEmbedding()
 
+    if name == ProviderName.OLLAMA:
+        url = os.environ.get("OLLAMA_EMBEDDING_URL", "http://localhost:11434/v1")
+        model = os.environ.get("OLLAMA_EMBEDDING_MODEL", "mxbai-embed-large")
+        return _get_or_create_openai_provider(
+            api_key="ollama", model=model, base_url=url,
+            send_dimensions=False, query_instruction=None, truncate_to_dim=None,
+        )
+
     raise ValueError(f"Unknown embedding provider: {name}")
