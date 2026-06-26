@@ -16,7 +16,7 @@ import logging
 import re
 import time
 import uuid
-from datetime import datetime as _dt
+from datetime import UTC, datetime as _dt
 from typing import Annotated, Any, cast
 from uuid import UUID, uuid4
 
@@ -2104,8 +2104,6 @@ async def memclaw_env(
     verify: bump verification_count + verified_at without changing the value.
     Facts default to tenant-wide scope (fleet_id=None) — all agents see them.
     """
-    from datetime import UTC, datetime
-
     t0 = time.perf_counter()
     if err := _check_auth():
         return err
@@ -2121,7 +2119,7 @@ async def memclaw_env(
         return _with_latency(_error_response("INVALID_ARGUMENTS", f"op={op} requires 'name'."), t0)
     if op == "upsert" and value is None:
         return _with_latency(_error_response("INVALID_ARGUMENTS", "op=upsert requires 'value'."), t0)
-    if op in {"upsert"} and (err := _check_write_scope()):
+    if op == "upsert" and (err := _check_write_scope()):
         return err
 
     tenant_id = _get_tenant()
@@ -2129,48 +2127,20 @@ async def memclaw_env(
 
     async with _no_db():
         try:
-            if op == "get" or op == "verify":
+            if op in {"get", "verify"}:
                 existing = await sc.get_document(tenant_id, _ENV_TRUTHS_COLLECTION, name, read=True)
                 if existing is None:
                     return _with_latency(_error_response("NOT_FOUND", f"Env truth '{name}' not found."), t0)
-
-                if op == "get":
-                    d = existing.get("data") or {}
-                    return _with_latency(
-                        json.dumps(
-                            {
-                                "name": name,
-                                "value": d.get("value"),
-                                "confidence": d.get("confidence", 1.0),
-                                "verified_at": d.get("verified_at"),
-                                "verification_count": d.get("verification_count", 0),
-                            }
-                        ),
-                        t0,
-                    )
-
-                # verify — bump count + timestamp, leave value intact
                 d = dict(existing.get("data") or {})
-                d["verification_count"] = d.get("verification_count", 0) + 1
-                d["verified_at"] = datetime.now(UTC).isoformat()
-                await sc.upsert_document(
-                    {
-                        "tenant_id": tenant_id,
-                        "collection": _ENV_TRUTHS_COLLECTION,
-                        "doc_id": name,
-                        "data": d,
-                    }
-                )
+                if op == "verify":
+                    # bump count + timestamp, leave value intact
+                    d["verification_count"] = d.get("verification_count", 0) + 1
+                    d["verified_at"] = _dt.now(UTC).isoformat()
+                    await sc.upsert_document(
+                        {"tenant_id": tenant_id, "collection": _ENV_TRUTHS_COLLECTION, "doc_id": name, "data": d}
+                    )
                 return _with_latency(
-                    json.dumps(
-                        {
-                            "name": name,
-                            "value": d.get("value"),
-                            "confidence": d.get("confidence", 1.0),
-                            "verified_at": d["verified_at"],
-                            "verification_count": d["verification_count"],
-                        }
-                    ),
+                    json.dumps({"name": name, "value": d.get("value"), "confidence": d.get("confidence", 1.0), "verified_at": d.get("verified_at"), "verification_count": d.get("verification_count", 0)}),
                     t0,
                 )
 
@@ -2179,19 +2149,11 @@ async def memclaw_env(
                 truths = []
                 for doc in docs:
                     d = doc.get("data") or {}
-                    truths.append(
-                        {
-                            "name": doc.get("doc_id"),
-                            "value": d.get("value"),
-                            "confidence": d.get("confidence", 1.0),
-                            "verified_at": d.get("verified_at"),
-                            "verification_count": d.get("verification_count", 0),
-                        }
-                    )
+                    truths.append({"name": doc.get("doc_id"), "value": d.get("value"), "confidence": d.get("confidence", 1.0), "verified_at": d.get("verified_at"), "verification_count": d.get("verification_count", 0)})
                 return _with_latency(json.dumps({"truths": truths, "count": len(truths)}), t0)
 
             # upsert
-            now = datetime.now(UTC).isoformat()
+            now = _dt.now(UTC).isoformat()
             existing = await sc.get_document(tenant_id, _ENV_TRUTHS_COLLECTION, name, read=False)
             if existing is not None:
                 d = dict(existing.get("data") or {})
@@ -2458,7 +2420,7 @@ async def memclaw_export(
     sc = get_storage_client()
     async with _no_db():
         try:
-            trust, _, terr = await _require_trust(tenant_id, agent_id, min_level=1)
+            _, _, terr = await _require_trust(tenant_id, agent_id, min_level=1)
             if terr:
                 return _with_latency(_error_response("FORBIDDEN", parse_trust_error(terr)), t0)
 
@@ -3348,12 +3310,7 @@ async def memclaw_procedure_manage(
         return err
     if op not in _PROC_MANAGE_OPS:
         return _with_latency(
-            _error_response(
-                "INVALID_ARGUMENTS",
-                f"Unknown op '{op}'. Expected one of: {list(_PROC_MANAGE_OPS)}.",
-                op=op,
-                expected_ops=list(_PROC_MANAGE_OPS),
-            ),
+            _error_response("INVALID_ARGUMENTS", f"Unknown op '{op}'. Expected one of: {_PROC_MANAGE_OPS}."),
             t0,
         )
     if op != "stats" and (err := _check_write_scope()):
@@ -3854,18 +3811,7 @@ async def memclaw_keystones_set(
             )
             return _with_latency(json.dumps({"ok": True, "action": "delete", "doc_id": doc_id}), t0)
         except httpx.HTTPStatusError as e:
-            # storage_client._post / _delete call raise_for_status(); a
-            # storage-side 422 (bad scope/weight) raises this — surface
-            # the upstream status + detail instead of crashing the tool.
-            # Mirrors routes/keystones.py:_surface_storage_error.
-            try:
-                detail = e.response.json()
-            except ValueError:
-                detail = e.response.text or str(e)
-            return _with_latency(
-                _error_response(code_for_status(e.response.status_code), str(detail)),
-                t0,
-            )
+            return _storage_error_envelope(e, t0)
         except HTTPException as e:
             return _with_latency(_error_response(code_for_status(e.status_code), str(e.detail)), t0)
         except Exception as e:
