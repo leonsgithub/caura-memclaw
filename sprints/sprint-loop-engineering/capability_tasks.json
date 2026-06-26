@@ -1,19 +1,21 @@
 {
   "planId": "SPRINT-LOOP-ENGINEERING-PLAN",
-  "sprintGoal": "Close the structural gaps between MemClaw's current 52% Loop Engineering support and 100% enablement. The Loop Engineering framework defines 5 load-bearing ideas: (1) Layer 4 Substrate, (2) the 5-Move cycle, (3) Isolated Verification, (4) Turn-Distance Cost, (5) Faithful Amplifier of Judgment. MemClaw already covers Layer 4, most of the 5 moves, and the amplifier well — the three structural gaps are: Isolated Verification (10% supported — no sandboxed verification harness), Turn-Distance Cost (30% — no turn indexing or TDCF exposure), and Move 5 Propulsion Scheduling (60% — no proactive loop re-firing). This sprint builds: (LE-01) a verification_runs storage table + service for recording isolated verification outcomes; (LE-02) memclaw_verify_run — an MCP tool that executes eval commands in an isolated sub-agent and records success/failure against procedure reliability; (LE-03) turn-index tracking on writes and the Turn-Distance Cost Factor (TDCF) computation; (LE-04) memclaw_cost_audit — exposes TDCF and cheapest-alternative analysis for any recall or write decision; (LE-05) memclaw_schedule_loop — proactive propulsion tickets + a worker loop engine driven by lifecycle cron, closing the scheduling half of Move 5.",
+  "sprintGoal": "Make MemClaw a faithful Memory organ inside a Loop Engineering loop — NOT the whole loop. The Loop Engineering working note (Loop-Engineering-IEEE.pdf / Orange Book) is explicit that loop engineering is 'a set of capabilities, not a product': the loop's six organs (automations=scheduling, worktrees=handoff, skills=discovery, connectors, sub-agents=verification, memory=persistence) live in the HARNESS (Claude Code: /loop, --worktree, SKILL.md, MCP, .claude/agents + /goal, on-disk state). MemClaw is exactly ONE of those organs: Memory/Persistence. The original draft of this sprint over-reached — it had the memory store grow a scheduler (propulsion cron), an invented Turn-Distance Cost metric, and an in-process subprocess evaluator, i.e. one organ colonizing three the harness already owns natively. Those are dropped (see metrics.droppedFromOriginalDraft). The ONE genuine, in-lane gap this sprint closes is the paper's central failure mode — the 'Nodding Loop' (§VI.A): an agent that grades its own homework. Today memclaw_procedure_record drives reliability purely from the self-reported outcome_type, and the validation_passed field it already accepts (mcp_server.py:~3098) is silently DROPPED. This sprint makes the harness's independent evaluator (the separate-agent reviewer of Fig. 3) able to record a VERIFIED outcome that MemClaw distinguishes from a merely CLAIMED one, so procedure reliability reflects real test results — closing the 'verification debt' the paper warns accumulates between 'runs' and 'right' (§VIII).",
   "correlationId": "SPRINT-LOOP-ENGINEERING",
   "createdAt": "2026-06-26T00:00:00Z",
   "createdBy": "claude-code",
   "workItems": [
     {
       "id": "LE-01",
-      "kind": "software.foundation",
-      "objective": "Add storage foundation for the Isolated Verification subsystem. New alembic migration creates verification_runs table (tenant_id, memory_id, procedure_id, command, command_type, outcome, details, triggered_at, turn_distance), FK to memories ON DELETE CASCADE. New service loop_engineering/verification_store.py exposes insert + query (by memory_id, by procedure_id, latest N). No new columns on the existing memories table — turn_index is a caller-managed annotation stored in verification_runs context.",
+      "kind": "software.feature",
+      "objective": "Stop dropping verification provenance in memclaw_procedure_record. The handler already declares validation_passed (mcp_server.py:~3098) but never reads it — reliability moves purely on the self-reported outcome_type (the 'Nodding Loop'). Wire validation_passed through so an outcome carries whether it was independently VERIFIED, persist a small verified/unverified counter split on procedure_stats, and surface a 'verified_reliability' alongside the existing self-reported reliability_score. No new table, no subprocess execution, no evaluator agent inside MemClaw — the harness's reviewer agent runs the tests and reports the verdict here; MemClaw only remembers it honestly.",
       "acceptanceCriteria": [
-        "New alembic migration creates verification_runs table with columns: id (uuid PK, server_default gen_random_uuid()), tenant_id (uuid NOT NULL, FK tenants.id ON DELETE CASCADE), memory_id (uuid NULLABLE, FK memories.id ON DELETE CASCADE — NULL when a procedure is verified independently of a specific memory), procedure_id (uuid NULLABLE — NULL for memory-only verification), command (text NOT NULL), command_type (enum/varchar NOT NULL: bash|http|filesystem), outcome (varchar NOT NULL: pass|fail|error), details (jsonb DEFAULT {}), triggered_at (timestamptz NOT NULL server_default now()), turn_distance (integer NULL — NULL means N/A, not computed); composite index on (tenant_id, memory_id, triggered_at DESC); composite index on (tenant_id, procedure_id, triggered_at DESC)",
-        "core-api/src/core_api/services/loop_engineering/verification_store.py provides insert(tenant_id, memory_id, procedure_id, command, command_type, outcome, details, turn_distance) and query_by_memory(tenant_id, memory_id, limit) and query_by_procedure(tenant_id, procedure_id, limit) — all using the async pool from app lifespan",
-        "core-api tests: insert a verification run, query by memory, query by procedure; assert memory CASCADE delete removes the verification runs; assert cross-tenant isolation (tenant A cannot see tenant B's runs)",
-        "Migration runs cleanly against an empty DB and against the current migration chain (run: alembic upgrade head twice — second run is no-op)"
+        "Migration 029 adds two columns to procedure_stats: verified_success_count (integer NOT NULL DEFAULT 0) and verified_failure_count (integer NOT NULL DEFAULT 0). No other schema change. Migration is additive and reversible (down() drops the two columns); runs cleanly on top of 028 and is a no-op on a second `alembic upgrade head`",
+        "common/models/procedure.py ProcedureStats gains verified_success_count and verified_failure_count mapped columns matching the migration",
+        "memclaw_procedure_record reads validation_passed: when validation_passed is True, the outcome ALSO increments verified_success_count (on success) or verified_failure_count (on failure); when validation_passed is False or None, only the existing success_count/failure_count move (current behavior preserved exactly — backwards compatible)",
+        "The response JSON gains verified_reliability = compute_reliability(verified_success_count, verified_failure_count) computed from the verified counters only, returned alongside the existing reliability_score; when there are zero verified outcomes verified_reliability is null (not 0.5) so callers can tell 'no independent verification yet' from 'verified and reliable'",
+        "core-api test: record success with validation_passed=None -> success_count=1, verified_success_count=0, verified_reliability=null (proves the self-reported path is unchanged); record success with validation_passed=True -> success_count=2, verified_success_count=1, verified_reliability reflects the verified counters; record failure with validation_passed=True -> verified_failure_count=1 and verified_reliability drops",
+        "Quarantine logic is unchanged in THIS task (still driven by the combined success/failure counts) — verified counters are additive telemetry only. Any change to let verified failures quarantine faster is explicitly deferred (see LE-02)"
       ],
       "state": "todo",
       "priority": 100,
@@ -30,237 +32,15 @@
       "risk": {
         "level": "low",
         "reasons": [
-          "Purely additive: new table + new service, no changes to existing tables or columns",
-          "FK ON DELETE CASCADE to memories ensures cleanup follows the existing memory delete path with no new logic",
-          "Rollback: drop the table via a down migration; zero impact on existing functionality"
-        ]
-      },
-      "resourceLocks": [{"resource": "core-storage-api:migrations", "mode": "write"}],
-      "version": 1,
-      "attempt": 0,
-      "parentId": null,
-      "artifacts": [],
-      "failure": null,
-      "payload": {
-        "model_after": [
-          "core-api/src/core_api/alembic/versions/ (latest migration — follow the numbering after the last existing migration)",
-          "common/models/memory.py (for the memories.id FK reference)",
-          "common/database/postgres_client.py (for pool access pattern and async engine usage)"
-        ],
-        "facts": [
-          "memories table has id (uuid PK), tenant_id; verification_runs.tenant_id should match memories.tenant_id for row-level tenant isolation",
-          "procedure_id on verification_runs is not FK'd to the procedures table — procedures are identified by memory_id + metadata in practice across this codebase",
-          "Details column is jsonb — flexible for outcome payloads that differ per command_type (http status+body, bash stdout+stderr, fs found/size)"
-        ],
-        "validation_commands": [
-          "cd core-api && alembic upgrade head && alembic current",
-          "cd core-api && pytest tests/services/loop_engineering/ -q"
-        ]
-      }
-    },
-    {
-      "id": "LE-02",
-      "kind": "software.feature",
-      "objective": "Add memclaw_verify_run MCP tool: takes a procedure_id + command + command_type, spawns an isolated sub-agent in the current harness, executes the verification (bash command, HTTP assertion, or filesystem check), and records outcome + details to verification_runs. Success increments the procedure's success_count, failure increments failure_count — directly feeding the existing reliability ranker. Designed as the Isolated Verification Substrate that Loop Engineering Idea 3 requires.",
-      "acceptanceCriteria": [
-        "core-api/src/core_api/tools/memclaw_verify_run.py defines a ToolSpec with command, command_type (bash|http|filesystem), procedure_id (required for reliability feedback), optional memory_id; tool registered via register() + mcp_register() and appears in the MCP tool list and scripts/export_tool_specs.py output",
-        "Execution engine dispatches by command_type: bash runs via subprocess in a sandboxed working directory (read-only mount, no network beyond localhost, timeout ≤ 30s); http makes a single GET/POST and asserts status_code + optional body substring; filesystem stats the path and asserts existence + optional size/content match — NO unrestricted code execution",
-        "On completion (success, fail, or error), insert into verification_runs via the LE-01 service and update the associated procedure_stats: success -> increment success_count, fail -> increment failure_count (reuses compute_reliability pathway from core-api/src/core_api/services/procedure_service.py)",
-        "trust_required >= 2 (mutations procedure reliability); auth check follows the _get_tenant/_get_agent_id pattern from existing tools",
-        "End-to-end test: register a procedure via memclaw_procedure_record -> memclaw_verify_run(command_type='bash', command='echo ok') -> assert outcome=pass, success_count incremented; memclaw_verify_run(command='exit 1') -> assert outcome=fail, failure_count incremented; procedure suggest reflects updated reliability",
-        "Sandboxed execution: test that a command attempting network access beyond localhost is blocked and outcome=error is recorded"
-      ],
-      "state": "todo",
-      "priority": 90,
-      "dependencies": ["LE-01"],
-      "requiredCapabilities": ["filesystem.write", "subprocess.exec"],
-      "executionPolicy": {
-        "maxAttempts": 2,
-        "timeoutSeconds": 1800,
-        "requiresHumanApproval": true,
-        "allowedSideEffects": ["local_filesystem_write", "subprocess_exec_sandboxed"],
-        "networkAccess": "localhost_only",
-        "retryPolicy": {"strategy": "exponential_backoff", "retryOn": ["transient_error", "timeout"]}
-      },
-      "risk": {
-        "level": "high",
-        "reasons": [
-          "Subprocess execution is the highest-trust surface in MemClaw — the sandbox must be airtight (no network, no privileged paths, strict timeout)",
-          "Failure in sandbox isolation could allow an untrusted command to affect the host environment",
-          "Rollback: remove the tool module + handler; verification_runs rows are inert historical data"
-        ]
-      },
-      "resourceLocks": [{"resource": "core-api:mcp_server", "mode": "write"}],
-      "version": 1,
-      "attempt": 0,
-      "parentId": null,
-      "artifacts": [],
-      "failure": null,
-      "payload": {
-        "model_after": [
-          "core-api/src/core_api/tools/memclaw_procedure_record.py (procedure-domain tool pattern + procedure_id resolution)",
-          "core-api/src/core_api/services/procedure_service.py (compute_reliability + success_count/failure_count update path)",
-          "core-api/src/core_api/mcp_server.py (tool registration + _check_auth/_get_tenant/_get_agent_id helpers)"
-        ],
-        "security_notes": [
-          "Sandbox model: subprocess.run with timeout=30, cwd set to a temp directory, environment stripped to a minimum (no credentials, no API keys), no network namespace (or deny-list firewall) — implementation detail chosen at build time based on what the deployment platform supports",
-          "http command_type: only single-request assertions, no persistent connections; timeout enforced",
-          "The tool is trust>=2 AND requires explicit procedure_id — the agent cannot run arbitrary commands without attributing them to a known procedure"
-        ],
-        "validation_commands": [
-          "pytest core-api/tests -k 'verify_run and (sandbox or isolation)' -v",
-          "pytest core-api/tests -k 'procedure and reliability' -q"
-        ]
-      }
-    },
-    {
-      "id": "LE-03",
-      "kind": "software.foundation",
-      "objective": "Add turn-index tracking to the memory write and recall paths, and implement the Turn-Distance Cost Factor (TDCF) computation. Turn index is a monotonically increasing conversation-scoped counter passed by the caller (the agent harness supplies it on each memclaw_write/memclaw_recall); TDCF = base_cost × 2^(turn_distance/10) where turn_distance = T_current − T_introduced. This gives agents a concrete cost signal for how stale a piece of context is.",
-      "acceptanceCriteria": [
-        "common/models/memory.py gains turn_index (integer NULL — NULL for memories written before LE-03 or when the caller does not supply one; populated on write when caller passes it)",
-        "core-api write path (memclaw_write handler in mcp_server.py) accepts an optional turn_index (integer) in the write payload and persists it to the memory's turn_index column; the storage layer and write pipeline (common/pipelines/memory_write_pipeline.py) propagate it without truncation",
-        "core-api/src/core_api/services/loop_engineering/turn_distance.py provides compute_tdcf(turn_distance, base_cost=1.0) -> float using the formula base_cost × 2^(turn_distance/10); and compute_turn_distance(t_introduced, t_current) -> integer where either can be None (returning 0 when turn_index is absent — conservative assumption: fresh context)",
-        "Unit tests: TDCF(0) == 1.0 (no cost amplification for current-turn context), TDCF(10) == 2.0, TDCF(20) == 4.0, TDCF(None/absent) == 1.0 (conservative default); turn_distance computation: current=50, introduced=30 -> 20",
-        "Migration adds turn_index (integer, nullable, no default — only populated when caller provides it) to the memories table; index on (tenant_id, turn_index) for range queries"
-      ],
-      "state": "todo",
-      "priority": 70,
-      "dependencies": [],
-      "requiredCapabilities": ["filesystem.write", "database.write"],
-      "executionPolicy": {
-        "maxAttempts": 2,
-        "timeoutSeconds": 1800,
-        "requiresHumanApproval": false,
-        "allowedSideEffects": ["local_filesystem_write", "database_migration"],
-        "networkAccess": "none",
-        "retryPolicy": {"strategy": "exponential_backoff", "retryOn": ["transient_error", "timeout"]}
-      },
-      "risk": {
-        "level": "medium",
-        "reasons": [
-          "Adds a column to the memories table (hot path) — must be nullable with no default to avoid a full table rewrite on large tenants",
-          "The write path change must not break existing callers that do not pass turn_index (nullable, backwards-compatible)",
-          "Rollback: drop the column via a down migration; TDCF service becomes unused and can be removed"
+          "Purely additive: two integer columns + reading a parameter that is already in the tool signature but currently ignored",
+          "Existing self-reported path is preserved byte-for-byte when validation_passed is None/False — no behavior change for current callers",
+          "No subprocess execution, no new agent, no scheduling — stays entirely within MemClaw's Memory organ. Rollback: down-migration drops two columns; verified_reliability field is inert"
         ]
       },
       "resourceLocks": [
-        {"resource": "core-api:migrations", "mode": "write"},
-        {"resource": "common:memory_model", "mode": "write"}
-      ],
-      "version": 1,
-      "attempt": 0,
-      "parentId": null,
-      "artifacts": [],
-      "failure": null,
-      "payload": {
-        "model_after": [
-          "common/models/memory.py (memory dataclass + ORM model — the turn_index column addition point)",
-          "common/pipelines/memory_write_pipeline.py (write pipeline — propagate turn_index from write payload to storage row)",
-          "core-api/src/core_api/mcp_server.py memclaw_write handler (accept optional turn_index from the caller)"
-        ],
-        "facts": [
-          "TDCF formula: base_cost × 2^(turn_distance/10) — exponential doubling every 10 turns of staleness",
-          "turn_index is caller-supplied (the agent harness counts its own turns); MemClaw does not try to auto-detect turn boundaries",
-          "When turn_index is NULL (pre-LE-03 memories or callers that don't supply it), TDCF defaults to 1.0 — conservative, no penalty for unknown age"
-        ],
-        "validation_commands": [
-          "cd core-api && alembic upgrade head",
-          "cd core-api && pytest tests/services/loop_engineering/test_turn_distance.py -q"
-        ]
-      }
-    },
-    {
-      "id": "LE-04",
-      "kind": "software.feature",
-      "objective": "Add memclaw_cost_audit MCP tool: exposes Turn-Distance Cost Factor analysis for recall results and write decisions. For a given recall operation, returns each returned memory's TDCF (how stale it is), base cost (1.0), and the cheapest alternative (another memory covering the same entity/scope with a lower turn_distance). For write operations, flags writes where the new memory's turn_index is within N turns of an active memory on the same entity — predicting early supersession and the associated TDCF cliff. Read-only.",
-      "acceptanceCriteria": [
-        "core-api/src/core_api/tools/memclaw_cost_audit.py defines a ToolSpec with op (recall | write_preview), optional query/entity filter parameters; tool registered via register() + mcp_register() and appears in the MCP tool list",
-        "op='recall' computes TDCF for the most recent recall_event's result set using the LE-03 turn_distance service; returns per-memory: memory_id, turn_index, turn_distance, tdcf, and cheapest_alternative (another active memory on the same entity with lower turn_distance, or null if none); scoped to caller's tenant",
-        "op='write_preview' takes a proposed write (entity, scope, content) and checks for active memories on the same entity; returns the projected TDCF cliff if the new write supersedes a young existing memory (turn_distance < threshold, default 5) — a 'stale context warning' signal for the agent",
-        "trust_required >= 0 (read-only); tenant-scoped visibility rules match memclaw_list",
-        "Test: seed 3 memories on the same entity with turn_indices 10, 20, 40 (current turn = 50); recall -> cost_audit shows the turn_index=10 memory with TDCF=16.0 and cheapest_alternative=turn_index=40; write_preview shows no cliff when no entity collision, shows cliff warning when writing to a young existing entity",
-        "When turn_index is NULL on a memory, TDCF defaults to 1.0 and cheapest_alternative is null — the audit is conservative, not speculative"
-      ],
-      "state": "todo",
-      "priority": 60,
-      "dependencies": ["LE-03"],
-      "requiredCapabilities": ["filesystem.write"],
-      "executionPolicy": {
-        "maxAttempts": 2,
-        "timeoutSeconds": 1800,
-        "requiresHumanApproval": true,
-        "allowedSideEffects": ["local_filesystem_write"],
-        "networkAccess": "none",
-        "retryPolicy": {"strategy": "exponential_backoff", "retryOn": ["transient_error", "timeout"]}
-      },
-      "risk": {
-        "level": "low",
-        "reasons": [
-          "Read-only tool — no mutations to memories or procedures",
-          "Reuses existing visibility-scoped query paths and the LE-03 computation service",
-          "Rollback: remove the tool module; no schema or data change"
-        ]
-      },
-      "resourceLocks": [{"resource": "core-api:mcp_server", "mode": "write"}],
-      "version": 1,
-      "attempt": 0,
-      "parentId": null,
-      "artifacts": [],
-      "failure": null,
-      "payload": {
-        "model_after": [
-          "core-api/src/core_api/tools/memclaw_insights.py (read-only analytics tool — same pattern)",
-          "core-api/src/core_api/tools/memclaw_list.py (visibility-scoped query pattern for tenant isolation)",
-          "core-api/src/core_api/services/loop_engineering/turn_distance.py (LE-03 — TDCF computation)"
-        ],
-        "facts": [
-          "cheapest_alternative is defined as: another active memory on the same entity (matched via existing entity resolution) with the lowest turn_distance among memories with turn_distance < the current one",
-          "write_preview does NOT actually write — it is a dry-run signal for agents to evaluate cost before committing a write",
-          "TDCF cliff threshold default = 5 turns — configurable via organization_settings if needed later"
-        ],
-        "validation_commands": [
-          "pytest core-api/tests -k 'cost_audit or tdcf or turn_distance' -q",
-          "python scripts/export_tool_specs.py --check"
-        ]
-      }
-    },
-    {
-      "id": "LE-05",
-      "kind": "software.feature",
-      "objective": "Add memclaw_schedule_loop MCP tool: enables proactive loop propulsion — agents (or humans) can schedule future loop re-entry by creating propulsion tickets. Tickets are stored as documents in a reserved __loop_propulsion__ collection (reuses the existing memclaw_doc store, no new migration). A lifecycle cron handler (new forge-distill-style cron entry) runs on a fixed interval, reads active tickets, evaluates their trigger conditions, and fires matching tickets by invoking the task_payload (a structured loop instruction). Closes the scheduling half of 5-Move cycle Move 5 (propulsion).",
-      "acceptanceCriteria": [
-        "Propulsion tickets stored via the existing document store in the reserved collection '__loop_propulsion__'; each ticket has: ticket_id (doc_id), title, trigger_type (delay|cron|webhook), trigger_at (timestamp for delay, cron expression for cron, null for webhook), task_payload (structured loop instruction — what the agent should do when the ticket fires), created_at, status (active|fired|cancelled), fired_at (null until fired)",
-        "core-api/src/core_api/tools/memclaw_schedule_loop.py defines a ToolSpec with ops: schedule (title, trigger_type, trigger_at/cron_expr, task_payload), cancel (ticket_id), list (status filter, limit); trust_required >= 2; appears in the MCP tool list",
-        "op='schedule' with trigger_type='delay' creates a ticket with trigger_at = now + delay_seconds; trigger_type='cron' stores the cron expression + next_fire_time (computed server-side); returns the ticket_id immediately",
-        "core-api/src/core_api/services/loop_engineering/propulsion_worker.py: invoked by lifecycle cron (new entry in organization_settings.security_audit_schedule_cron or a dedicated propulsion_schedule_cron), reads active tickets, evaluates triggers: delay tickets fire when now() >= trigger_at, cron tickets fire at their next_fire_time; fired tickets get status='fired', fired_at=now(); the worker calls the registered callback hook with the task_payload (implementation: invokes a configured loop entry endpoint or emits a structured event for the agent harness to consume)",
-        "op='cancel' sets status='cancelled' on a ticket by ticket_id; cancelled tickets are never fired by the worker",
-        "Test: schedule a delay ticket with trigger_at in the past -> run the worker -> assert ticket is fired and outcome logged; schedule a cron ticket -> advance time past next_fire_time -> run worker -> assert fired; cancel a ticket -> run worker -> assert NOT fired; cross-tenant: tenant A's worker does not fire tenant B's tickets",
-        "Trust gate: trust>=2 for schedule/cancel; list respects caller's visibility scope (same as memclaw_doc); ticket status transitions are auditable (fired_at is immutable once set)"
-      ],
-      "state": "todo",
-      "priority": 50,
-      "dependencies": [],
-      "requiredCapabilities": ["filesystem.write"],
-      "executionPolicy": {
-        "maxAttempts": 2,
-        "timeoutSeconds": 1800,
-        "requiresHumanApproval": true,
-        "allowedSideEffects": ["local_filesystem_write", "cron_scheduling"],
-        "networkAccess": "none",
-        "retryPolicy": {"strategy": "exponential_backoff", "retryOn": ["transient_error", "timeout"]}
-      },
-      "risk": {
-        "level": "medium",
-        "reasons": [
-          "Introduces a new cron-driven execution path — the worker loop must be idempotent (a fired ticket must not fire twice) and tenant-isolated",
-          "The task_payload is an opaque instruction to the agent harness — MemClaw stores and fires it, does not interpret or execute the payload directly (the harness is responsible for consumption)",
-          "Rollback: remove the tool + worker; __loop_propulsion__ documents are inert data"
-        ]
-      },
-      "resourceLocks": [
+        {"resource": "core-storage-api:migrations", "mode": "write"},
         {"resource": "core-api:mcp_server", "mode": "write"},
-        {"resource": "core-api:lifecycle_cron", "mode": "write"}
+        {"resource": "common:procedure_model", "mode": "write"}
       ],
       "version": 1,
       "attempt": 0,
@@ -269,36 +49,36 @@
       "failure": null,
       "payload": {
         "model_after": [
-          "core-api/src/core_api/tools/memclaw_doc.py (op-dispatched document tool — same reservation pattern as env truths)",
-          "core-api/src/core_api/services/lifecycle_audit.py (cron handler registration pattern — lifecycle operations fan out via admin endpoint)",
-          "docs/operator-forge-cron.md (forge-distill cron pattern — the propulsion worker follows the same scheduler -> fanout -> per-tenant event model)"
+          "core-api/src/core_api/mcp_server.py memclaw_procedure_record (~line 3089) — the handler that already accepts validation_passed and drops it",
+          "common/models/procedure.py ProcedureStats (success_count/failure_count/reliability_score pattern)",
+          "core-storage-api/src/core_storage_api/database/migrations/versions/028_procedures.py (latest migration — 029 follows it)",
+          "core-api/src/core_api/services/procedure_service.py compute_reliability (reused for verified_reliability)"
         ],
         "facts": [
-          "Propulsion tickets use the document store (__loop_propulsion__ reserved collection) — no new alembic migration, no new table; same as env truths pattern",
-          "The worker does NOT execute the task_payload — it marks the ticket as fired and emits an event; the agent harness (Claude Code, OpenClaw loop, etc.) consumes the event and re-enters the loop",
-          "Cron trigger evaluation uses a standard cron library — next_fire_time is computed at schedule time and re-evaluated after each fire for recurring tickets",
-          "Follow the forge-distill cron pattern: external scheduler -> POST /admin/lifecycle/fanout/propulsion-fire -> per-tenant events -> in-process worker"
+          "validation_passed is ALREADY a parameter of memclaw_procedure_record but is never read — this task gives it meaning rather than adding new surface",
+          "verified_reliability is null (not 0.5) at zero verified outcomes so 'unverified' is distinguishable from 'verified-and-mediocre' — directly serves the paper's verification-debt signal",
+          "The harness's evaluator agent (.claude/agents/reviewer.md per Fig. 3) is what sets validation_passed=True after running tests; MemClaw does not run the tests itself"
         ],
         "validation_commands": [
-          "pytest core-api/tests -k 'schedule_loop or propulsion' -q",
-          "python scripts/export_tool_specs.py --check"
+          "cd core-storage-api && alembic upgrade head && alembic current",
+          "pytest core-api/tests -k 'procedure_record and (validation or verified)' -v"
         ]
       }
     },
     {
       "id": "LE-Z01",
       "kind": "process.signoff",
-      "objective": "Write SPRINT-LOOP-ENGINEERING_SIGNOFF.md recording task outcomes, file changes for all 3 upgrades (verification subsystem, TDCF exposure, propulsion scheduling), verification evidence for each tool, and a Loop Engineering coverage table mapping each of the 5 load-bearing ideas to the MemClaw capabilities that now support them — proving 100% enablement post-sprint.",
+      "objective": "Write SPRINT-LOOP-ENGINEERING_SIGNOFF.md recording the scope correction (why the original 3-upgrade draft was dropped to a single in-lane item), the LE-01 outcome, verification evidence, and a Loop Engineering organ-map showing that MemClaw correctly occupies ONE organ (Memory) rather than attempting to be the whole loop.",
       "acceptanceCriteria": [
         "File exists at sprints/sprint-loop-engineering/SPRINT-LOOP-ENGINEERING_SIGNOFF.md",
-        "Task status table covers LE-01..LE-05 with DONE/PARTIAL/PENDING/BLOCKED",
-        "Verification section includes: pytest output for each tool (verify_run, cost_audit, schedule_loop); end-to-end evidence for the Isolated Verification path (LE-02: procedure_record → verify_run → suggest reflects updated reliability); TDCF correctness evidence (LE-03 unit tests + LE-04: seed memories at different turn_indices → audit shows correct TDCF values); propulsion firing evidence (LE-05: schedule delay ticket → worker fires it → ticket is in fired state)",
-        "Loop Engineering Coverage Table maps each of the 5 ideas to specific MemClaw capabilities: (1) Layer 4 Substrate -> existing memclaw_write/recall/evolve/lifecycle; (2) 5 Moves -> recall(1), write(2), verify_run(3), evolve(4), schedule_loop(5); (3) Isolated Verification -> verify_run + verification_runs; (4) Turn-Distance Cost -> turn_index + cost_audit + TDCF; (5) Amplifier -> memclaw_recall ranker (BM25+vector+entity crosslinks+recency+feedback) + verify_run reliability updates",
-        "Sprint close summary states whether 100% Loop Engineering enablement was achieved and lists any carried-forward items"
+        "Includes a 'Scope correction' section: the original draft proposed verify_run (subprocess sandbox), cost_audit (invented Turn-Distance Cost Factor), and schedule_loop (propulsion cron); all three were dropped because scheduling, isolated subprocess verification, and the evaluator agent are HARNESS organs the paper assigns outside Memory (cite Loop-Engineering-IEEE Table V + the 'capabilities not a product' thesis)",
+        "Task status line for LE-01 (DONE/PARTIAL/PENDING) with the pytest evidence: the three record-outcome cases (validation_passed None vs True-success vs True-failure) and the verified_reliability null-at-zero behavior",
+        "Loop Engineering organ-map table: lists all six organs, marks Memory as MemClaw's lane (memclaw_write/recall/evolve/lifecycle + now verified-outcome reliability), and marks the other five as harness-owned (with the Claude Code primitive that provides each) — making explicit that 100% loop coverage is NOT a MemClaw goal",
+        "Sprint close summary states the one capability delivered and lists what was deliberately NOT built and why"
       ],
       "state": "todo",
       "priority": 10,
-      "dependencies": ["LE-01", "LE-02", "LE-03", "LE-04", "LE-05"],
+      "dependencies": ["LE-01"],
       "requiredCapabilities": ["filesystem.write"],
       "executionPolicy": {
         "maxAttempts": 1,
@@ -320,7 +100,8 @@
       "failure": null,
       "payload": {
         "implementation_notes": [
-          "Include: task status table, changes-by-file, verification output per tool, Loop Engineering coverage table (5 ideas × pre/post capability mapping), carried-forward table, sprint close summary"
+          "Lead the signoff with the scope correction — the most important artifact of this sprint is the decision to NOT build five-sixths of the original plan",
+          "Organ-map must cite the paper so a future reader understands the boundary is principled, not arbitrary"
         ],
         "evidence_required": ["SPRINT-LOOP-ENGINEERING_SIGNOFF.md committed"]
       }
@@ -330,37 +111,34 @@
     "status": "valid",
     "errors": [],
     "warnings": [
-      "LE-02 (memclaw_verify_run) is the highest-risk item — sandbox isolation for subprocess execution must be validated before merging. The security model is: trust>=2 + procedure_id required + no network + timeout + minimal environment. Do NOT loosen any of these constraints.",
-      "LE-01 and LE-03 each add an alembic migration (new table + new column). Run them in order: LE-01 first (new table has no dependencies), then LE-03 (adds turn_index to memories table). They do not conflict but share the migration chain.",
-      "LE-04 (cost_audit) is read-only and can be built and tested independently against the LE-03 service, but the value proposition is maximal when turn_index is populated — early testing will use NULL turn_index data.",
-      "LE-05 (schedule_loop) reuses the document store (__loop_propulsion__ collection) without a new migration — same pattern as env truths (BP-03 of brain-parity sprint). Ensure the reserved collection name does not collide with user-created collections.",
-      "The propulsion worker (LE-05) does NOT execute the task_payload — it marks the ticket as fired and emits an event. The agent harness is responsible for consuming the event and re-entering the loop. This is by design — MemClaw is a substrate, not a scheduler/orchestrator."
+      "This sprint is deliberately SMALL (one feature + signoff). That is the point: per Loop-Engineering-IEEE §XII 'a first loop is better small', and MemClaw is one organ of six. Resist re-expanding scope — the dropped items are dropped on principle, not for time.",
+      "LE-01 must preserve the existing self-reported reliability path EXACTLY when validation_passed is None/False. The whole value is that an INDEPENDENT verdict (from the harness evaluator) is now distinguishable from a self-graded one; do not let the two counters merge.",
+      "MemClaw must NOT execute tests, spawn the evaluator, or schedule anything. Those are harness organs. If a future reader is tempted to add a subprocess runner here, that is precisely the over-reach this sprint corrected."
     ]
   },
   "metrics": {
-    "totalWorkItems": 6,
-    "estimatedDurationDays": 4,
-    "criticalPathWorkItems": ["LE-01", "LE-02", "LE-Z01"],
-    "highRiskWorkItems": ["LE-02"],
-    "mediumRiskWorkItems": ["LE-03", "LE-05"],
+    "totalWorkItems": 2,
+    "estimatedDurationDays": 1,
+    "criticalPathWorkItems": ["LE-01", "LE-Z01"],
+    "highRiskWorkItems": [],
     "parallelWorkstreams": [
-      "LE-01 -> LE-02 is the isolation-verification spine (new table before the tool that writes to it)",
-      "LE-03 -> LE-04 is the TDCF spine (turn_index column before the audit tool that reads it)",
-      "LE-05 (propulsion scheduling) is fully independent — uses the document store, no migration dependency",
-      "LE-01/02 and LE-03/04 tracks are independent of each other and can run concurrently",
-      "LE-Z01 signoff depends on all of LE-01..LE-05"
+      "LE-01 (verified-outcome reliability) is the only build item; LE-Z01 signoff follows it"
     ],
-    "loopEngineeringCoverage": {
-      "idea_1_layer4_substratum": "SUPPORTED (pre-sprint) — memclaw_write, recall, entity_get, evolve, lifecycle automation",
-      "idea_2_five_moves": "FULLY SUPPORTED post-sprint — recall(1), write(2), verify_run(3), evolve(4), schedule_loop(5)",
-      "idea_3_isolated_verification": "FULLY SUPPORTED post-sprint — verification_runs table + memclaw_verify_run isolated execution + reliability feedback",
-      "idea_4_turn_distance_cost": "FULLY SUPPORTED post-sprint — turn_index on memories + TDCF computation + memclaw_cost_audit",
-      "idea_5_amplifier_of_judgment": "SUPPORTED (pre-sprint + post-sprint reinforcement) — ranker (BM25+vector+entity crosslinks+recency+feedback) + procedure reliability updated by verify_run outcomes"
+    "loopEngineeringOrganMap": {
+      "memory_persistence": "MemClaw's lane — memclaw_write/recall/evolve/lifecycle + (this sprint) verified-vs-claimed outcome reliability on procedures",
+      "automations_scheduling": "HARNESS — Claude Code /loop, Cloud Routines, GitHub Actions. NOT MemClaw.",
+      "worktrees_handoff": "HARNESS — git --worktree. NOT MemClaw.",
+      "skills_discovery": "HARNESS — SKILL.md (MemClaw's Forge mints skill docs, but discovery/invocation is harness-side)",
+      "connectors": "HARNESS/PROTOCOL — MCP (MemClaw is itself reached over MCP)",
+      "subagents_verification": "HARNESS — .claude/agents/reviewer.md + /goal fresh-model stop check. MemClaw only RECORDS the verdict it produces."
     },
+    "droppedFromOriginalDraft": [
+      "memclaw_verify_run (subprocess-sandbox evaluator inside the memory store) — DROPPED: the evaluator is a separate AGENT (Fig. 3), a harness organ, not a function in the Memory store. The in-lane sliver (recording its verdict) survives as LE-01.",
+      "memclaw_cost_audit + Turn-Distance Cost Factor (base_cost*2^(turn_distance/10)) — DROPPED: the formula was INVENTED; the paper's 'cost scales with turns survived' (§II.C) is motivational intuition for why verification matters, not a mechanism it proposes building. Instrumenting a fabricated metric is speculative gold-plating.",
+      "memclaw_schedule_loop + propulsion-ticket worker cron — DROPPED: scheduling is the harness's organ (/loop + Cloud Routines). The draft worker even punted payload execution back to the harness, making it pure duplication."
+    ],
     "deferredToNextSprint": [
-      "Webhook trigger type for propulsion tickets (LE-05 ships delay+cron; webhook requires external event source integration)",
-      "TDCF surfaced in the recall ranker as a ranking signal (this sprint exposes it via cost_audit for the agent to act on; auto-weighting by TDCF in the ranker is a future optimization)",
-      "Cross-agent verification (verify_run executed by a separate verifier-agent harness rather than an inline subprocess — requires a multi-agent orchestration layer not present in MemClaw)"
+      "Letting verified failures quarantine a procedure faster than self-reported ones (a verified-failure could carry more weight in the quarantine rule) — deferred until LE-01's verified counters have real data to tune against"
     ]
   }
 }
