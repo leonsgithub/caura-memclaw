@@ -59,6 +59,7 @@ concurrency:
 jobs:
   dispatch:
     runs-on: ubuntu-latest
+    if: github.repository == 'caura-ai/caura-memclaw'
     # Tight ceiling — this job is a single ``gh api`` POST that should
     # complete in well under 30s. Without an explicit timeout the
     # default is 6 hours, and ``cancel-in-progress: true`` only

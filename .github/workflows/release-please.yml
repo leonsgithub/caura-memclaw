@@ -19,6 +19,7 @@ permissions:
 jobs:
   release-please:
     runs-on: ubuntu-latest
+    if: github.repository == 'caura-ai/caura-memclaw'
     steps:
       # Mint an installation token from the org's deploy GitHub App.
       # The default GITHUB_TOKEN can't trigger downstream workflows
