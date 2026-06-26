@@ -1,7 +1,7 @@
 import uuid
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import Float, ForeignKey, Index, Text, text
+from sqlalchemy import Float, ForeignKey, Index, Text, UniqueConstraint, text
 from sqlalchemy.dialects.postgresql import JSONB, TSVECTOR
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -47,6 +47,18 @@ class Relation(Base):
     __table_args__ = (
         Index("ix_relations_from", "from_entity_id"),
         Index("ix_relations_to", "to_entity_id"),
+        # Natural key matching migration 001 — the target of the
+        # ``ON CONFLICT ON CONSTRAINT uq_relations_natural_key`` upsert in
+        # entity_service / postgres_service. Declaring it on the model keeps
+        # create_all-built schemas (tests) in sync with the migration so the
+        # upsert resolves the constraint by name.
+        UniqueConstraint(
+            "tenant_id",
+            "from_entity_id",
+            "relation_type",
+            "to_entity_id",
+            name="uq_relations_natural_key",
+        ),
     )
 
 

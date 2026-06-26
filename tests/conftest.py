@@ -45,6 +45,19 @@ for _k, _v in _TEST_DEFAULTS.items():
 for _leaky in ("MEMCLAW_API_KEY", "MEMCLAW_KEY"):
     os.environ.pop(_leaky, None)
 
+# Same hazard for LLM-provider keys: tests assert a clean baseline (e.g.
+# ``ResolvedConfig({}).openrouter_api_key is None``), but ``global_settings``
+# reads these from the process env at import time, so a key sourced from the
+# developer's shell (``~/.config/caura-keys.env``, a leaked CI secret) flips the
+# expectation and fails the test for an environment reason, not a code one. Unset
+# them up front — tests that need a provider key set it explicitly via fixtures.
+for _leaky_provider in (
+    "OPENROUTER_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+):
+    os.environ.pop(_leaky_provider, None)
+
 # ruff: noqa: E402 — these imports MUST stay below the env defaults above;
 # ``core_api.config`` reads settings at import time so ``pytest`` triggering
 # test collection (which transitively imports config) must see the

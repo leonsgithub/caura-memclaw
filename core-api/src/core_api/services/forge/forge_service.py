@@ -217,10 +217,9 @@ async def run_forge_distill(
 
     # 1. Build traces (persists into session_traces via SF-102).
     #
-    # ``db`` is a vestigial first positional arg on ``run_forge_distill``
-    # (Fix 2 Ph5a): ``build_session_traces`` + the injected fetchers now
-    # route through core-storage-api, so nothing here touches a DB session.
-    # The arg is kept for CLI / test call-site compatibility.
+    # No DB session is threaded here (Fix 2 Ph5a): ``build_session_traces``
+    # + the injected fetchers all route through core-storage-api, so nothing
+    # in this function touches a DB session — the signature is keyword-only.
     traces = await build_session_traces(
         tenant_id=tenant_id,
         fleet_id=fleet_id,

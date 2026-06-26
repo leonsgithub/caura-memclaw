@@ -94,10 +94,6 @@ class TestBuildProcedureFromCluster:
 # ── integration with run_forge_distill ────────────────────────────
 
 
-class _MockDb:
-    pass
-
-
 def _passing_traces(n: int) -> list[SessionTraceRow]:
     return [
         _trace(run_id=f"r{i}", agent_id=f"agent{i}", entities=["e1", "e2", "e3"],
@@ -157,7 +153,6 @@ async def test_run_forge_emits_linked_procedure(monkeypatch):
         procs.append(proc)
 
     result = await run_forge_distill(
-        _MockDb(),
         run_label="test-run",
         tenant_id="acme",
         fleet_id="ops",
@@ -192,7 +187,6 @@ async def test_emitter_failure_does_not_abort_mint(monkeypatch):
         raise RuntimeError("storage down")
 
     result = await run_forge_distill(
-        _MockDb(),
         run_label="test-run",
         tenant_id="acme",
         fleet_id="ops",
