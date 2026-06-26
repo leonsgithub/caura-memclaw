@@ -1,0 +1,341 @@
+{
+  "planId": "SPRINT-BRAIN-PARITY-PLAN",
+  "sprintGoal": "Close the genuine, non-redundant feature-parity gaps between procedural_memory_mcp (Brain) and MemClaw at the 'pragmatic parity' scope. Build: (BP-01/BP-02) manual procedure lifecycle controls — quarantine/unquarantine/invalidate/delete + a stats read — currently quarantine is auto-only with no override; (BP-03) Env Truths as a verify-capable convention over the existing memclaw_doc store (single-value-per-key infra facts with verified_at / verification_count), NOT a new migration domain; (BP-04) memclaw_export — agent-facing, visibility-scoped bulk export of memories; (BP-05) review_low_rated — surface low-`weight` / poor-recall-outcome memories for curation, reusing the existing memory.weight + recall_event signal. EXPLICITLY OUT OF SCOPE by design (documented in BP-Z01, not built): record_correction / link_thought / get_stale_thoughts (MemClaw already does these automatically via the contradiction detector + supersessions, the entity cross-linking pipeline, and lifecycle/crystallizer); record_failure_context / record_escalation (feed Brain's training/curriculum subsystem that the prior procedural-memory sprint deliberately omitted — Forge replaces it); call_procedure (memclaw_procedure_suggest already returns steps/reasoning_guide and _record logs usage); brain_batch (the MCP client already parallelizes independent calls — YAGNI).",
+  "correlationId": "SPRINT-BRAIN-PARITY",
+  "createdAt": "2026-06-26T00:00:00Z",
+  "createdBy": "claude-code",
+  "workItems": [
+    {
+      "id": "BP-01",
+      "kind": "software.implementation",
+      "objective": "Add the storage + client foundation for manual procedure lifecycle. core-storage-api gains a DELETE /procedures/{id} endpoint (hard delete with stats CASCADE) and reuses the procedures.status column for soft-invalidate; core-api storage_client gains delete_procedure, set_procedure_quarantine (via existing PATCH /stats is_quarantined), and invalidate_procedure (status patch) methods. No new migration — the procedures table already has status; quarantine flips the existing procedure_stats.is_quarantined.",
+      "acceptanceCriteria": [
+        "core-storage-api/src/core_storage_api/routers/procedures.py exposes DELETE /procedures/{id} returning 404 when absent and 200 with deleted-id otherwise; deleting a procedure also removes its procedure_stats row (FK CASCADE already declared in migration 028)",
+        "An invalidate path is reachable: either a PATCH /procedures/{id} that sets status (e.g. 'outdated'/'invalid') or documented reuse of update_procedure_stats — invalidated procedures are excluded by the ranker the same way quarantined ones are",
+        "core-api/src/core_api/clients/storage_client.py gains delete_procedure(procedure_id), invalidate_procedure(procedure_id, reason), set_procedure_quarantine(procedure_id, quarantined: bool) mirroring the existing create/get/list/update_procedure_stats methods (L902-934)",
+        "Storage-layer test: create a procedure, set is_quarantined via the quarantine path and assert the ranker/list omits it; un-quarantine and assert it returns; delete it and assert GET returns 404 and its stats row is gone"
+      ],
+      "state": "todo",
+      "priority": 100,
+      "dependencies": [],
+      "requiredCapabilities": ["filesystem.write", "database.read"],
+      "executionPolicy": {
+        "maxAttempts": 2,
+        "timeoutSeconds": 1800,
+        "requiresHumanApproval": false,
+        "allowedSideEffects": ["local_filesystem_write"],
+        "networkAccess": "none",
+        "retryPolicy": {"strategy": "exponential_backoff", "retryOn": ["transient_error", "timeout"]}
+      },
+      "risk": {
+        "level": "low",
+        "reasons": [
+          "Additive endpoint + new client methods; quarantine/invalidate reuse existing columns (procedure_stats.is_quarantined, procedures.status) — NO new migration",
+          "Rollback: revert the router/client additions; no schema change to undo"
+        ]
+      },
+      "resourceLocks": [{"resource": "core-storage-api:procedures", "mode": "write"}],
+      "version": 1,
+      "attempt": 0,
+      "parentId": null,
+      "artifacts": [],
+      "failure": null,
+      "payload": {
+        "model_after": [
+          "core-storage-api/src/core_storage_api/routers/procedures.py (existing POST/GET/list/PATCH-stats shape)",
+          "core-storage-api/src/core_storage_api/routers/memories.py /batch-update-status for the soft-status pattern",
+          "core-api/src/core_api/clients/storage_client.py L902-934 (existing procedure methods)"
+        ],
+        "facts": [
+          "Quarantine is ALREADY settable via PATCH /procedures/{id}/stats with {is_quarantined: true} — manual quarantine/unquarantine needs NO new storage endpoint, only the client + MCP surface",
+          "procedures table has a status column (migration 028) usable for invalidate without a migration",
+          "procedure_stats FK is ON DELETE CASCADE (migration 028) — a procedures DELETE cleans up stats automatically"
+        ],
+        "validation_commands": [
+          "cd core-storage-api && pytest tests -k procedure -q",
+          "grep -n 'def procedure' core-storage-api/src/core_storage_api/services/postgres_service.py"
+        ]
+      }
+    },
+    {
+      "id": "BP-02",
+      "kind": "software.feature",
+      "objective": "Expose manual procedure lifecycle as an op-dispatched MCP tool memclaw_procedure_manage (ops: quarantine, unquarantine, invalidate, delete, stats), mirroring the memclaw_manage pattern. Trust-gates: stats=0, quarantine/unquarantine/invalidate>=2, delete>=3. Reuses the BP-01 storage_client methods and the existing auth/trust/scope helpers.",
+      "acceptanceCriteria": [
+        "core-api/src/core_api/tools/memclaw_procedure_manage.py defines a ToolSpec with ops (quarantine, unquarantine, invalidate, delete, stats) registered via register() + mcp_register(); the tool appears in the MCP tool list and in scripts/export_tool_specs.py output",
+        "memclaw_procedure_manage(op='stats', procedure_id) returns reliability_score, success_count, failure_count, is_quarantined; trust_required=0",
+        "op='quarantine'/'unquarantine' flips procedure_stats.is_quarantined; op='invalidate' sets the procedure status so the ranker skips it; all three require trust>=2",
+        "op='delete' hard-deletes via storage_client.delete_procedure and requires trust>=3 (matches memclaw_manage op=delete)",
+        "End-to-end test: suggest surfaces a procedure -> manage op=quarantine -> the same procedure no longer appears in suggest -> op=unquarantine -> it returns -> op=delete -> stats read returns NOT_FOUND",
+        "A low-trust (trust<2) caller invoking op=quarantine/delete receives the unified trust-denied error, not a successful mutation"
+      ],
+      "state": "todo",
+      "priority": 90,
+      "dependencies": ["BP-01"],
+      "requiredCapabilities": ["filesystem.write"],
+      "executionPolicy": {
+        "maxAttempts": 2,
+        "timeoutSeconds": 1800,
+        "requiresHumanApproval": true,
+        "allowedSideEffects": ["local_filesystem_write"],
+        "networkAccess": "none",
+        "retryPolicy": {"strategy": "exponential_backoff", "retryOn": ["transient_error", "timeout"]}
+      },
+      "risk": {
+        "level": "medium",
+        "reasons": [
+          "New mutating MCP surface including a destructive delete — must enforce the same trust gates as memclaw_manage (delete trust>=3) to avoid a low-trust destructive path",
+          "Rollback: remove the spec module + handler; SoT registration auto-drops the tool"
+        ]
+      },
+      "resourceLocks": [{"resource": "core-api:mcp_server", "mode": "write"}],
+      "version": 1,
+      "attempt": 0,
+      "parentId": null,
+      "artifacts": [],
+      "failure": null,
+      "payload": {
+        "model_after": [
+          "core-api/src/core_api/tools/memclaw_manage.py (op-dispatched ToolSpec + per-op trust_required + delete trust=3)",
+          "core-api/src/core_api/tools/memclaw_procedure_record.py (procedure-domain handler + spec)",
+          "core-api/src/core_api/mcp_server.py memclaw_manage / memclaw_evolve handlers (op dispatch + _check_auth/_get_tenant/_get_agent_id + three-phase session pattern)"
+        ],
+        "concept_from": [
+          "/home/leon/dev/procedural_memory_mcp/src/server.py delete_procedure (L195), invalidate_procedure (L254), quarantine_procedure (L278), unquarantine_procedure (L287), get_procedure_stats (L178)"
+        ],
+        "validation_commands": [
+          "pytest core-api/tests -k 'procedure and (manage or quarantine or delete)' -q",
+          "python scripts/export_tool_specs.py --check"
+        ]
+      }
+    },
+    {
+      "id": "BP-03",
+      "kind": "software.feature",
+      "objective": "Implement Env Truths as a verify-capable convention over the EXISTING memclaw_doc store — NOT a new migration/domain. Stable infra facts (urls, ports, hostnames) live in a reserved collection keyed by truth-name (upsert-by-doc_id = single value per key), carrying value, verified_at, verification_count, confidence in data{}. Provide a thin op surface for upsert/get/list/verify so agents have Brain's env_truth ergonomics without a parallel table.",
+      "acceptanceCriteria": [
+        "Env truths are stored via the existing memclaw_doc document store in a reserved collection (e.g. '__env_truths__'); upsert by (collection, doc_id=truth_name) gives single-value-per-key semantics with NO new alembic migration",
+        "A verify operation bumps verification_count and sets verified_at without changing value; an upsert with a new value resets verification_count and updates verified_at",
+        "get returns value + verified_at + verification_count + confidence; list enumerates all env truths for the tenant; both respect existing visibility/scope rules (shared infra facts default to scope_org)",
+        "Surface is either a documented memclaw_doc convention plus a small memclaw_env op-tool, OR new ops on memclaw_doc — chosen in implementation; whichever ships is registered and appears in the MCP tool list",
+        "Test: upsert an env truth, verify it twice (count==2, verified_at advances, value unchanged), upsert a new value (count resets), list returns it; reading a missing key returns NOT_FOUND"
+      ],
+      "state": "todo",
+      "priority": 70,
+      "dependencies": [],
+      "requiredCapabilities": ["filesystem.write"],
+      "executionPolicy": {
+        "maxAttempts": 2,
+        "timeoutSeconds": 1800,
+        "requiresHumanApproval": true,
+        "allowedSideEffects": ["local_filesystem_write"],
+        "networkAccess": "none",
+        "retryPolicy": {"strategy": "exponential_backoff", "retryOn": ["transient_error", "timeout"]}
+      },
+      "risk": {
+        "level": "medium",
+        "reasons": [
+          "New agent-facing convention/tool; must not collide with user-named collections (reserve the '__env_truths__' name) and must reuse memclaw_doc visibility scoping",
+          "Rollback: drop the env tool/ops; doc-backed rows are ordinary documents and can be left or purged"
+        ]
+      },
+      "resourceLocks": [{"resource": "core-api:mcp_server", "mode": "write"}],
+      "version": 1,
+      "attempt": 0,
+      "parentId": null,
+      "artifacts": [],
+      "failure": null,
+      "payload": {
+        "model_after": [
+          "core-api/src/core_api/tools/memclaw_doc.py (op-dispatched structured-doc CRUD — the backing store)",
+          "core-api/src/core_api/services around document upsert/query used by memclaw_doc"
+        ],
+        "concept_from": [
+          "/home/leon/dev/procedural_memory_mcp/src/server.py upsert_env_truth (L216), get_env_truth (L233), list_env_truths (L242), verify_env_truth (L266) — semantics only; do NOT port Brain's env_truths table"
+        ],
+        "decision_note": "Brain models env truths as a first-class D1 table; MemClaw already has memclaw_doc upsert-by-key + visibility scoping, so a doc-backed convention closes the gap WITHOUT a migration. Only fall back to a dedicated table if verify/confidence cannot be expressed in data{} cleanly.",
+        "validation_commands": [
+          "pytest core-api/tests -k 'env_truth or env or memclaw_doc' -q"
+        ]
+      }
+    },
+    {
+      "id": "BP-04",
+      "kind": "software.feature",
+      "objective": "Add memclaw_export: an agent-facing, visibility-scoped bulk export of the caller's memories to JSON/JSONL, reusing the existing memclaw_list/storage list path. Must NOT exfiltrate memories the caller cannot already read (scope_agent of others). Trust-gated.",
+      "acceptanceCriteria": [
+        "core-api/src/core_api/tools/memclaw_export.py registers a ToolSpec; the tool appears in the MCP tool list",
+        "Export returns only memories the caller is already authorized to read under existing visibility scoping (own scope_agent + scope_team/scope_org) — a test proves another agent's private scope_agent memory is NOT included",
+        "Output is structured JSON/JSONL with stable fields (id, content, type, scope, created_at, weight) and is paginated/streamed so a large tenant does not OOM the handler",
+        "trust_required>=1 (read-all-own export is a bulk-egress surface); export respects the same tenant isolation as memclaw_list",
+        "Test: seed N memories across scopes for two agents, export as agent A, assert count == A-visible set and B's private memory is absent"
+      ],
+      "state": "todo",
+      "priority": 60,
+      "dependencies": [],
+      "requiredCapabilities": ["filesystem.write"],
+      "executionPolicy": {
+        "maxAttempts": 2,
+        "timeoutSeconds": 1800,
+        "requiresHumanApproval": true,
+        "allowedSideEffects": ["local_filesystem_write"],
+        "networkAccess": "none",
+        "retryPolicy": {"strategy": "exponential_backoff", "retryOn": ["transient_error", "timeout"]}
+      },
+      "risk": {
+        "level": "medium",
+        "reasons": [
+          "Bulk data-egress surface — the security-sensitive item this sprint; visibility scoping + tenant isolation must be enforced exactly as memclaw_list, never widened",
+          "Rollback: remove the spec module + handler; no data or schema change"
+        ]
+      },
+      "resourceLocks": [{"resource": "core-api:mcp_server", "mode": "write"}],
+      "version": 1,
+      "attempt": 0,
+      "parentId": null,
+      "artifacts": [],
+      "failure": null,
+      "payload": {
+        "model_after": [
+          "core-api/src/core_api/tools/memclaw_list.py + the visibility-scoped list path in clients/storage_client.py (L1016 'Non-admin memory list WITH visibility scoping')",
+          "core-storage-api/src/core_storage_api/routers/memories.py /bulk-get + list endpoints"
+        ],
+        "concept_from": [
+          "/home/leon/dev/procedural_memory_mcp/src/server.py export_thoughts (L499)"
+        ],
+        "validation_commands": [
+          "pytest core-api/tests -k 'export and (scope or visibility)' -q"
+        ]
+      }
+    },
+    {
+      "id": "BP-05",
+      "kind": "software.feature",
+      "objective": "Add review_low_rated: surface memories with a poor track record (low memory.weight and/or repeated failure outcomes in recall_event) for curation. Read-only — reuses the existing weight signal that memclaw_evolve already adjusts and the recall_event/recall_candidate logging (migration 027). The MemClaw analog of Brain's avg_usefulness review.",
+      "acceptanceCriteria": [
+        "A read tool (new memclaw tool or a memclaw_insights op) returns memories ranked ascending by weight (and/or by failure-outcome ratio from recall_event), scoped to the caller's tenant/visibility, with a configurable threshold and limit",
+        "Each returned row includes the signal that flagged it (weight value and/or recall failure count) so a curator can act (transition to outdated/archived via memclaw_manage)",
+        "Read-only: the tool performs no mutation; flagged memories are returned, not auto-changed",
+        "Test: seed memories with high and low weight (or success/failure recall outcomes), call the tool with a threshold, assert only low-weight/poor-outcome memories are returned in ascending-badness order"
+      ],
+      "state": "todo",
+      "priority": 50,
+      "dependencies": [],
+      "requiredCapabilities": ["filesystem.write", "database.read"],
+      "executionPolicy": {
+        "maxAttempts": 2,
+        "timeoutSeconds": 1800,
+        "requiresHumanApproval": false,
+        "allowedSideEffects": ["local_filesystem_write"],
+        "networkAccess": "none",
+        "retryPolicy": {"strategy": "exponential_backoff", "retryOn": ["transient_error", "timeout"]}
+      },
+      "risk": {
+        "level": "medium",
+        "reasons": [
+          "Read-only, but queries the recall_event/weight signal — must not regress the hot recall path or leak cross-tenant rows",
+          "Rollback: remove the read tool/op; no schema or data change"
+        ]
+      },
+      "resourceLocks": [{"resource": "core-api:mcp_server", "mode": "write"}],
+      "version": 1,
+      "attempt": 0,
+      "parentId": null,
+      "artifacts": [],
+      "failure": null,
+      "payload": {
+        "model_after": [
+          "common/models/memory.py weight column (server_default 0.5 — the usefulness signal memclaw_evolve adjusts)",
+          "core-storage-api/src/core_storage_api/database/migrations/versions/027_recall_logging.py (recall_event / recall_candidate)",
+          "core-api/src/core_api/tools/memclaw_stats.py + memclaw_insights.py (read-tool shape + visibility scoping)"
+        ],
+        "concept_from": [
+          "/home/leon/dev/procedural_memory_mcp/src/server.py review_low_rated (L540), get_low_rated_thoughts"
+        ],
+        "investigate_first": [
+          "Confirm whether per-memory outcome lives on memory.weight, in recall_event, or both — pick the cheapest authoritative signal before writing the query"
+        ],
+        "validation_commands": [
+          "pytest core-api/tests -k 'low_rated or review or weight' -q"
+        ]
+      }
+    },
+    {
+      "id": "BP-Z01",
+      "kind": "process.signoff",
+      "objective": "Write SPRINT-BRAIN-PARITY_SIGNOFF.md recording task outcomes, file changes, verification evidence, and — critically — the DELIBERATE-DIVERGENCE ledger: every Brain tool NOT ported this sprint with the reason, so 'parity' is a documented decision, not an oversight.",
+      "acceptanceCriteria": [
+        "File exists at sprints/sprint-brain-parity/SPRINT-BRAIN-PARITY_SIGNOFF.md",
+        "Task status table covers BP-01..BP-05 with DONE/PARTIAL/PENDING/BLOCKED",
+        "Verification section includes the pytest output for each delivered tool and the end-to-end procedure-lifecycle evidence (suggest -> quarantine -> absent -> delete -> not-found)",
+        "A 'Deliberate Divergence' table lists record_correction, link_thought, get_stale_thoughts (auto-covered — name the MemClaw mechanism), record_failure_context, record_escalation (training-subsystem, out of scope), call_procedure, brain_batch (redundant/YAGNI) with the one-line reason each",
+        "Sprint close summary states whether pragmatic-parity was achieved and lists any carried-forward items"
+      ],
+      "state": "todo",
+      "priority": 10,
+      "dependencies": ["BP-01", "BP-02", "BP-03", "BP-04", "BP-05"],
+      "requiredCapabilities": ["filesystem.write"],
+      "executionPolicy": {
+        "maxAttempts": 1,
+        "timeoutSeconds": 900,
+        "requiresHumanApproval": false,
+        "allowedSideEffects": ["local_filesystem_write"],
+        "networkAccess": "none",
+        "retryPolicy": {"strategy": "none", "retryOn": []}
+      },
+      "risk": {
+        "level": "low",
+        "reasons": ["Documentation only — no behavior change", "Rollback: N/A"]
+      },
+      "resourceLocks": [],
+      "version": 1,
+      "attempt": 0,
+      "parentId": null,
+      "artifacts": [],
+      "failure": null,
+      "payload": {
+        "implementation_notes": [
+          "Include: task status table, changes-by-file, verification output, definition-of-done checklist, deliberate-divergence ledger, carried-forward table, sprint close summary"
+        ],
+        "evidence_required": ["SPRINT-BRAIN-PARITY_SIGNOFF.md committed"]
+      }
+    }
+  ],
+  "validation": {
+    "status": "valid",
+    "errors": [],
+    "warnings": [
+      "SCOPE = pragmatic parity (user-selected). Build BP-01..BP-05 only. Do NOT port record_correction / link_thought / get_stale_thoughts (MemClaw already does these automatically — contradiction detector + supersessions, entity cross-linking pipeline, lifecycle/crystallizer); porting manual versions duplicates live capability.",
+      "Do NOT port record_failure_context or record_escalation — they feed Brain's training/curriculum subsystem the prior procedural-memory sprint deliberately omitted (Forge replaces the mining). call_procedure is redundant (suggest already returns steps; _record logs usage). brain_batch is YAGNI (the MCP client parallelizes independent calls).",
+      "BP-03 must NOT add a new alembic migration/table — env truths ride on the existing memclaw_doc store (upsert-by-key + visibility scoping). Only escalate to a dedicated table if verify/confidence cannot be modeled in data{}.",
+      "BP-04 is the security-sensitive item: bulk memory egress MUST honor the exact visibility scoping memclaw_list uses; never widen it. trust>=1.",
+      "Reuse MemClaw's embedding provider, VECTOR_DIM from common.constants, and the existing storage/doc layers — do NOT import procedural_memory_mcp at runtime and do NOT hardcode Brain's 768 (MemClaw is 1024 / bge-m3).",
+      "BP-02 destructive delete must keep trust>=3 (matches memclaw_manage op=delete); quarantine/unquarantine/invalidate trust>=2."
+    ]
+  },
+  "metrics": {
+    "totalWorkItems": 6,
+    "estimatedDurationDays": 4,
+    "criticalPathWorkItems": ["BP-01", "BP-02", "BP-Z01"],
+    "highRiskWorkItems": [],
+    "mediumRiskWorkItems": ["BP-02", "BP-03", "BP-04", "BP-05"],
+    "parallelWorkstreams": [
+      "BP-01 -> BP-02 is the only hard spine (lifecycle storage before the MCP tool)",
+      "BP-03 (env truths), BP-04 (export), BP-05 (review_low_rated) are mutually independent and independent of BP-01/02 — run concurrently",
+      "BP-Z01 signoff depends on all of BP-01..BP-05"
+    ],
+    "deliberatelyNotPorted": [
+      "record_correction -> MemClaw contradiction detector + supersessions (automatic)",
+      "link_thought -> MemClaw entity cross-linking pipeline (automatic)",
+      "get_stale_thoughts -> MemClaw lifecycle automation + crystallizer (automatic); BP-05 covers the low-rated curation half",
+      "record_failure_context -> Brain training/curriculum subsystem (out of scope; Forge replaces mining)",
+      "record_escalation -> Brain training/curriculum subsystem (out of scope)",
+      "call_procedure -> redundant: memclaw_procedure_suggest returns steps/reasoning_guide and _record logs usage",
+      "brain_batch -> YAGNI: MCP client already parallelizes independent tool calls"
+    ],
+    "deferredToNextSprint": [
+      "Deploy the parity-enabled MemClaw build (host TBD — see prior sprint PM-N2)",
+      "Surface the new tools in the OpenClaw plugin tools.json via scripts/export_tool_specs.py (mirrors PM-N3)"
+    ]
+  }
+}
