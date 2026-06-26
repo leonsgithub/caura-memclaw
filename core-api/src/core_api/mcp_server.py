@@ -2417,6 +2417,104 @@ async def memclaw_list(
             return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
 
 
+# ── BP-04: Export ────────────────────────────────────────────────────────────
+_EXPORT_SCOPES = {"agent", "team", "org", "all"}
+_EXPORT_FORMATS = {"json", "jsonl"}
+_EXPORT_MAX_LIMIT = 500
+
+
+async def memclaw_export(
+    scope: Annotated[str, Field(description="agent|team|org|all. Mirrors memclaw_list visibility scoping.")] = "agent",
+    format: Annotated[str, Field(description="json (envelope) or jsonl (newline-delimited records).")] = "json",
+    limit: Annotated[int, Field(description="Records per page, max 500 (default 200).")] = 200,
+    cursor: Annotated[str | None, Field(description="Pagination cursor from previous response.")] = None,
+    agent_id: Annotated[str, Field(description="Caller agent.")] = _DEFAULT_AGENT_ID,
+) -> str:
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    if scope not in _EXPORT_SCOPES:
+        return _with_latency(_error_response("INVALID_ARGUMENTS", f"scope must be one of {sorted(_EXPORT_SCOPES)}."), t0)
+    if format not in _EXPORT_FORMATS:
+        return _with_latency(_error_response("INVALID_ARGUMENTS", f"format must be one of {sorted(_EXPORT_FORMATS)}."), t0)
+    capped_limit = max(1, min(limit, _EXPORT_MAX_LIMIT))
+    tenant_id = _get_tenant()
+    sc = get_storage_client()
+    async with _no_db():
+        try:
+            trust, _, terr = await _require_trust(tenant_id, agent_id, min_level=1)
+            if terr:
+                return _with_latency(_error_response("FORBIDDEN", parse_trust_error(terr)), t0)
+
+            effective_written_by = agent_id if scope == "agent" else None
+            c_ts = c_id = None
+            if cursor:
+                try:
+                    c_ts, c_id = decode_cursor(cursor)
+                except Exception:
+                    return _with_latency(_error_response("INVALID_ARGUMENTS", "Invalid cursor."), t0)
+
+            readable = _get_readable_tenants() or None
+            payload: dict[str, Any] = {
+                "tenant_id": tenant_id,
+                "caller_agent_id": agent_id,
+                "fleet_id": None,
+                "written_by": effective_written_by,
+                "memory_type": None,
+                "status": "active",
+                "weight_min": None,
+                "weight_max": None,
+                "created_after": None,
+                "created_before": None,
+                "include_deleted": False,
+                "sort": "created_at",
+                "order": "desc",
+                "limit": capped_limit + 1,
+                "cursor_ts": c_ts.isoformat() if c_ts else None,
+                "cursor_id": str(c_id) if c_id else None,
+                "readable_tenant_ids": readable if scope != "agent" else None,
+            }
+            rows = await sc.list_memories_by_filters(payload)
+            has_more = len(rows) > capped_limit
+            page = rows[:capped_limit]
+            records = [
+                {
+                    "id": str(r.get("id", "")),
+                    "content": r.get("content", ""),
+                    "type": r.get("memory_type", ""),
+                    "created_at": r.get("created_at", ""),
+                    "weight": r.get("weight", 0.5),
+                    "agent_id": r.get("agent_id", ""),
+                    "visibility": r.get("visibility", ""),
+                }
+                for r in page
+            ]
+            next_cursor = None
+            if has_more and page:
+                last = page[-1]
+                next_cursor = encode_cursor(_dt.fromisoformat(last["created_at"]), UUID(last["id"]))
+
+            if format == "jsonl":
+                body = "\n".join(json.dumps(rec, default=str) for rec in records)
+                return _with_latency(body, t0)
+
+            return _with_latency(
+                json.dumps(
+                    {"count": len(records), "records": records, "next_cursor": next_cursor, "scope": scope},
+                    default=str,
+                ),
+                t0,
+            )
+        except HTTPException as e:
+            logger.warning("MCP export error (%s): %s", e.status_code, e.detail)
+            return _with_latency(_error_response(code_for_status(e.status_code), str(e.detail)), t0)
+        except httpx.HTTPStatusError as e:
+            return _storage_error_envelope(e, t0)
+        except Exception as e:
+            logger.error("MCP export error: %s", e, exc_info=True)
+            return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
+
+
 async def memclaw_stats(
     scope: Annotated[
         str,

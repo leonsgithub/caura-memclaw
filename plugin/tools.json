@@ -303,6 +303,56 @@
     "trust_required": 1
   },
   {
+    "description": "Bulk-export memories for the calling tenant. scope: agent (own only, default) | team | org | all \u2014 mirrors memclaw_list visibility. format: json (envelope with count/records/next_cursor) or jsonl (newline-delimited records). Paginate with cursor from next_cursor. Each record: id, content, type, created_at, weight, agent_id, visibility. trust>=1 required (bulk egress surface).",
+    "error_codes": [
+      "INVALID_ARGUMENTS",
+      "FORBIDDEN",
+      "INTERNAL_ERROR"
+    ],
+    "impl_status": "live",
+    "name": "memclaw_export",
+    "ops": [],
+    "params": [
+      {
+        "default": "agent",
+        "description": "agent|team|org|all. Mirrors memclaw_list visibility scoping.",
+        "name": "scope",
+        "required": false,
+        "type": "str"
+      },
+      {
+        "default": "json",
+        "description": "json (envelope) or jsonl (newline-delimited records).",
+        "name": "format",
+        "required": false,
+        "type": "str"
+      },
+      {
+        "default": 200,
+        "description": "Records per page, max 500 (default 200).",
+        "name": "limit",
+        "required": false,
+        "type": "int"
+      },
+      {
+        "default": null,
+        "description": "Pagination cursor from previous response.",
+        "name": "cursor",
+        "required": false,
+        "type": "str | None"
+      },
+      {
+        "default": "mcp-agent",
+        "description": "Caller agent.",
+        "name": "agent_id",
+        "required": false,
+        "type": "str"
+      }
+    ],
+    "plugin_exposed": true,
+    "trust_required": 1
+  },
+  {
     "description": "Reflect over your memory store. focus: contradictions|failures|stale|divergence|patterns|discover. scope: agent (default, trust \u2265 1)|fleet|all (trust \u2265 2; divergence requires fleet/all). Findings are saved as insight-type memories for future runs to build on.",
     "error_codes": [],
     "impl_status": "live",

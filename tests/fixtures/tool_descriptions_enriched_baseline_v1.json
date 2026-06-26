@@ -15,6 +15,10 @@
     "description": "Report what happened after acting on memories. outcome_type: success|failure|partial. related_ids = the memory UUIDs that influenced the action (use IDs from your most recent memclaw_recall). scope: agent (default, trust \u2265 1)|fleet|all (trust \u2265 2; fleet_id required when scope='fleet'). Weight adjustments and rule generation are scoped \u2014 agents can only evolve memories they own (scope=agent), their fleet (scope=fleet), or any (scope=all).",
     "stm_only": false
   },
+  "memclaw_export": {
+    "description": "Bulk-export memories for the calling tenant. scope: agent (own only, default) | team | org | all \u2014 mirrors memclaw_list visibility. format: json (envelope with count/records/next_cursor) or jsonl (newline-delimited records). Paginate with cursor from next_cursor. Each record: id, content, type, created_at, weight, agent_id, visibility. trust>=1 required (bulk egress surface).",
+    "stm_only": false
+  },
   "memclaw_insights": {
     "description": "Reflect over your memory store. focus: contradictions|failures|stale|divergence|patterns|discover. scope: agent (default, trust \u2265 1)|fleet|all (trust \u2265 2; divergence requires fleet/all). Findings are saved as insight-type memories for future runs to build on.",
     "stm_only": false

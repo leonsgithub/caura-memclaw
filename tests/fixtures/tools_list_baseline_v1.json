@@ -304,6 +304,59 @@
     "execution": null
   },
   {
+    "name": "memclaw_export",
+    "title": null,
+    "description": "Bulk-export memories for the calling tenant. scope: agent (own only, default) | team | org | all \u2014 mirrors memclaw_list visibility. format: json (envelope with count/records/next_cursor) or jsonl (newline-delimited records). Paginate with cursor from next_cursor. Each record: id, content, type, created_at, weight, agent_id, visibility. trust>=1 required (bulk egress surface).",
+    "inputSchema": {
+      "properties": {
+        "scope": {
+          "default": "agent",
+          "description": "agent|team|org|all. Mirrors memclaw_list visibility scoping.",
+          "title": "Scope",
+          "type": "string"
+        },
+        "format": {
+          "default": "json",
+          "description": "json (envelope) or jsonl (newline-delimited records).",
+          "title": "Format",
+          "type": "string"
+        },
+        "limit": {
+          "default": 200,
+          "description": "Records per page, max 500 (default 200).",
+          "title": "Limit",
+          "type": "integer"
+        },
+        "cursor": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "description": "Pagination cursor from previous response.",
+          "title": "Cursor"
+        },
+        "agent_id": {
+          "default": "mcp-agent",
+          "description": "Caller agent.",
+          "title": "Agent Id",
+          "type": "string"
+        }
+      },
+      "title": "memclaw_exportArguments",
+      "type": "object"
+    },
+    "outputSchema": null,
+    "icons": null,
+    "annotations": null,
+    "meta": null,
+    "execution": null
+  },
+  {
     "name": "memclaw_insights",
     "title": null,
     "description": "Reflect over your memory store. focus: contradictions|failures|stale|divergence|patterns|discover. scope: agent (default, trust \u2265 1)|fleet|all (trust \u2265 2; divergence requires fleet/all). Findings are saved as insight-type memories for future runs to build on.",

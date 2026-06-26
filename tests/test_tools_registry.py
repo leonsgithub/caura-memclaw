@@ -44,6 +44,8 @@ EXPECTED_PLUGIN_EXPOSED = {
     "memclaw_procedure_manage",
     # BP-03: env truths.
     "memclaw_env",
+    # BP-04: bulk export.
+    "memclaw_export",
 }
 
 # MCP-only tools — not surfaced through the plugin. ``memclaw_keystones_set``
