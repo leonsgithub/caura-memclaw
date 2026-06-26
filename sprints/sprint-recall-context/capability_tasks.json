@@ -1,0 +1,262 @@
+{
+  "planId": "SPRINT-RECALL-CONTEXT-PLAN",
+  "sprintGoal": "Fix cross-project bleed in memclaw_recall phase 2. Currently CrossContextEnrich re-runs the query without caller_agent_id, so storage returns all scope_team/scope_org rows ranked by pure embedding similarity — a .53 login from an unrelated project can outrank the one you want. Fix: add preferred_agent_ids (list[str] | None) to memory_scored_search as a soft score boost (×1.2 for matching agent_id rows). CrossContextEnrich auto-populates it from caller_agent_id so same-project shared memories rank above cross-project noise without hard-filtering them out.",
+  "correlationId": "SPRINT-RECALL-CONTEXT",
+  "createdAt": "2026-06-26T00:00:00Z",
+  "createdBy": "claude-code",
+  "workItems": [
+    {
+      "id": "RC-01",
+      "kind": "software.implementation",
+      "objective": "Add preferred_agent_ids soft boost to memory_scored_search in postgres_service. Rows whose agent_id is in preferred_agent_ids get score multiplied by a configurable boost factor (default 1.2). Param is optional — None means no boost, preserving existing behaviour exactly.",
+      "acceptanceCriteria": [
+        "memory_scored_search signature has preferred_agent_ids: list[str] | None = None and preferred_agent_boost: float = 1.2",
+        "When preferred_agent_ids is None, the SQL score expression is identical to before (no CASE added)",
+        "When preferred_agent_ids is set, a CASE expression multiplies score by preferred_agent_boost for rows where Memory.agent_id.in_(preferred_agent_ids), else 1.0",
+        "Boost is applied AFTER all existing multipliers (freshness, recall_boost, temporal_boost, status_penalty) so it does not interfere with their semantics",
+        "ruff check passes on the changed file"
+      ],
+      "state": "todo",
+      "priority": 100,
+      "dependencies": [],
+      "requiredCapabilities": ["filesystem.write"],
+      "executionPolicy": {
+        "maxAttempts": 2,
+        "timeoutSeconds": 600,
+        "requiresHumanApproval": false,
+        "allowedSideEffects": ["local_filesystem_write"],
+        "networkAccess": "none",
+        "retryPolicy": {"strategy": "exponential_backoff", "retryOn": ["transient_error"]}
+      },
+      "risk": {
+        "level": "low",
+        "reasons": [
+          "Additive param with None default — zero behaviour change when not set",
+          "No DB schema changes",
+          "Boost is a multiplier, not a filter — cross-project memories still appear, just ranked lower"
+        ]
+      },
+      "resourceLocks": [],
+      "version": 1,
+      "attempt": 0,
+      "parentId": null,
+      "artifacts": [],
+      "failure": null,
+      "payload": {
+        "file": "core-storage-api/src/core_storage_api/services/postgres_service.py",
+        "function": "memory_scored_search",
+        "change": "Add preferred_agent_ids: list[str] | None = None and preferred_agent_boost: float = 1.2 params. After building the score expression (line ~1281), wrap in a CASE: score * case((Memory.agent_id.in_(preferred_agent_ids), preferred_agent_boost), else_=1.0) when preferred_agent_ids is not None."
+      }
+    },
+    {
+      "id": "RC-02",
+      "kind": "software.implementation",
+      "objective": "Thread preferred_agent_ids and preferred_agent_boost from the /memories/scored-search HTTP request body through to the postgres_service call in the storage router.",
+      "acceptanceCriteria": [
+        "scored_search endpoint in routers/memories.py passes preferred_agent_ids=body.get('preferred_agent_ids') and preferred_agent_boost=body.get('preferred_agent_boost', 1.2) to _svc.memory_scored_search()",
+        "No other scored-search call sites in the router are missed (check all usages of memory_scored_search in that file)",
+        "ruff check passes on the changed file"
+      ],
+      "state": "todo",
+      "priority": 95,
+      "dependencies": ["RC-01"],
+      "requiredCapabilities": ["filesystem.write"],
+      "executionPolicy": {
+        "maxAttempts": 2,
+        "timeoutSeconds": 300,
+        "requiresHumanApproval": false,
+        "allowedSideEffects": ["local_filesystem_write"],
+        "networkAccess": "none",
+        "retryPolicy": {"strategy": "exponential_backoff", "retryOn": ["transient_error"]}
+      },
+      "risk": {
+        "level": "low",
+        "reasons": [
+          "body.get() with defaults is safe — missing keys return None/default, existing callers unaffected",
+          "storage_client already POSTs the dict as-is, no client changes needed"
+        ]
+      },
+      "resourceLocks": [],
+      "version": 1,
+      "attempt": 0,
+      "parentId": null,
+      "artifacts": [],
+      "failure": null,
+      "payload": {
+        "file": "core-storage-api/src/core_storage_api/routers/memories.py",
+        "change": "At the /scored-search endpoint (line ~130), add preferred_agent_ids=body.get('preferred_agent_ids') and preferred_agent_boost=body.get('preferred_agent_boost', 1.2) to the _svc.memory_scored_search() call. Check lines ~242 and ~318 for other memory_scored_search call sites in the same file and apply the same params."
+      }
+    },
+    {
+      "id": "RC-03",
+      "kind": "software.implementation",
+      "objective": "Update CrossContextEnrich to auto-populate preferred_agent_ids from caller_agent_id so phase 2 automatically biases toward the caller's own project without any MCP tool API change.",
+      "acceptanceCriteria": [
+        "cross_context_enrich.py search_p2 dict includes preferred_agent_ids=[data['caller_agent_id']] when data.get('caller_agent_id') is not None, else the key is absent",
+        "Existing ponytail comment (line 56) is updated to note the preferred_agent_ids addition",
+        "When caller_agent_id is None (anonymous call), search_p2 has no preferred_agent_ids key — no boost applied",
+        "ruff check passes on the changed file"
+      ],
+      "state": "todo",
+      "priority": 90,
+      "dependencies": ["RC-02"],
+      "requiredCapabilities": ["filesystem.write"],
+      "executionPolicy": {
+        "maxAttempts": 2,
+        "timeoutSeconds": 300,
+        "requiresHumanApproval": false,
+        "allowedSideEffects": ["local_filesystem_write"],
+        "networkAccess": "none",
+        "retryPolicy": {"strategy": "exponential_backoff", "retryOn": ["transient_error"]}
+      },
+      "risk": {
+        "level": "low",
+        "reasons": [
+          "caller_agent_id is already in ctx.data (memory_service.py line 3164)",
+          "Adding one key to search_p2 dict is safe — storage ignores unknown keys via body.get()"
+        ]
+      },
+      "resourceLocks": [],
+      "version": 1,
+      "attempt": 0,
+      "parentId": null,
+      "artifacts": [],
+      "failure": null,
+      "payload": {
+        "file": "core-api/src/core_api/pipeline/steps/search/cross_context_enrich.py",
+        "change": "In search_p2 dict (line ~49-57): add 'preferred_agent_ids': [data['caller_agent_id']] if data.get('caller_agent_id') else key absent. Update the ponytail comment to: '# ponytail: no caller_agent_id → scope_team/scope_org only; preferred_agent_ids boosts same-project hits'"
+      }
+    },
+    {
+      "id": "RC-04",
+      "kind": "software.testing",
+      "objective": "Add tests proving (a) preferred_agent_ids boost ranks same-agent rows higher in postgres_service, and (b) CrossContextEnrich passes caller_agent_id as preferred_agent_ids in the phase 2 search payload.",
+      "acceptanceCriteria": [
+        "test_preferred_agent_boost: given two scope_team rows with equal similarity, the one matching preferred_agent_ids scores higher after boost",
+        "test_cross_context_enrich_passes_preferred: mock sc.scored_search, run CrossContextEnrich with caller_agent_id set, assert search_p2 sent to scored_search contains preferred_agent_ids=[caller_agent_id]",
+        "test_cross_context_enrich_no_preferred_when_anon: caller_agent_id=None → preferred_agent_ids absent from search_p2",
+        "All three tests pass: pytest tests/test_recall_context.py -q",
+        "No existing tests broken: pytest tests/ -q (excluding pre-existing failures in test_integration.py)"
+      ],
+      "state": "todo",
+      "priority": 80,
+      "dependencies": ["RC-03"],
+      "requiredCapabilities": ["filesystem.write"],
+      "executionPolicy": {
+        "maxAttempts": 2,
+        "timeoutSeconds": 600,
+        "requiresHumanApproval": false,
+        "allowedSideEffects": ["local_filesystem_write"],
+        "networkAccess": "none",
+        "retryPolicy": {"strategy": "exponential_backoff", "retryOn": ["transient_error"]}
+      },
+      "risk": {
+        "level": "low",
+        "reasons": ["Test-only changes, no production code affected"]
+      },
+      "resourceLocks": [],
+      "version": 1,
+      "attempt": 0,
+      "parentId": null,
+      "artifacts": [],
+      "failure": null,
+      "payload": {
+        "new_file": "tests/test_recall_context.py",
+        "note": "postgres_service boost test can use direct SQL or mock the CASE expression. CrossContextEnrich tests mock get_storage_client() and inspect the call args."
+      }
+    },
+    {
+      "id": "RC-05",
+      "kind": "software.deploy",
+      "objective": "Deploy to 192.168.1.53 and verify phase 2 same-project bias works end-to-end: write two scope_team memories from different agent_ids with similar content, recall with cross_context=true, confirm the same-agent one ranks first.",
+      "acceptanceCriteria": [
+        "docker compose build core-api + core-storage-api succeeds on 192.168.1.53",
+        "docker compose up -d brings both containers healthy",
+        "memclaw_recall with cross_context=true returns phase 2 hits where same-agent memories rank above cross-agent memories of comparable similarity",
+        "memclaw_recall with cross_context=false is unchanged (source_type=null for all, no preferred_agent_ids in play)"
+      ],
+      "state": "todo",
+      "priority": 70,
+      "dependencies": ["RC-04"],
+      "requiredCapabilities": ["network.ssh", "docker.compose"],
+      "executionPolicy": {
+        "maxAttempts": 2,
+        "timeoutSeconds": 600,
+        "requiresHumanApproval": true,
+        "allowedSideEffects": ["remote_docker_restart"],
+        "networkAccess": "ssh:192.168.1.53",
+        "retryPolicy": {"strategy": "manual", "retryOn": ["build_failure"]}
+      },
+      "risk": {
+        "level": "medium",
+        "reasons": [
+          "Restarts core-api and core-storage-api containers — brief downtime",
+          "core-storage-api restart affects all tenants on .53"
+        ]
+      },
+      "resourceLocks": [
+        {"resource": "192.168.1.53:core-api", "mode": "write"},
+        {"resource": "192.168.1.53:core-storage-api", "mode": "write"}
+      ],
+      "version": 1,
+      "attempt": 0,
+      "parentId": null,
+      "artifacts": [],
+      "failure": null,
+      "payload": {
+        "deploy_command": "ssh 192.168.1.53 \"cd ~/dev/caura-memclaw && git pull && docker compose build core-api core-storage-api && docker compose up -d core-api core-storage-api\""
+      }
+    },
+    {
+      "id": "RC-Z01",
+      "kind": "content.generation",
+      "objective": "Write SPRINT-RECALL-CONTEXT_SIGNOFF.md recording task outcomes, file changes, verification results, and backlog.",
+      "acceptanceCriteria": [
+        "sprints/sprint-recall-context/SPRINT-RECALL-CONTEXT_SIGNOFF.md exists",
+        "All RC-01..RC-05 outcomes recorded (state, commit, notes)",
+        "Verification section includes actual test run output",
+        "Backlog section lists any deferred items"
+      ],
+      "state": "todo",
+      "priority": 60,
+      "dependencies": ["RC-05"],
+      "requiredCapabilities": ["filesystem.write"],
+      "executionPolicy": {
+        "maxAttempts": 1,
+        "timeoutSeconds": 300,
+        "requiresHumanApproval": false,
+        "allowedSideEffects": ["local_filesystem_write"],
+        "networkAccess": "none",
+        "retryPolicy": {"strategy": "none", "retryOn": []}
+      },
+      "risk": {
+        "level": "low",
+        "reasons": ["Documentation only"]
+      },
+      "resourceLocks": [],
+      "version": 1,
+      "attempt": 0,
+      "parentId": null,
+      "artifacts": [],
+      "failure": null,
+      "payload": {
+        "file": "sprints/sprint-recall-context/SPRINT-RECALL-CONTEXT_SIGNOFF.md"
+      }
+    }
+  ],
+  "validation": {
+    "status": "valid",
+    "errors": [],
+    "warnings": [
+      "RC-05 restarts core-storage-api which affects all tenants — schedule during low-traffic window",
+      "preferred_agent_boost default of 1.2 is arbitrary; tune after observing real ranking behaviour"
+    ]
+  },
+  "metrics": {
+    "totalWorkItems": 6,
+    "estimatedDurationDays": 1,
+    "criticalPathWorkItems": ["RC-01", "RC-02", "RC-03", "RC-04", "RC-05"],
+    "highRiskWorkItems": [],
+    "mediumRiskWorkItems": ["RC-05"]
+  }
+}
