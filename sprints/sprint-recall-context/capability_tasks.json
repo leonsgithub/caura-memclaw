@@ -16,7 +16,7 @@
         "Boost is applied AFTER all existing multipliers (freshness, recall_boost, temporal_boost, status_penalty) so it does not interfere with their semantics",
         "ruff check passes on the changed file"
       ],
-      "state": "todo",
+      "state": "completed",
       "priority": 100,
       "dependencies": [],
       "requiredCapabilities": ["filesystem.write"],
@@ -57,7 +57,7 @@
         "No other scored-search call sites in the router are missed (check all usages of memory_scored_search in that file)",
         "ruff check passes on the changed file"
       ],
-      "state": "todo",
+      "state": "completed",
       "priority": 95,
       "dependencies": ["RC-01"],
       "requiredCapabilities": ["filesystem.write"],
@@ -97,7 +97,7 @@
         "When caller_agent_id is None (anonymous call), search_p2 has no preferred_agent_ids key — no boost applied",
         "ruff check passes on the changed file"
       ],
-      "state": "todo",
+      "state": "completed",
       "priority": 90,
       "dependencies": ["RC-02"],
       "requiredCapabilities": ["filesystem.write"],
@@ -138,7 +138,7 @@
         "All three tests pass: pytest tests/test_recall_context.py -q",
         "No existing tests broken: pytest tests/ -q (excluding pre-existing failures in test_integration.py)"
       ],
-      "state": "todo",
+      "state": "completed",
       "priority": 80,
       "dependencies": ["RC-03"],
       "requiredCapabilities": ["filesystem.write"],

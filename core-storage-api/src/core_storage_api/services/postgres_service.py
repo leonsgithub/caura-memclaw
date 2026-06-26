@@ -1066,6 +1066,8 @@ class PostgresService:
         date_range_start: str | None = None,
         date_range_end: str | None = None,
         readable_tenant_ids: list[str] | None = None,
+        preferred_agent_ids: list[str] | None = None,
+        preferred_agent_boost: float = 1.2,
     ) -> list[SimpleNamespace]:
         """Execute the full CTE-based scored search with entity-link JOIN.
 
@@ -1261,6 +1263,15 @@ class PostgresService:
         else:
             currency_factor = literal_column("1.0").label("currency_factor")
 
+        # ponytail: soft project bias — same agent_id rows rank higher in phase 2 cross-context
+        if preferred_agent_ids:
+            preferred_boost_expr = case(
+                (Memory.agent_id.in_(preferred_agent_ids), preferred_agent_boost),
+                else_=1.0,
+            )
+        else:
+            preferred_boost_expr = literal_column("1.0")
+
         if boosted_memory_ids and memory_boost_factor:
             boost_tiers: dict[float, list[UUID]] = {}
             for mid, factor in memory_boost_factor.items():
@@ -1278,6 +1289,7 @@ class PostgresService:
                 * date_range_boost
                 * currency_factor
                 * status_penalty
+                * preferred_boost_expr
             ).label("score")
         else:
             score = (
@@ -1288,6 +1300,7 @@ class PostgresService:
                 * date_range_boost
                 * currency_factor
                 * status_penalty
+                * preferred_boost_expr
             ).label("score")
 
         # -- Build scored CTE --

@@ -46,6 +46,7 @@ class CrossContextEnrich:
         ratio = data.get("cc_ratio", 0.3)
         discount = data.get("cc_discount", 0.85)
 
+        # ponytail: no caller_agent_id → scope_team/scope_org only; preferred_agent_ids boosts same-project hits
         search_p2: dict = {
             "tenant_id": data["tenant_id"],
             "query": data["query"],
@@ -53,8 +54,9 @@ class CrossContextEnrich:
             "search_params": data["search_params"],
             "top_k": top_m * SEARCH_OVERFETCH_FACTOR,
             "recall_boost_enabled": data.get("recall_boost_enabled", True),
-            # ponytail: no caller_agent_id → storage filters to scope_team + scope_org only
         }
+        if data.get("caller_agent_id"):
+            search_p2["preferred_agent_ids"] = [data["caller_agent_id"]]
         readable = data.get("readable_tenant_ids")
         if readable and readable != [data["tenant_id"]]:
             search_p2["readable_tenant_ids"] = readable
