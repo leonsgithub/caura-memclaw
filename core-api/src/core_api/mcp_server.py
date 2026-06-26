@@ -2515,6 +2515,76 @@ async def memclaw_export(
             return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
 
 
+# ── BP-05: Review low-rated ───────────────────────────────────────────────────
+
+async def memclaw_review(
+    threshold: Annotated[float, Field(description="Max weight to flag (0–1, default 0.4). Memories at or below this are returned.")] = 0.4,
+    limit: Annotated[int, Field(description="Max records to return (1–100, default 50).")] = 50,
+    scope: Annotated[str, Field(description="agent (own only, default) | all (tenant-wide).")] = "agent",
+    agent_id: Annotated[str, Field(description="Caller agent.")] = _DEFAULT_AGENT_ID,
+) -> str:
+    """Read-only curation surface: return memories flagged by low weight,
+    sorted ascending (worst first). Mirrors Brain review_low_rated.
+    scope='agent' restricts to caller's own memories; 'all' covers the full
+    tenant. No mutations — act on results via memclaw_manage."""
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    if scope not in {"agent", "all"}:
+        return _with_latency(_error_response("INVALID_ARGUMENTS", "scope must be 'agent' or 'all'."), t0)
+    capped_limit = max(1, min(int(limit), 100))
+    tenant_id = _get_tenant()
+    sc = get_storage_client()
+    async with _no_db():
+        try:
+            effective_written_by = agent_id if scope == "agent" else None
+            payload: dict[str, Any] = {
+                "tenant_id": tenant_id,
+                "caller_agent_id": agent_id,
+                "fleet_id": None,
+                "written_by": effective_written_by,
+                "memory_type": None,
+                "status": "active",
+                "weight_min": None,
+                "weight_max": threshold,
+                "created_after": None,
+                "created_before": None,
+                "include_deleted": False,
+                "sort": "weight",
+                "order": "asc",
+                "limit": capped_limit,
+                "cursor_ts": None,
+                "cursor_id": None,
+                "readable_tenant_ids": None,
+            }
+            rows = await sc.list_memories_by_filters(payload)
+            flagged = [
+                {
+                    "id": str(r.get("id", "")),
+                    "content": r.get("content", ""),
+                    "type": r.get("memory_type", ""),
+                    "weight": r.get("weight", 0.5),
+                    "recall_count": r.get("recall_count", 0),
+                    "created_at": r.get("created_at", ""),
+                    "agent_id": r.get("agent_id", ""),
+                    "status": r.get("status", ""),
+                }
+                for r in rows
+            ]
+            return _with_latency(
+                json.dumps({"count": len(flagged), "threshold": threshold, "flagged": flagged}, default=str),
+                t0,
+            )
+        except HTTPException as e:
+            logger.warning("MCP review error (%s): %s", e.status_code, e.detail)
+            return _with_latency(_error_response(code_for_status(e.status_code), str(e.detail)), t0)
+        except httpx.HTTPStatusError as e:
+            return _storage_error_envelope(e, t0)
+        except Exception as e:
+            logger.error("MCP review error: %s", e, exc_info=True)
+            return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
+
+
 async def memclaw_stats(
     scope: Annotated[
         str,

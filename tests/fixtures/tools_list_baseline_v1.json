@@ -1278,6 +1278,46 @@
     "execution": null
   },
   {
+    "name": "memclaw_review",
+    "title": null,
+    "description": "Read-only curation surface. Returns memories flagged by low weight, sorted ascending (worst-rated first). threshold: max weight to include (default 0.4). scope: agent (own only, default) | all (full tenant). Each record includes weight + recall_count as triage signals. Act on results via memclaw_manage (transition to outdated/archived). Mirrors Brain review_low_rated.",
+    "inputSchema": {
+      "properties": {
+        "threshold": {
+          "default": 0.4,
+          "description": "Max weight to flag (0\u20131, default 0.4). Memories at or below this are returned.",
+          "title": "Threshold",
+          "type": "number"
+        },
+        "limit": {
+          "default": 50,
+          "description": "Max records to return (1\u2013100, default 50).",
+          "title": "Limit",
+          "type": "integer"
+        },
+        "scope": {
+          "default": "agent",
+          "description": "agent (own only, default) | all (tenant-wide).",
+          "title": "Scope",
+          "type": "string"
+        },
+        "agent_id": {
+          "default": "mcp-agent",
+          "description": "Caller agent.",
+          "title": "Agent Id",
+          "type": "string"
+        }
+      },
+      "title": "memclaw_reviewArguments",
+      "type": "object"
+    },
+    "outputSchema": null,
+    "icons": null,
+    "annotations": null,
+    "meta": null,
+    "execution": null
+  },
+  {
     "name": "memclaw_stats",
     "title": null,
     "description": "Aggregate counts of memories: total + breakdowns by type, agent, status. scope='agent' (default) counts only memories visible to YOU (trust \u2265 1); scope='fleet'/'all' aggregates across agents (trust \u2265 2). Counts exclude soft-deleted memories by default; set include_deleted=true for additional 'deleted' and 'total_including_deleted' fields. Read-only \u2014 useful for self-introspection and dashboard-style summaries.",

@@ -46,6 +46,8 @@ EXPECTED_PLUGIN_EXPOSED = {
     "memclaw_env",
     # BP-04: bulk export.
     "memclaw_export",
+    # BP-05: low-weight curation surface.
+    "memclaw_review",
 }
 
 # MCP-only tools — not surfaced through the plugin. ``memclaw_keystones_set``

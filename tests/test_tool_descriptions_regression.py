@@ -17,8 +17,8 @@ import pytest
 pytestmark = pytest.mark.unit
 
 FIXTURES = Path(__file__).parent / "fixtures"
-# 12 v1 tools + 4 procedural-memory tools + memclaw_env (BP-03) + memclaw_export (BP-04).
-EXPECTED_TOOL_COUNT = 18
+# 12 v1 tools + 4 procedural-memory tools + memclaw_env (BP-03) + memclaw_export (BP-04) + memclaw_review (BP-05).
+EXPECTED_TOOL_COUNT = 19
 
 
 @pytest.mark.asyncio
