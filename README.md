@@ -161,6 +161,7 @@ OPENAI_API_KEY=sk-...
 | **Anthropic** | `EMBEDDING_PROVIDER=openai`<br>`ENTITY_EXTRACTION_PROVIDER=anthropic` | `ANTHROPIC_API_KEY` + `OPENAI_API_KEY` |
 | **OpenRouter** | `EMBEDDING_PROVIDER=openai`<br>`ENTITY_EXTRACTION_PROVIDER=openrouter` | `OPENROUTER_API_KEY` + `OPENAI_API_KEY` |
 | **Self-hosted (TEI / bge-m3)** | `--profile embed-local` + `OPENAI_EMBEDDING_BASE_URL=http://tei:80/v1`<br>+ `OPENAI_EMBEDDING_MODEL=BAAI/bge-m3`<br>+ `OPENAI_EMBEDDING_SEND_DIMENSIONS=false` | none — runs locally |
+| **Ollama** | `EMBEDDING_PROVIDER=ollama`<br>`OLLAMA_EMBEDDING_URL=http://localhost:11434/v1` (default)<br>`OLLAMA_EMBEDDING_MODEL=mxbai-embed-large` (default) | none — runs locally |
 
 Anthropic, Gemini, and OpenRouter don't offer embedding APIs here — pair them with OpenAI (or with TEI) for embeddings. You can mix providers freely. Gemini uses the [Google AI Studio](https://aistudio.google.com/) key-auth Developer API (no GCP project/ADC required). The self-hosted TEI row keeps `EMBEDDING_PROVIDER=openai` because TEI speaks the same OpenAI-compatible API; see [`docs/local-embedder.md`](docs/local-embedder.md) for hardware sizing, GPU setup, and model swapping.
 
@@ -351,7 +352,7 @@ See [`clients/typescript/`](clients/typescript/) for the full client.
 ### Governance
 
 - **Tenant isolation** — row-level database separation per tenant; PII auto-detected and flagged on every write (surfaced in memory metadata as `contains_pii`/`pii_types`)
-- **Visibility scopes** — every memory is stamped at write time: `scope_agent` (private), `scope_team` (fleet-wide, default), or `scope_org` (cross-fleet). Cross-fleet recall is permissioned, not open
+- **Visibility scopes** — every memory is stamped at write time: `scope_agent` (private, **default**), `scope_team` (fleet-wide), or `scope_org` (cross-fleet). Cross-fleet recall is permissioned, not open
 - **Agent trust tiers** — four levels control cross-fleet reads, writes, and deletes. Agents are either provisioned atomically via `POST /admin/agent-keys/provision` (recommended — mints key + row + trust + fleet in one call) or auto-registered on first write (legacy fallback)
 - **Full audit log** — every write, delete, and transition logged with tenant and scope context
 
@@ -373,6 +374,10 @@ See [`clients/typescript/`](clients/typescript/) for the full client.
 - **MCP server** — built-in [Model Context Protocol](https://modelcontextprotocol.io) at `/mcp` (Streamable HTTP). Connect Claude Desktop, Claude Code, Cursor, Windsurf, or any MCP client with a URL and API key
 - **Multi-provider LLM** — primary + fallback provider chain per tenant (OpenAI, Gemini, Anthropic, OpenRouter) with platform defaults for zero-config tenants
 - **Document store** — structured JSONB collections alongside semantic memories for exact-field lookups (customer records, config, task lists)
+- **Ollama embedder** — `EMBEDDING_PROVIDER=ollama` routes through any Ollama-compatible `/v1/embeddings` endpoint; defaults to `mxbai-embed-large` at `localhost:11434` with no cloud key required
+- **Redis recall cache** — recall results cached 5 minutes by default, keyed per agent; bypassed automatically when `cross_context=True` or `filter_agent_id` is set
+- **`memclaw_session_start`** — zero-latency context injection on session open: returns top-5 memories by weight, active keystones, and procedures with ≥ 60% success rate in one call
+- **`memclaw-init` CLI** — `python -m cli.memclaw_init --url <url>` pings `/health`, verifies agent registration, and prints the ready-to-paste MCP config block for `~/.claude/settings.json`
 
 ---
 
@@ -490,7 +495,7 @@ The client discovers 19 tools automatically:
 ### Install the skill (Claude Code & Codex)
 
 Install MemClaw's usage guide as a **skill** so your agent knows *when* and
-*how* to use the 19 tools — the memory/doc mental model, the three rules
+*how* to use the 20 tools — the memory/doc mental model, the three rules
 (recall, write, supersede), trust levels, common patterns, and
 anti-patterns. The skill is loaded on-demand (not per-turn), so it costs
 nothing until the agent reaches for MemClaw.
@@ -878,7 +883,9 @@ All configuration is via environment variables or `.env`. See `.env.example` for
 | `POSTGRES_DB` | `memclaw` | Database name |
 | `POSTGRES_USE_IAM_AUTH` | `false` | Use GCP IAM for DB auth (managed Postgres on GCP only) |
 | `ADMIN_API_KEY` | *(empty)* | Admin API key — bypasses tenant enforcement |
-| `EMBEDDING_PROVIDER` | `openai` | `openai`, `local`, or `fake` |
+| `EMBEDDING_PROVIDER` | `openai` | `openai`, `ollama`, `local`, or `fake` |
+| `OLLAMA_EMBEDDING_URL` | `http://localhost:11434/v1` | Ollama base URL (only used when `EMBEDDING_PROVIDER=ollama`) |
+| `OLLAMA_EMBEDDING_MODEL` | `mxbai-embed-large` | Ollama embedding model (only used when `EMBEDDING_PROVIDER=ollama`) |
 | `ENTITY_EXTRACTION_PROVIDER` | `openai` | `openai`, `gemini`, `anthropic`, `openrouter`, `fake`, or `none` |
 | `ENTITY_EXTRACTION_MODEL` | `gpt-5.4-nano` | LLM model for enrichment and entity extraction |
 | `OPENAI_API_KEY` | — | Required for OpenAI embeddings and enrichment |
@@ -908,7 +915,7 @@ memclaw/
 ├── core-api/                      # Main FastAPI service
 │   └── src/core_api/
 │       ├── app.py                 # FastAPI app, lifespan, middleware
-│       ├── mcp_server.py          # MCP server (Streamable HTTP, 19 tools)
+│       ├── mcp_server.py          # MCP server (Streamable HTTP, 20 tools)
 │       ├── constants.py           # Tool descriptions, limits, ranking params
 │       ├── config.py              # Settings (env vars)
 │       ├── auth.py                # API key + JWT auth, tenant enforcement
@@ -1136,7 +1143,7 @@ tools don't address. See [How MemClaw compares](#how-memclaw-compares).
 
 **Does MemClaw work with Claude Desktop, Claude Code, Cursor, or Windsurf?**
 Yes — MemClaw is MCP-native. Paste a JSON config with a URL and API key
-into any MCP client and 19 tools appear immediately.
+into any MCP client and 20 tools appear immediately.
 
 **Can agents from different vendors share memory?**
 Yes — that's the point. An Anthropic agent recalls what an OpenAI agent
@@ -1144,7 +1151,7 @@ wrote, under the same governance rules — with trust tiers and visibility
 scopes deciding what crosses fleet boundaries.
 
 **Is MemClaw really free?**
-The full engine — storage, 19 MCP tools, plugin, audit trail — is Apache
+The full engine — storage, 20 MCP tools, plugin, audit trail — is Apache
 2.0. Run it yourself forever. The managed platform at
 [memclaw.net](https://memclaw.net) adds hosting, scaling, and enterprise
 governance for teams that don't want to operate infrastructure.

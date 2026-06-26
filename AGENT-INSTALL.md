@@ -208,8 +208,9 @@ Once connected via MCP or the OpenClaw plugin, you have these tools:
 | `memclaw_env` | Stable-infra fact store (URLs, ports, hostnames): `upsert` \| `get` \| `list` \| `verify` |
 | `memclaw_export` | Bulk-export memories (JSON/JSONL, cursor-paginated). Trust ≥ 1. Scope: `agent` \| `team` \| `org` \| `all` |
 | `memclaw_review` | Read-only curation: memories below a weight threshold, sorted ascending (worst-rated first) |
+| `memclaw_session_start` | Zero-latency context injection on session open: returns top-5 memories by weight, active keystones, and procedures with ≥ 60% success rate |
 
-MCP exposes all 19 tools; the OpenClaw plugin surfaces 18 — every tool except
+MCP exposes all 20 tools; the OpenClaw plugin surfaces 19 — every tool except
 `memclaw_keystones_set` (the admin authoring path is not plugin-exposed). Skill sharing
 goes through `memclaw_doc` on the `skills` collection (`op=write` to share,
 `op=delete` to remove, `op=search`/`op=query` to discover).
@@ -232,7 +233,7 @@ Then restart the server (`docker compose restart app` or re-run uvicorn).
 
 - A local MemClaw server with full API + MCP
 - A single-tenant standalone setup (or admin-keyed multi-tenant, depending on which path you picked)
-- 19 tools ready to use (memory ops + document store + Karpathy Loop + stats + keystone governance + procedural memory + env truths + bulk export + curation surface; skill sharing rides on `memclaw_doc collection=skills`)
+- 20 tools ready to use (memory ops + document store + Karpathy Loop + stats + keystone governance + procedural memory + env truths + bulk export + curation surface + session-start warm context; skill sharing rides on `memclaw_doc collection=skills`)
 - PostgreSQL with pgvector for semantic search
 - No external dependencies (fake providers, no API keys needed)
 - Full read/write access to your own memory store
