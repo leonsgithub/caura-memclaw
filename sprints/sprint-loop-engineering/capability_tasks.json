@@ -1,6 +1,6 @@
 {
   "planId": "SPRINT-LOOP-ENGINEERING-PLAN",
-  "sprintGoal": "Make MemClaw a faithful Memory organ inside a Loop Engineering loop — NOT the whole loop. The Loop Engineering working note (Loop-Engineering-IEEE.pdf / Orange Book) is explicit that loop engineering is 'a set of capabilities, not a product': the loop's six organs (automations=scheduling, worktrees=handoff, skills=discovery, connectors, sub-agents=verification, memory=persistence) live in the HARNESS (Claude Code: /loop, --worktree, SKILL.md, MCP, .claude/agents + /goal, on-disk state). MemClaw is exactly ONE of those organs: Memory/Persistence. The original draft of this sprint over-reached — it had the memory store grow a scheduler (propulsion cron), an invented Turn-Distance Cost metric, and an in-process subprocess evaluator, i.e. one organ colonizing three the harness already owns natively. Those are dropped (see metrics.droppedFromOriginalDraft). The ONE genuine, in-lane gap this sprint closes is the paper's central failure mode — the 'Nodding Loop' (§VI.A): an agent that grades its own homework. Today memclaw_procedure_record drives reliability purely from the self-reported outcome_type, and the validation_passed field it already accepts (mcp_server.py:~3098) is silently DROPPED. This sprint makes the harness's independent evaluator (the separate-agent reviewer of Fig. 3) able to record a VERIFIED outcome that MemClaw distinguishes from a merely CLAIMED one, so procedure reliability reflects real test results — closing the 'verification debt' the paper warns accumulates between 'runs' and 'right' (§VIII).",
+  "sprintGoal": "Make MemClaw a faithful Memory organ inside a Loop Engineering loop \u2014 NOT the whole loop. The Loop Engineering working note (Loop-Engineering-IEEE.pdf / Orange Book) is explicit that loop engineering is 'a set of capabilities, not a product': the loop's six organs (automations=scheduling, worktrees=handoff, skills=discovery, connectors, sub-agents=verification, memory=persistence) live in the HARNESS (Claude Code: /loop, --worktree, SKILL.md, MCP, .claude/agents + /goal, on-disk state). MemClaw is exactly ONE of those organs: Memory/Persistence. The original draft of this sprint over-reached \u2014 it had the memory store grow a scheduler (propulsion cron), an invented Turn-Distance Cost metric, and an in-process subprocess evaluator, i.e. one organ colonizing three the harness already owns natively. Those are dropped (see metrics.droppedFromOriginalDraft). The ONE genuine, in-lane gap this sprint closes is the paper's central failure mode \u2014 the 'Nodding Loop' (\u00a7VI.A): an agent that grades its own homework. Today memclaw_procedure_record drives reliability purely from the self-reported outcome_type, and the validation_passed field it already accepts (mcp_server.py:~3098) is silently DROPPED. This sprint makes the harness's independent evaluator (the separate-agent reviewer of Fig. 3) able to record a VERIFIED outcome that MemClaw distinguishes from a merely CLAIMED one, so procedure reliability reflects real test results \u2014 closing the 'verification debt' the paper warns accumulates between 'runs' and 'right' (\u00a7VIII).",
   "correlationId": "SPRINT-LOOP-ENGINEERING",
   "createdAt": "2026-06-26T00:00:00Z",
   "createdBy": "claude-code",
@@ -8,55 +8,76 @@
     {
       "id": "LE-01",
       "kind": "software.feature",
-      "objective": "Stop dropping verification provenance in memclaw_procedure_record. The handler already declares validation_passed (mcp_server.py:~3098) but never reads it — reliability moves purely on the self-reported outcome_type (the 'Nodding Loop'). Wire validation_passed through so an outcome carries whether it was independently VERIFIED, persist a small verified/unverified counter split on procedure_stats, and surface a 'verified_reliability' alongside the existing self-reported reliability_score. No new table, no subprocess execution, no evaluator agent inside MemClaw — the harness's reviewer agent runs the tests and reports the verdict here; MemClaw only remembers it honestly.",
+      "objective": "Stop dropping verification provenance in memclaw_procedure_record. The handler already declares validation_passed (mcp_server.py:~3098) but never reads it \u2014 reliability moves purely on the self-reported outcome_type (the 'Nodding Loop'). Wire validation_passed through so an outcome carries whether it was independently VERIFIED, persist a small verified/unverified counter split on procedure_stats, and surface a 'verified_reliability' alongside the existing self-reported reliability_score. No new table, no subprocess execution, no evaluator agent inside MemClaw \u2014 the harness's reviewer agent runs the tests and reports the verdict here; MemClaw only remembers it honestly.",
       "acceptanceCriteria": [
         "Migration 029 adds two columns to procedure_stats: verified_success_count (integer NOT NULL DEFAULT 0) and verified_failure_count (integer NOT NULL DEFAULT 0). No other schema change. Migration is additive and reversible (down() drops the two columns); runs cleanly on top of 028 and is a no-op on a second `alembic upgrade head`",
         "common/models/procedure.py ProcedureStats gains verified_success_count and verified_failure_count mapped columns matching the migration",
-        "memclaw_procedure_record reads validation_passed: when validation_passed is True, the outcome ALSO increments verified_success_count (on success) or verified_failure_count (on failure); when validation_passed is False or None, only the existing success_count/failure_count move (current behavior preserved exactly — backwards compatible)",
+        "memclaw_procedure_record reads validation_passed: when validation_passed is True, the outcome ALSO increments verified_success_count (on success) or verified_failure_count (on failure); when validation_passed is False or None, only the existing success_count/failure_count move (current behavior preserved exactly \u2014 backwards compatible)",
         "The response JSON gains verified_reliability = compute_reliability(verified_success_count, verified_failure_count) computed from the verified counters only, returned alongside the existing reliability_score; when there are zero verified outcomes verified_reliability is null (not 0.5) so callers can tell 'no independent verification yet' from 'verified and reliable'",
         "core-api test: record success with validation_passed=None -> success_count=1, verified_success_count=0, verified_reliability=null (proves the self-reported path is unchanged); record success with validation_passed=True -> success_count=2, verified_success_count=1, verified_reliability reflects the verified counters; record failure with validation_passed=True -> verified_failure_count=1 and verified_reliability drops",
-        "Quarantine logic is unchanged in THIS task (still driven by the combined success/failure counts) — verified counters are additive telemetry only. Any change to let verified failures quarantine faster is explicitly deferred (see LE-02)"
+        "Quarantine logic is unchanged in THIS task (still driven by the combined success/failure counts) \u2014 verified counters are additive telemetry only. Any change to let verified failures quarantine faster is explicitly deferred (see LE-02)"
       ],
-      "state": "todo",
+      "state": "done",
       "priority": 100,
       "dependencies": [],
-      "requiredCapabilities": ["filesystem.write", "database.write"],
+      "requiredCapabilities": [
+        "filesystem.write",
+        "database.write"
+      ],
       "executionPolicy": {
         "maxAttempts": 2,
         "timeoutSeconds": 1800,
         "requiresHumanApproval": false,
-        "allowedSideEffects": ["local_filesystem_write", "database_migration"],
+        "allowedSideEffects": [
+          "local_filesystem_write",
+          "database_migration"
+        ],
         "networkAccess": "none",
-        "retryPolicy": {"strategy": "exponential_backoff", "retryOn": ["transient_error", "timeout"]}
+        "retryPolicy": {
+          "strategy": "exponential_backoff",
+          "retryOn": [
+            "transient_error",
+            "timeout"
+          ]
+        }
       },
       "risk": {
         "level": "low",
         "reasons": [
           "Purely additive: two integer columns + reading a parameter that is already in the tool signature but currently ignored",
-          "Existing self-reported path is preserved byte-for-byte when validation_passed is None/False — no behavior change for current callers",
-          "No subprocess execution, no new agent, no scheduling — stays entirely within MemClaw's Memory organ. Rollback: down-migration drops two columns; verified_reliability field is inert"
+          "Existing self-reported path is preserved byte-for-byte when validation_passed is None/False \u2014 no behavior change for current callers",
+          "No subprocess execution, no new agent, no scheduling \u2014 stays entirely within MemClaw's Memory organ. Rollback: down-migration drops two columns; verified_reliability field is inert"
         ]
       },
       "resourceLocks": [
-        {"resource": "core-storage-api:migrations", "mode": "write"},
-        {"resource": "core-api:mcp_server", "mode": "write"},
-        {"resource": "common:procedure_model", "mode": "write"}
+        {
+          "resource": "core-storage-api:migrations",
+          "mode": "write"
+        },
+        {
+          "resource": "core-api:mcp_server",
+          "mode": "write"
+        },
+        {
+          "resource": "common:procedure_model",
+          "mode": "write"
+        }
       ],
       "version": 1,
-      "attempt": 0,
+      "attempt": 1,
       "parentId": null,
       "artifacts": [],
       "failure": null,
       "payload": {
         "model_after": [
-          "core-api/src/core_api/mcp_server.py memclaw_procedure_record (~line 3089) — the handler that already accepts validation_passed and drops it",
+          "core-api/src/core_api/mcp_server.py memclaw_procedure_record (~line 3089) \u2014 the handler that already accepts validation_passed and drops it",
           "common/models/procedure.py ProcedureStats (success_count/failure_count/reliability_score pattern)",
-          "core-storage-api/src/core_storage_api/database/migrations/versions/028_procedures.py (latest migration — 029 follows it)",
+          "core-storage-api/src/core_storage_api/database/migrations/versions/028_procedures.py (latest migration \u2014 029 follows it)",
           "core-api/src/core_api/services/procedure_service.py compute_reliability (reused for verified_reliability)"
         ],
         "facts": [
-          "validation_passed is ALREADY a parameter of memclaw_procedure_record but is never read — this task gives it meaning rather than adding new surface",
-          "verified_reliability is null (not 0.5) at zero verified outcomes so 'unverified' is distinguishable from 'verified-and-mediocre' — directly serves the paper's verification-debt signal",
+          "validation_passed is ALREADY a parameter of memclaw_procedure_record but is never read \u2014 this task gives it meaning rather than adding new surface",
+          "verified_reliability is null (not 0.5) at zero verified outcomes so 'unverified' is distinguishable from 'verified-and-mediocre' \u2014 directly serves the paper's verification-debt signal",
           "The harness's evaluator agent (.claude/agents/reviewer.md per Fig. 3) is what sets validation_passed=True after running tests; MemClaw does not run the tests itself"
         ],
         "validation_commands": [
@@ -73,37 +94,51 @@
         "File exists at sprints/sprint-loop-engineering/SPRINT-LOOP-ENGINEERING_SIGNOFF.md",
         "Includes a 'Scope correction' section: the original draft proposed verify_run (subprocess sandbox), cost_audit (invented Turn-Distance Cost Factor), and schedule_loop (propulsion cron); all three were dropped because scheduling, isolated subprocess verification, and the evaluator agent are HARNESS organs the paper assigns outside Memory (cite Loop-Engineering-IEEE Table V + the 'capabilities not a product' thesis)",
         "Task status line for LE-01 (DONE/PARTIAL/PENDING) with the pytest evidence: the three record-outcome cases (validation_passed None vs True-success vs True-failure) and the verified_reliability null-at-zero behavior",
-        "Loop Engineering organ-map table: lists all six organs, marks Memory as MemClaw's lane (memclaw_write/recall/evolve/lifecycle + now verified-outcome reliability), and marks the other five as harness-owned (with the Claude Code primitive that provides each) — making explicit that 100% loop coverage is NOT a MemClaw goal",
+        "Loop Engineering organ-map table: lists all six organs, marks Memory as MemClaw's lane (memclaw_write/recall/evolve/lifecycle + now verified-outcome reliability), and marks the other five as harness-owned (with the Claude Code primitive that provides each) \u2014 making explicit that 100% loop coverage is NOT a MemClaw goal",
         "Sprint close summary states the one capability delivered and lists what was deliberately NOT built and why"
       ],
-      "state": "todo",
+      "state": "done",
       "priority": 10,
-      "dependencies": ["LE-01"],
-      "requiredCapabilities": ["filesystem.write"],
+      "dependencies": [
+        "LE-01"
+      ],
+      "requiredCapabilities": [
+        "filesystem.write"
+      ],
       "executionPolicy": {
         "maxAttempts": 1,
         "timeoutSeconds": 900,
         "requiresHumanApproval": false,
-        "allowedSideEffects": ["local_filesystem_write"],
+        "allowedSideEffects": [
+          "local_filesystem_write"
+        ],
         "networkAccess": "none",
-        "retryPolicy": {"strategy": "none", "retryOn": []}
+        "retryPolicy": {
+          "strategy": "none",
+          "retryOn": []
+        }
       },
       "risk": {
         "level": "low",
-        "reasons": ["Documentation only — no behavior change", "Rollback: N/A"]
+        "reasons": [
+          "Documentation only \u2014 no behavior change",
+          "Rollback: N/A"
+        ]
       },
       "resourceLocks": [],
       "version": 1,
-      "attempt": 0,
+      "attempt": 1,
       "parentId": null,
       "artifacts": [],
       "failure": null,
       "payload": {
         "implementation_notes": [
-          "Lead the signoff with the scope correction — the most important artifact of this sprint is the decision to NOT build five-sixths of the original plan",
+          "Lead the signoff with the scope correction \u2014 the most important artifact of this sprint is the decision to NOT build five-sixths of the original plan",
           "Organ-map must cite the paper so a future reader understands the boundary is principled, not arbitrary"
         ],
-        "evidence_required": ["SPRINT-LOOP-ENGINEERING_SIGNOFF.md committed"]
+        "evidence_required": [
+          "SPRINT-LOOP-ENGINEERING_SIGNOFF.md committed"
+        ]
       }
     }
   ],
@@ -111,7 +146,7 @@
     "status": "valid",
     "errors": [],
     "warnings": [
-      "This sprint is deliberately SMALL (one feature + signoff). That is the point: per Loop-Engineering-IEEE §XII 'a first loop is better small', and MemClaw is one organ of six. Resist re-expanding scope — the dropped items are dropped on principle, not for time.",
+      "This sprint is deliberately SMALL (one feature + signoff). That is the point: per Loop-Engineering-IEEE \u00a7XII 'a first loop is better small', and MemClaw is one organ of six. Resist re-expanding scope \u2014 the dropped items are dropped on principle, not for time.",
       "LE-01 must preserve the existing self-reported reliability path EXACTLY when validation_passed is None/False. The whole value is that an INDEPENDENT verdict (from the harness evaluator) is now distinguishable from a self-graded one; do not let the two counters merge.",
       "MemClaw must NOT execute tests, spawn the evaluator, or schedule anything. Those are harness organs. If a future reader is tempted to add a subprocess runner here, that is precisely the over-reach this sprint corrected."
     ]
@@ -119,26 +154,29 @@
   "metrics": {
     "totalWorkItems": 2,
     "estimatedDurationDays": 1,
-    "criticalPathWorkItems": ["LE-01", "LE-Z01"],
+    "criticalPathWorkItems": [
+      "LE-01",
+      "LE-Z01"
+    ],
     "highRiskWorkItems": [],
     "parallelWorkstreams": [
       "LE-01 (verified-outcome reliability) is the only build item; LE-Z01 signoff follows it"
     ],
     "loopEngineeringOrganMap": {
-      "memory_persistence": "MemClaw's lane — memclaw_write/recall/evolve/lifecycle + (this sprint) verified-vs-claimed outcome reliability on procedures",
-      "automations_scheduling": "HARNESS — Claude Code /loop, Cloud Routines, GitHub Actions. NOT MemClaw.",
-      "worktrees_handoff": "HARNESS — git --worktree. NOT MemClaw.",
-      "skills_discovery": "HARNESS — SKILL.md (MemClaw's Forge mints skill docs, but discovery/invocation is harness-side)",
-      "connectors": "HARNESS/PROTOCOL — MCP (MemClaw is itself reached over MCP)",
-      "subagents_verification": "HARNESS — .claude/agents/reviewer.md + /goal fresh-model stop check. MemClaw only RECORDS the verdict it produces."
+      "memory_persistence": "MemClaw's lane \u2014 memclaw_write/recall/evolve/lifecycle + (this sprint) verified-vs-claimed outcome reliability on procedures",
+      "automations_scheduling": "HARNESS \u2014 Claude Code /loop, Cloud Routines, GitHub Actions. NOT MemClaw.",
+      "worktrees_handoff": "HARNESS \u2014 git --worktree. NOT MemClaw.",
+      "skills_discovery": "HARNESS \u2014 SKILL.md (MemClaw's Forge mints skill docs, but discovery/invocation is harness-side)",
+      "connectors": "HARNESS/PROTOCOL \u2014 MCP (MemClaw is itself reached over MCP)",
+      "subagents_verification": "HARNESS \u2014 .claude/agents/reviewer.md + /goal fresh-model stop check. MemClaw only RECORDS the verdict it produces."
     },
     "droppedFromOriginalDraft": [
-      "memclaw_verify_run (subprocess-sandbox evaluator inside the memory store) — DROPPED: the evaluator is a separate AGENT (Fig. 3), a harness organ, not a function in the Memory store. The in-lane sliver (recording its verdict) survives as LE-01.",
-      "memclaw_cost_audit + Turn-Distance Cost Factor (base_cost*2^(turn_distance/10)) — DROPPED: the formula was INVENTED; the paper's 'cost scales with turns survived' (§II.C) is motivational intuition for why verification matters, not a mechanism it proposes building. Instrumenting a fabricated metric is speculative gold-plating.",
-      "memclaw_schedule_loop + propulsion-ticket worker cron — DROPPED: scheduling is the harness's organ (/loop + Cloud Routines). The draft worker even punted payload execution back to the harness, making it pure duplication."
+      "memclaw_verify_run (subprocess-sandbox evaluator inside the memory store) \u2014 DROPPED: the evaluator is a separate AGENT (Fig. 3), a harness organ, not a function in the Memory store. The in-lane sliver (recording its verdict) survives as LE-01.",
+      "memclaw_cost_audit + Turn-Distance Cost Factor (base_cost*2^(turn_distance/10)) \u2014 DROPPED: the formula was INVENTED; the paper's 'cost scales with turns survived' (\u00a7II.C) is motivational intuition for why verification matters, not a mechanism it proposes building. Instrumenting a fabricated metric is speculative gold-plating.",
+      "memclaw_schedule_loop + propulsion-ticket worker cron \u2014 DROPPED: scheduling is the harness's organ (/loop + Cloud Routines). The draft worker even punted payload execution back to the harness, making it pure duplication."
     ],
     "deferredToNextSprint": [
-      "Letting verified failures quarantine a procedure faster than self-reported ones (a verified-failure could carry more weight in the quarantine rule) — deferred until LE-01's verified counters have real data to tune against"
+      "Letting verified failures quarantine a procedure faster than self-reported ones (a verified-failure could carry more weight in the quarantine rule) \u2014 deferred until LE-01's verified counters have real data to tune against"
     ]
   }
 }
