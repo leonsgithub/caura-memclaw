@@ -231,6 +231,7 @@ def _memory_to_out(
         last_recalled_at=_mem_attr(memory, "last_recalled_at"),
         supersedes_id=_mem_attr(memory, "supersedes_id"),
         superseded_by=contradictions if contradictions else None,
+        source_type=_mem_attr(memory, "source_type"),
     )
 
 
@@ -3076,6 +3077,11 @@ async def search_memories(
     diagnostic_ctx: dict | None = None,
     readable_tenant_ids: list[str] | None = None,
     source: str = "search",
+    cross_context: bool = False,
+    cc_top_m: int = 3,
+    cc_threshold: float = 0.15,
+    cc_ratio: float = 0.3,
+    cc_discount: float = 0.85,
 ) -> list[MemoryOut]:
     # Diagnostic mode requires the pipeline path for score introspection
     if _USE_PIPELINE_SEARCH or diagnostic:
@@ -3097,6 +3103,11 @@ async def search_memories(
             diagnostic_ctx=diagnostic_ctx,
             readable_tenant_ids=readable_tenant_ids,
             source=source,
+            cross_context=cross_context,
+            cc_top_m=cc_top_m,
+            cc_threshold=cc_threshold,
+            cc_ratio=cc_ratio,
+            cc_discount=cc_discount,
         )
     logger.warning("legacy search path invoked; this path is deprecated and scheduled for removal")
     return await _search_memories_legacy(
@@ -3134,6 +3145,11 @@ async def _search_memories_pipeline(
     diagnostic_ctx: dict | None = None,
     readable_tenant_ids: list[str] | None = None,
     source: str = "search",
+    cross_context: bool = False,
+    cc_top_m: int = 3,
+    cc_threshold: float = 0.15,
+    cc_ratio: float = 0.3,
+    cc_discount: float = 0.85,
 ) -> list[MemoryOut]:
     """Pipeline-based search_memories -- same logic, decomposed into timed steps."""
     from core_api.pipeline.compositions.search import build_search_pipeline
@@ -3157,6 +3173,11 @@ async def _search_memories_pipeline(
             "diagnostic": diagnostic,
             "readable_tenant_ids": readable_tenant_ids,
             "source": source,
+            "cross_context": cross_context,
+            "cc_top_m": cc_top_m,
+            "cc_threshold": cc_threshold,
+            "cc_ratio": cc_ratio,
+            "cc_discount": cc_discount,
         },
         tenant_config=tenant_config,
     )

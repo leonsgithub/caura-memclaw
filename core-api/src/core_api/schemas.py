@@ -259,6 +259,8 @@ class MemoryOut(BaseModel):
     superseded_by: list["ContradictionInfo"] | None = None
     # Usage info (populated on write responses)
     usage: UsageSummary | None = None
+    # Retrieval provenance: "cross_context" for Phase 2 hits, None for Phase 1
+    source_type: str | None = None
 
     model_config = {"from_attributes": True}
 

@@ -3,6 +3,7 @@
 from core_api.pipeline.runner import Pipeline
 from core_api.pipeline.steps.search import (
     ClassifyQuery,
+    CrossContextEnrich,
     ExecuteScoredSearch,
     ExtractTemporalHint,
     InjectSTMContext,
@@ -25,6 +26,7 @@ def build_search_pipeline() -> Pipeline:
             ParallelEmbedAndEntityBoost(),
             ExecuteScoredSearch(),
             PostFilterResults(),
+            CrossContextEnrich(),
             LoadAndSerialize(),
             InjectSTMContext(),
             TrackRecalls(),

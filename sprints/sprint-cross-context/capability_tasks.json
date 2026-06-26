@@ -1,0 +1,176 @@
+{
+  "planId": "SPRINT-CROSS-CONTEXT-PLAN",
+  "sprintGoal": "Port Brain MCP's 2-phase cross-context retrieval into memclaw_recall. Phase 1 = current hybrid search (unchanged). Phase 2 = opt-in: re-runs the same query embedding without caller_agent_id so storage returns only scope_team/scope_org memories, applies a lower similarity threshold and a score discount, caps the blend at cc_ratio of total results, marks each Phase 2 hit with source_type='cross_context'. Goal: agents surface shared/infra knowledge that Phase 1 crowds out with higher-scoring own memories.",
+  "correlationId": "SPRINT-CROSS-CONTEXT",
+  "createdAt": "2026-06-26T00:00:00Z",
+  "createdBy": "claude-code",
+  "workItems": [
+    {
+      "id": "CC-01",
+      "kind": "software.implementation",
+      "objective": "Add source_type field to MemoryOut schema so Phase 2 retrieval provenance is visible to callers.",
+      "acceptanceCriteria": [
+        "schemas.py MemoryOut has source_type: str | None = None field",
+        "Phase 2 hits carry source_type='cross_context' in API/MCP responses",
+        "Phase 1 hits carry source_type=None (no change to existing behaviour)"
+      ],
+      "state": "done",
+      "priority": 100,
+      "dependencies": [],
+      "requiredCapabilities": ["filesystem.write"],
+      "executionPolicy": {
+        "maxAttempts": 1,
+        "timeoutSeconds": 300,
+        "requiresHumanApproval": false,
+        "allowedSideEffects": ["local_filesystem_write"],
+        "networkAccess": "none",
+        "retryPolicy": {"strategy": "none", "retryOn": []}
+      },
+      "risk": {
+        "level": "low",
+        "reasons": [
+          "Additive field with None default — backwards compatible, existing callers unaffected"
+        ]
+      },
+      "resourceLocks": [],
+      "version": 1,
+      "attempt": 1,
+      "parentId": null,
+      "artifacts": [],
+      "failure": null,
+      "payload": {
+        "files_changed": [
+          "core-api/src/core_api/schemas.py (MemoryOut.source_type field)",
+          "core-api/src/core_api/services/memory_service.py (_memory_to_out: source_type=_mem_attr(memory, 'source_type'))"
+        ]
+      }
+    },
+    {
+      "id": "CC-02",
+      "kind": "software.implementation",
+      "objective": "Create CrossContextEnrich pipeline step that runs Phase 2 search and appends discounted shared-scope hits to filtered_rows.",
+      "acceptanceCriteria": [
+        "core-api/src/core_api/pipeline/steps/search/cross_context_enrich.py exists",
+        "When cross_context=False (default), step returns SKIPPED with zero effect on results",
+        "When cross_context=True, Phase 2 results exclude Phase 1 IDs, pass cc_threshold, have score multiplied by cc_discount, and total Phase 2 rows are capped at max(1, int((len_phase1 + len_cross) * cc_ratio))",
+        "Each Phase 2 SimpleNamespace has Memory.source_type='cross_context'",
+        "Step is exported from steps/search/__init__.py and inserted after PostFilterResults in compositions/search.py"
+      ],
+      "state": "done",
+      "priority": 100,
+      "dependencies": ["CC-01"],
+      "requiredCapabilities": ["filesystem.write"],
+      "executionPolicy": {
+        "maxAttempts": 1,
+        "timeoutSeconds": 300,
+        "requiresHumanApproval": false,
+        "allowedSideEffects": ["local_filesystem_write"],
+        "networkAccess": "none",
+        "retryPolicy": {"strategy": "none", "retryOn": []}
+      },
+      "risk": {
+        "level": "low",
+        "reasons": [
+          "Step is opt-in (cross_context=False default); all existing search behaviour unchanged",
+          "Phase 2 uses existing sc.scored_search() — no new storage endpoints"
+        ]
+      },
+      "resourceLocks": [],
+      "version": 1,
+      "attempt": 1,
+      "parentId": null,
+      "artifacts": [],
+      "failure": null,
+      "payload": {
+        "files_changed": [
+          "core-api/src/core_api/pipeline/steps/search/cross_context_enrich.py (new)",
+          "core-api/src/core_api/pipeline/steps/search/__init__.py (export CrossContextEnrich)",
+          "core-api/src/core_api/pipeline/compositions/search.py (insert CrossContextEnrich() after PostFilterResults())"
+        ],
+        "key_design": "Phase 2 omits caller_agent_id → storage visibility filter returns scope_team + scope_org only. Python-side: exclude Phase 1 IDs, apply cc_threshold on vec_sim, multiply score by cc_discount, cap at cc_ratio."
+      }
+    },
+    {
+      "id": "CC-03",
+      "kind": "software.implementation",
+      "objective": "Wire cross_context and weight params through search_memories() → _search_memories_pipeline() → PipelineContext.data, and expose them on the memclaw_recall MCP tool.",
+      "acceptanceCriteria": [
+        "search_memories() and _search_memories_pipeline() in memory_service.py accept cross_context, cc_top_m, cc_threshold, cc_ratio, cc_discount with Brain-MCP defaults",
+        "PipelineContext.data contains all five keys on every search invocation",
+        "memclaw_recall MCP tool exposes all five as optional Annotated params with descriptions",
+        "memclaw_recall passes all five to search_memories()"
+      ],
+      "state": "done",
+      "priority": 100,
+      "dependencies": ["CC-02"],
+      "requiredCapabilities": ["filesystem.write"],
+      "executionPolicy": {
+        "maxAttempts": 1,
+        "timeoutSeconds": 300,
+        "requiresHumanApproval": false,
+        "allowedSideEffects": ["local_filesystem_write"],
+        "networkAccess": "none",
+        "retryPolicy": {"strategy": "none", "retryOn": []}
+      },
+      "risk": {
+        "level": "low",
+        "reasons": [
+          "All new params default to off/Brain defaults — no behaviour change unless cross_context=True is passed",
+          "No DB schema changes"
+        ]
+      },
+      "resourceLocks": [],
+      "version": 1,
+      "attempt": 1,
+      "parentId": null,
+      "artifacts": [],
+      "failure": null,
+      "payload": {
+        "files_changed": [
+          "core-api/src/core_api/services/memory_service.py (search_memories + _search_memories_pipeline signatures + ctx.data keys)",
+          "core-api/src/core_api/mcp_server.py (memclaw_recall tool signature + search_memories call)"
+        ]
+      }
+    },
+    {
+      "id": "CC-04",
+      "kind": "software.deploy",
+      "objective": "Deploy to .53 and verify Phase 2 cross-context hits appear with source_type='cross_context' when cross_context=true.",
+      "acceptanceCriteria": [
+        "docker compose build core-api succeeds on 192.168.1.53",
+        "docker compose up -d core-api brings container up healthy",
+        "memclaw_recall with cross_context=false returns Phase 1 results only (source_type=null for all)",
+        "memclaw_recall with cross_context=true, cc_threshold=0.1 returns at least one result with source_type='cross_context' (given a scope_org or scope_team memory exists)"
+      ],
+      "state": "todo",
+      "priority": 90,
+      "dependencies": ["CC-01", "CC-02", "CC-03"],
+      "requiredCapabilities": ["network.ssh", "docker.compose"],
+      "executionPolicy": {
+        "maxAttempts": 2,
+        "timeoutSeconds": 600,
+        "requiresHumanApproval": true,
+        "allowedSideEffects": ["remote_docker_restart"],
+        "networkAccess": "ssh:192.168.1.53",
+        "retryPolicy": {"strategy": "manual", "retryOn": ["build_failure"]}
+      },
+      "risk": {
+        "level": "medium",
+        "reasons": [
+          "Restarts core-api container on production host — brief downtime during restart"
+        ]
+      },
+      "resourceLocks": [
+        {"resource": "192.168.1.53:core-api", "mode": "write"}
+      ],
+      "version": 1,
+      "attempt": 0,
+      "parentId": null,
+      "artifacts": [],
+      "failure": null,
+      "payload": {
+        "deploy_command": "ssh 192.168.1.53 \"cd ~/dev/caura-memclaw && git pull && docker compose build core-api && docker compose up -d core-api\""
+      }
+    }
+  ]
+}

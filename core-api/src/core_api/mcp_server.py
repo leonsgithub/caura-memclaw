@@ -579,6 +579,13 @@ async def memclaw_recall(
     top_k: Annotated[
         int, Field(description="Max results, default 5. Values above 20 are capped to 20.")
     ] = DEFAULT_SEARCH_TOP_K,
+    cross_context: Annotated[
+        bool, Field(description="Enable Phase 2 cross-context retrieval (shared scope_team/scope_org memories below Phase 1 threshold).")
+    ] = False,
+    cc_top_m: Annotated[int, Field(description="Max Phase 2 cross-context candidates.")] = 3,
+    cc_threshold: Annotated[float, Field(description="Min vec_sim for Phase 2 hits.")] = 0.15,
+    cc_ratio: Annotated[float, Field(description="Max fraction of total results from Phase 2.")] = 0.3,
+    cc_discount: Annotated[float, Field(description="Score multiplier applied to Phase 2 hits.")] = 0.85,
 ) -> str:
     """Hybrid semantic+keyword recall, with optional LLM brief."""
     t0 = time.perf_counter()
@@ -670,6 +677,11 @@ async def memclaw_recall(
             search_profile=agent_profile,
             readable_tenant_ids=_get_readable_tenants() or None,
             source="mcp_recall",
+            cross_context=cross_context,
+            cc_top_m=cc_top_m,
+            cc_threshold=cc_threshold,
+            cc_ratio=cc_ratio,
+            cc_discount=cc_discount,
         )
         # Cross-tenant read audit (F2): emit one event per source tenant when
         # the credential widened beyond home. Async queue — non-blocking.
