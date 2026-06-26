@@ -153,7 +153,7 @@ This installs the plugin to `~/.openclaw/plugins/memclaw/`, builds it, claims th
 | | MCP | OpenClaw Plugin |
 |---|---|---|
 | For | Claude Code, Cursor, any MCP client | OpenClaw gateway agents |
-| Tools | 19 | 18 (agent-facing) |
+| Tools | 20 | 19 (every tool except `memclaw_keystones_set`) |
 | Setup | Add JSON config | Run install script + restart gateway |
 | Transport | Streamable HTTP | Plugin API → HTTP |
 

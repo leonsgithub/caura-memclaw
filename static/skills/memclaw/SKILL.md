@@ -44,6 +44,12 @@ them for the session; treat them as the boundary inside which every step below
 operates. Reading is open (trust 0). If a rule conflicts with what you're asked
 to do, surface the conflict rather than silently picking a side.
 
+**One-call warm start.** `memclaw_session_start` bundles the session-open reads
+into a single round-trip: it returns the active keystones **plus** your top
+memories by weight and the procedures with ≥ 60 % reliability. Call it once at
+session open for zero-latency context and paste the result into your working
+context; it does not replace obeying the keystones it returns.
+
 ## 2 · The loop — run it on every task
 
 Orient → Work → Write → Evolve. The first step does the heavy lifting:
@@ -235,6 +241,55 @@ memclaw_keystones_set op=set scope=fleet|tenant \
   title="…" content="…" weight=low|med|high [fleet_id=<fleet>]
 ```
 
+## 10 · Procedures — reliability-ranked workflows
+
+A **procedure** is an executable tool-call sequence the fleet has tried before,
+ranked by how reliably it has *worked*. Where a `skills`-collection doc is prose
+you read, a procedure is a ranked recipe you follow and then grade — so the next
+agent's ranking reflects real outcomes, not guesses.
+
+The loop is suggest → follow → record:
+
+```text
+# 1. Before a non-trivial, repeatable workflow, ask what has worked:
+memclaw_procedure_suggest context_features={framework, region, library, …} \
+  task="<goal>"
+#   → request_id + ranked procedures (id, name, tools_sequence, score).
+#   Quarantined (proven-unreliable) procedures are already excluded.
+
+# 2. Follow the top procedure's tools_sequence. Keep its id.
+
+# 3. Report how it went — THIS is what makes ranking improve:
+memclaw_procedure_record procedure_id=<id> outcome_type=success|failure
+
+# Capture a new reusable procedure (starts at reliability 0.5):
+memclaw_procedure_write name="<slug>" tools_sequence=[…] \
+  context_features={…} [reasoning_guide=… risk_level=low|medium|high]
+```
+
+**`validation_passed` — verified vs. self-reported (do not skip).** An agent
+grading its own work tends to call it a success. If — and only if — an
+**independent** check confirmed the outcome (a separate evaluator agent, a test
+run, a CI gate), pass `validation_passed=true` on `memclaw_procedure_record`.
+Verified outcomes move a separate counter and surface `verified_reliability` in
+the response, so a procedure proven by real tests is distinguishable from one
+with only self-reported wins. Leave it unset for a self-graded outcome — don't
+mark your own homework as verified.
+
+A procedure auto-quarantines after ≥ 3 attempts with reliability below 0.3 and
+drops out of `suggest`. Manual lifecycle (read stats, quarantine/unquarantine,
+invalidate, delete) is `memclaw_procedure_manage`.
+
+## 11 · Stable-infra facts — `memclaw_env`
+
+Infrastructure constants — service URLs, ports, hostnames — are not memories and
+not docs; they're **env truths** with a confidence that rises as agents confirm
+them. Use `memclaw_env` (`op=upsert|get|list|verify`) for "the staging API is at
+`https://…:8443`" rather than burying it in prose. `verify(name)` bumps the
+confidence without changing the value; re-`upsert` with a new value resets it
+when the fact changes. Prefer this over a plain memory whenever a teammate would
+ask "is this still the right URL/port/host?".
+
 ## A full loop, end to end
 
 One task — orient, work, write, evolve — with the IDs threaded through:
@@ -277,10 +332,17 @@ parameter list.
 - Find or publish a workflow → `memclaw_doc … collection=skills`
 - Fact no longer true → `memclaw_write` (new) + `memclaw_manage op=transition status=outdated` (old)
 - Acted on a recalled memory → `memclaw_evolve`
-- Session start (before anything) → `memclaw_keystones`
+- One-call session warm start (keystones + top memories + reliable procedures) → `memclaw_session_start`
+- Session start, rules only (before anything) → `memclaw_keystones`
 - Add / remove a governance rule → `memclaw_keystones_set`
+- Repeatable workflow — what has worked before → `memclaw_procedure_suggest`, then `memclaw_procedure_record` after
+- Capture a reusable tool-call recipe → `memclaw_procedure_write`
+- Manage a procedure (stats / quarantine / invalidate) → `memclaw_procedure_manage`
+- Infra constant (URL / port / host) → `memclaw_env`
 - Recall quality off across queries → `memclaw_tune` (once; sticky)
 - Session boundary / sweep → `memclaw_insights`
+- Bulk-export your memories → `memclaw_export`
+- Triage the worst-rated memories for cleanup → `memclaw_review`
 - Readiness probe / counts → `memclaw_stats`
 
 ### Behaviors the schema won't tell you
@@ -291,6 +353,8 @@ parameter list.
 - **`memclaw_doc`** — `where` is scalar exact-match only (no array descent). A doc is invisible to `op=search` unless it has a `data["summary"]` (the only embedded field); re-write with one to index it retroactively. Scope the search to a collection when you know it; omit `collection` for the single best match across the tenant.
 - **`memclaw_tune`** persists and reshapes every later recall — change one or two knobs at a time; call with no arguments to read your current profile (`fts_weight` 0 = pure semantic, 1 = pure keyword).
 - **`memclaw_insights`** saves findings as `insight` memories; run it at boundaries, not every turn. `focus="divergence"` needs a non-agent scope.
+- **`memclaw_procedure_record`** drives ranking off the outcome you report, so honest grading matters. `validation_passed=true` is reserved for *independently* verified outcomes (separate evaluator / test / CI) — it moves the verified counters and `verified_reliability`; a self-graded success leaves it unset. Auto-quarantine: ≥ 3 attempts and reliability < 0.3.
+- **`memclaw_review`** is read-only — act on its low-weight results via `memclaw_manage op=transition` (outdated/archived); it doesn't mutate anything itself.
 - **`memclaw_stats`** is read-only — use it as a readiness/health probe, never a write-then-delete check.
 
 ### Anti-patterns
