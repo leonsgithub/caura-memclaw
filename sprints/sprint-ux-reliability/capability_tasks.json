@@ -1,0 +1,268 @@
+{
+  "planId": "SPRINT-UX-RELIABILITY-PLAN",
+  "sprintNumber": "ux-reliability",
+  "sprintGoal": "Reduce adoption friction and prevent memory bleed: default writes to scope_agent, cache recall in Redis, add memclaw_session_start warm-context tool, add local embedder fallback, and add memclaw-init CLI.",
+  "previousSprint": "sprints/sprint-brain-parity/SPRINT-BRAIN-PARITY_SIGNOFF.md",
+  "workItems": [
+    {
+      "id": "UX-01",
+      "kind": "software.implementation",
+      "objective": "Change the default visibility on memclaw_write from None to 'scope_agent', and verify what None currently resolves to in the storage layer so the change is safe.",
+      "acceptanceCriteria": [
+        "memclaw_write called without visibility= produces a memory with visibility='scope_agent' in the DB",
+        "Existing memories with explicit visibility= are unaffected",
+        "pytest tests/test_mcp_*.py passes (no regressions)",
+        "The change is gated: standalone mode only — gateway path already enforces explicit visibility from the caller"
+      ],
+      "state": "todo",
+      "priority": 95,
+      "dependencies": [],
+      "requiredCapabilities": ["read_file", "edit_file", "run_tests"],
+      "executionPolicy": {
+        "maxAttempts": 3,
+        "timeoutSeconds": 1800,
+        "requiresHumanApproval": false,
+        "retryPolicy": {
+          "strategy": "linear_backoff",
+          "retryOn": ["transient_error", "timeout"]
+        }
+      },
+      "risk": {
+        "level": "medium",
+        "reasons": [
+          "Changes default behavior for existing agents that relied on None falling through to org-level visibility",
+          "Requires verifying what None currently resolves to before changing the default"
+        ]
+      },
+      "payload": {
+        "files": [
+          "core-api/src/core_api/mcp_server.py"
+        ],
+        "hint": "Line 726: visibility param on memclaw_write. Trace None through to storage call to confirm current fallback before changing. Also check memclaw_manage if it has a visibility param.",
+        "safe_change": "Only change the Python default= value; do not alter storage-layer logic."
+      }
+    },
+    {
+      "id": "UX-02",
+      "kind": "software.implementation",
+      "objective": "Add Redis-backed caching to memclaw_recall responses. Cache key = agent_id + query hash + top_k. TTL = 5 minutes. Skip cache when cross_context=True or filter_agent_id is set.",
+      "acceptanceCriteria": [
+        "A second identical memclaw_recall call within 5 minutes returns the cached result (verified by log line or latency < 50ms)",
+        "cross_context=True bypasses cache",
+        "Cache miss path is identical to today's behavior",
+        "If Redis is unavailable the tool falls through to the live path — no errors surfaced to caller",
+        "pytest tests/test_mcp_recall.py passes (create test file if none exists covering cache hit/miss/bypass)"
+      ],
+      "state": "todo",
+      "priority": 90,
+      "dependencies": [],
+      "requiredCapabilities": ["read_file", "edit_file", "run_tests"],
+      "executionPolicy": {
+        "maxAttempts": 3,
+        "timeoutSeconds": 1800,
+        "requiresHumanApproval": false,
+        "retryPolicy": {
+          "strategy": "linear_backoff",
+          "retryOn": ["transient_error", "timeout"]
+        }
+      },
+      "risk": {
+        "level": "low",
+        "reasons": [
+          "Redis already in stack with graceful fallback (cache.py)",
+          "Cache is read-only overlay — wrong cache hit degrades result quality but does not corrupt data",
+          "5-minute TTL limits blast radius of stale hits"
+        ]
+      },
+      "payload": {
+        "files": [
+          "core-api/src/core_api/mcp_server.py",
+          "core-api/src/core_api/cache.py"
+        ],
+        "hint": "cache.py already has cache_get/cache_set with TTL. The recall tool is memclaw_recall (line ~571). Cache key pattern: 'recall:{agent_id}:{sha256(query+str(top_k))[:12]}'. Serialize the JSON result string directly — it's already a string return.",
+        "cache_ttl_seconds": 300
+      }
+    },
+    {
+      "id": "UX-03",
+      "kind": "software.implementation",
+      "objective": "Add a memclaw_session_start MCP tool that returns warm context for the calling agent: top-5 memories by recency+weight, active keystone rules, and any procedures with reliability >= 0.6. Designed to be called once at session start and injected into the system prompt.",
+      "acceptanceCriteria": [
+        "memclaw_session_start is listed in the MCP tool registry (19 → 20 tools)",
+        "Returns JSON with keys: memories (list), keystones (list), procedures (list)",
+        "Respects agent_id scoping — only returns memories the agent can read",
+        "pytest tests/test_mcp_session.py passes with at least: tool exists, returns correct structure, respects agent_id",
+        "plugin/tools.json and baseline fixtures regenerated and committed",
+        "Tool description explicitly states: 'Call once at session start. Paste result into system prompt for zero-latency context.'"
+      ],
+      "state": "todo",
+      "priority": 85,
+      "dependencies": [],
+      "requiredCapabilities": ["read_file", "edit_file", "run_tests"],
+      "executionPolicy": {
+        "maxAttempts": 3,
+        "timeoutSeconds": 1800,
+        "requiresHumanApproval": false,
+        "retryPolicy": {
+          "strategy": "linear_backoff",
+          "retryOn": ["transient_error", "timeout"]
+        }
+      },
+      "risk": {
+        "level": "low",
+        "reasons": [
+          "Additive only — new tool, no changes to existing tools",
+          "Composes existing memclaw_recall + memclaw_keystones + memclaw_procedure_manage calls internally"
+        ]
+      },
+      "payload": {
+        "files": [
+          "core-api/src/core_api/mcp_server.py",
+          "core-api/src/core_api/tools/",
+          "tests/test_mcp_session.py",
+          "plugin/tools.json",
+          "tests/fixtures/tools_list_baseline_v1.json",
+          "tests/fixtures/tool_descriptions_baseline_v1.json",
+          "tests/fixtures/tool_descriptions_enriched_baseline_v1.json"
+        ],
+        "hint": "Follow the pattern of memclaw_review (new file in tools/, wired into mcp_server.py). The tool should fan out to: (1) memclaw_list top_k=5 sorted by weight desc, (2) memclaw_keystones, (3) memclaw_procedure_manage op=stats or similar. Combine and return as structured JSON.",
+        "tool_count_before": 19,
+        "tool_count_after": 20
+      }
+    },
+    {
+      "id": "UX-04",
+      "kind": "software.implementation",
+      "objective": "Add a local embedding provider that calls an Ollama-compatible /api/embeddings endpoint. Configurable via EMBEDDING_PROVIDER=local, LOCAL_EMBEDDING_URL, and LOCAL_EMBEDDING_MODEL env vars. Falls back gracefully to fake provider if the local endpoint is unreachable at startup.",
+      "acceptanceCriteria": [
+        "EMBEDDING_PROVIDER=local + LOCAL_EMBEDDING_URL=http://localhost:11434/api/embeddings writes memories with real embeddings when Ollama is running",
+        "If LOCAL_EMBEDDING_URL is unreachable at startup, a WARNING is logged and provider falls back to FakeEmbeddingProvider (no crash)",
+        "pytest tests/test_embedding_local.py passes: mock httpx call returns a 1024-dim vector, embedding stored correctly",
+        "config.py has local_embedding_url and local_embedding_model fields with sane defaults",
+        "Settings validator warns (not raises) when EMBEDDING_PROVIDER=local and LOCAL_EMBEDDING_URL is unset"
+      ],
+      "state": "todo",
+      "priority": 75,
+      "dependencies": [],
+      "requiredCapabilities": ["read_file", "edit_file", "run_tests"],
+      "executionPolicy": {
+        "maxAttempts": 3,
+        "timeoutSeconds": 2400,
+        "requiresHumanApproval": false,
+        "retryPolicy": {
+          "strategy": "linear_backoff",
+          "retryOn": ["transient_error", "timeout"]
+        }
+      },
+      "risk": {
+        "level": "medium",
+        "reasons": [
+          "Embedding dimension must match pgvector column (1024d) — Ollama models like nomic-embed-text output 768d by default; must document required model or add dimension validation",
+          "New config fields in Settings could break existing .env validation if added incorrectly"
+        ]
+      },
+      "payload": {
+        "files": [
+          "core-api/src/core_api/providers/local_provider.py",
+          "core-api/src/core_api/config.py",
+          "common/llm/registry.py",
+          "tests/test_embedding_local.py"
+        ],
+        "hint": "config.py line 28 shows embedding_provider='openai' with comment 'fake | openai | local' — the hook is already there. Add LocalEmbeddingProvider in providers/local_provider.py using httpx.AsyncClient. Wire it in common/llm/registry.py (where get_llm_provider and embedding init live). The Ollama embeddings endpoint: POST /api/embeddings {model, prompt}. Dimension warning: document that LOCAL_EMBEDDING_MODEL must output 1024d vectors (mxbai-embed-large, or nomic-embed-text with Matryoshka truncation).",
+        "new_config_fields": [
+          "local_embedding_url: str = 'http://localhost:11434'",
+          "local_embedding_model: str = 'mxbai-embed-large'"
+        ]
+      }
+    },
+    {
+      "id": "UX-05",
+      "kind": "software.implementation",
+      "objective": "Add a memclaw-init CLI script that: (1) pings the MemClaw health endpoint, (2) prints a ready-to-paste MCP config block for Claude Code / mcpServers, (3) optionally registers the agent if --agent-id is passed.",
+      "acceptanceCriteria": [
+        "python -m memclaw_init --url http://192.168.1.53:8001 prints the MCP config block and a health status line",
+        "python -m memclaw_init --url http://... --agent-id my-agent calls /agents/register and prints confirmation",
+        "python -m memclaw_init --url http://unreachable exits with code 1 and a clear error message",
+        "Script is a single file, no new dependencies beyond httpx (already in requirements)"
+      ],
+      "state": "todo",
+      "priority": 60,
+      "dependencies": [],
+      "requiredCapabilities": ["read_file", "edit_file", "run_tests"],
+      "executionPolicy": {
+        "maxAttempts": 3,
+        "timeoutSeconds": 1800,
+        "requiresHumanApproval": false,
+        "retryPolicy": {
+          "strategy": "linear_backoff",
+          "retryOn": ["transient_error", "timeout"]
+        }
+      },
+      "risk": {
+        "level": "low",
+        "reasons": [
+          "New standalone script with no existing code changed",
+          "No framework needed — stdlib argparse + httpx"
+        ]
+      },
+      "payload": {
+        "files": [
+          "cli/memclaw_init.py"
+        ],
+        "hint": "Create cli/memclaw_init.py. Use httpx.get(url + '/health') for the ping. Print the MCP config as a JSON block the user can paste into ~/.claude/settings.json mcpServers. Registration endpoint: check existing routes for /agents/register or equivalent. Single file, runnable as 'python cli/memclaw_init.py' or 'python -m cli.memclaw_init'. Add a small __main__ self-check that mocks httpx and asserts the config block is valid JSON.",
+        "output_example": "{\n  \"mcpServers\": {\n    \"memclaw\": {\n      \"url\": \"<url>/mcp\",\n      \"headers\": { \"X-Agent-ID\": \"<agent-id>\" }\n    }\n  }\n}"
+      }
+    },
+    {
+      "id": "UX-Z01",
+      "kind": "software.documentation",
+      "objective": "Write SPRINT-UX-RELIABILITY_SIGNOFF.md summarising outcomes, metrics, lessons learned, and any deliberate deferrals.",
+      "acceptanceCriteria": [
+        "SPRINT-UX-RELIABILITY_SIGNOFF.md exists in sprints/sprint-ux-reliability/",
+        "All 5 task outcomes are recorded (completed / failed / notes)",
+        "Lessons learned section has at least 2 entries",
+        "File is committed to the sprint branch"
+      ],
+      "state": "todo",
+      "priority": 10,
+      "dependencies": ["UX-01", "UX-02", "UX-03", "UX-04", "UX-05"],
+      "requiredCapabilities": ["read_file", "write_file", "git"],
+      "executionPolicy": {
+        "maxAttempts": 1,
+        "timeoutSeconds": 600,
+        "requiresHumanApproval": false,
+        "retryPolicy": {
+          "strategy": "none",
+          "retryOn": []
+        }
+      },
+      "risk": {
+        "level": "low",
+        "reasons": ["Documentation only"]
+      },
+      "payload": {
+        "files": [
+          "sprints/sprint-ux-reliability/SPRINT-UX-RELIABILITY_SIGNOFF.md"
+        ],
+        "template": "sprints/sprint-brain-parity/SPRINT-BRAIN-PARITY_SIGNOFF.md"
+      }
+    }
+  ],
+  "validation": {
+    "status": "valid",
+    "errors": [],
+    "warnings": [
+      "UX-04: local embedder dimension must match pgvector column (1024d). nomic-embed-text outputs 768d by default — executor must document or enforce compatible model.",
+      "UX-01: None→scope_agent default change is a behavioral break for any agent that intentionally relied on org-wide write fallback. Low risk in standalone/single-tenant but worth noting in signoff."
+    ]
+  },
+  "metrics": {
+    "totalWorkItems": 6,
+    "estimatedDurationDays": 3,
+    "criticalPathWorkItems": ["UX-03", "UX-Z01"],
+    "highRiskWorkItems": [],
+    "parallelBatch1": ["UX-01", "UX-02", "UX-03"],
+    "parallelBatch2": ["UX-04", "UX-05"],
+    "notes": "UX-01/02/03 are low-effort and can be done sequentially in one sitting. UX-04 and UX-05 are independent and can follow. UX-Z01 gates on all."
+  }
+}
