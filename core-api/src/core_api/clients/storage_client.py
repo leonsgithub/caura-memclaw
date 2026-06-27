@@ -1501,6 +1501,13 @@ class CoreStorageClient:
     async def upsert_document_xmax(self, data: dict) -> dict:
         return await self._post("/documents/upsert-xmax", data, read=False)  # type: ignore[return-value]
 
+    async def upsert_document_system(self, data: dict) -> dict:
+        # Write into a reserved ('_'-prefixed) collection the public
+        # ``/documents`` path refuses. Used by trusted surfaces that own a
+        # system collection (e.g. memclaw_env → _env_truths). read=False —
+        # this is a write on the primary.
+        return await self._post("/documents/system-upsert", data, read=False)  # type: ignore[return-value]
+
     async def list_document_collections(
         self,
         *,

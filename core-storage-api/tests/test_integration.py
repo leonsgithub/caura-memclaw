@@ -1284,6 +1284,54 @@ class TestDocuments:
         assert resp.status_code == 200
         assert resp.json()["data"]["v"] == 2
 
+    async def test_system_upsert_writes_reserved_collection(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+    ) -> None:
+        """`/documents/system-upsert` reaches a '_'-prefixed collection the
+        public `/documents` path refuses (the memclaw_env → _env_truths bug)."""
+        doc_id = f"brain_url-{_uid()}"
+        body = {
+            "tenant_id": tenant_id,
+            "collection": "_env_truths",
+            "doc_id": doc_id,
+            "data": {"value": "http://192.168.1.53:9001/mcp", "verification_count": 0},
+        }
+        # Public path is blocked …
+        blocked = await client.post(f"{PREFIX}/documents", json=body)
+        assert blocked.status_code == 400
+        assert "system-managed" in blocked.json()["detail"]
+        # … the system path writes it.
+        ok = await client.post(f"{PREFIX}/documents/system-upsert", json=body)
+        assert ok.status_code == 200, ok.text
+        assert ok.json()["doc_id"] == doc_id
+        # Round-trips via the unguarded read path.
+        got = await client.get(
+            f"{PREFIX}/documents/_env_truths/{doc_id}",
+            params={"tenant_id": tenant_id},
+        )
+        assert got.status_code == 200
+        assert got.json()["data"]["value"] == "http://192.168.1.53:9001/mcp"
+
+    async def test_system_upsert_rejects_non_reserved_collection(
+        self,
+        client: AsyncClient,
+        tenant_id: str,
+    ) -> None:
+        """system-upsert is narrowed to '_'-prefixed collections — it can't
+        double as a back door for ordinary docs."""
+        resp = await client.post(
+            f"{PREFIX}/documents/system-upsert",
+            json={
+                "tenant_id": tenant_id,
+                "collection": "test-collection",
+                "doc_id": f"doc-{_uid()}",
+                "data": {"v": 1},
+            },
+        )
+        assert resp.status_code == 422
+
     async def test_query_documents(
         self,
         client: AsyncClient,

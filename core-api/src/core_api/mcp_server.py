@@ -2136,7 +2136,7 @@ async def memclaw_env(
                     # bump count + timestamp, leave value intact
                     d["verification_count"] = d.get("verification_count", 0) + 1
                     d["verified_at"] = _dt.now(UTC).isoformat()
-                    await sc.upsert_document(
+                    await sc.upsert_document_system(
                         {"tenant_id": tenant_id, "collection": _ENV_TRUTHS_COLLECTION, "doc_id": name, "data": d}
                     )
                 return _with_latency(
@@ -2166,7 +2166,7 @@ async def memclaw_env(
             else:
                 d = {"value": value, "confidence": confidence, "verified_at": now, "verification_count": 0}
 
-            await sc.upsert_document(
+            await sc.upsert_document_system(
                 {
                     "tenant_id": tenant_id,
                     "collection": _ENV_TRUTHS_COLLECTION,

@@ -27,6 +27,38 @@ async def upsert_document(request: Request) -> dict:
     return orm_to_dict(doc, DOCUMENT_FIELDS)
 
 
+@router.post("/system-upsert")
+async def system_upsert_document(request: Request) -> dict:
+    """Upsert into a system-managed (``_``-prefixed) collection.
+
+    The public ``POST /documents`` path refuses ``_``-prefixed collections
+    (see ``document_upsert``'s guard) so external ``memclaw_doc`` writers
+    can't clobber governance state. Trusted core-api surfaces that own a
+    reserved collection (e.g. ``memclaw_env`` → ``_env_truths``) write
+    through here, passing ``system=True``. Restricted to ``_``-prefixed
+    collections so it can't double as a back door for normal docs.
+    """
+    body: dict = await request.json()
+    collection = body.get("collection", "")
+    if not isinstance(collection, str) or not collection.startswith("_"):
+        raise HTTPException(
+            status_code=422,
+            detail="system-upsert is only for '_'-prefixed (system-managed) collections.",
+        )
+    try:
+        doc = await _svc.document_upsert(
+            tenant_id=body["tenant_id"],
+            collection=collection,
+            doc_id=body["doc_id"],
+            data=body["data"],
+            fleet_id=body.get("fleet_id"),
+            system=True,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return orm_to_dict(doc, DOCUMENT_FIELDS)
+
+
 @router.post("/upsert-xmax")
 async def upsert_document_xmax(request: Request) -> dict:
     """Upsert returning (id, created_at, updated_at, xmax).

@@ -18,6 +18,19 @@ class FakeDocStore:
         return self._docs.get((tenant_id, collection, doc_id))
 
     async def upsert_document(self, data: dict) -> dict:
+        # Mirror the storage-side guard: the public write path refuses
+        # '_'-prefixed (system-managed) collections. Env truths live in
+        # '_env_truths', so a regression that routes them here would 400
+        # in production — make the double fail loudly instead of silently
+        # accepting it (the bug this test now guards against).
+        if data["collection"].startswith("_"):
+            raise RuntimeError(
+                f"Collection '{data['collection']}' is system-managed; "
+                "use upsert_document_system."
+            )
+        return await self.upsert_document_system(data)
+
+    async def upsert_document_system(self, data: dict) -> dict:
         key = (data["tenant_id"], data["collection"], data["doc_id"])
         self._docs[key] = dict(data)
         return data
