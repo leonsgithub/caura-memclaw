@@ -387,23 +387,24 @@ Accuracy benchmarks cluster the leading tools in a narrow band (see
 [Performance](#performance)). Where the field actually diverges is
 fleet capability and governance:
 
-| Capability | MemClaw | Mem0 | Zep | Letta |
-|---|---|---|---|---|
-| Multi-fleet support | ✅ | ❌ | ❌ | ❌ |
-| Agent trust tiers + keystone policies | ✅ | ❌ | ❌ | ❌ |
-| Cross-vendor memory sharing | ✅ | ❌ | ❌ | ❌ |
-| Contradiction detection + supersession | ✅ | ❌ | ❌ | ❌ |
-| Per-agent retrieval tuning | ✅ | ❌ | ❌ | ❌ |
-| PII detection & flagging | ✅ | ❌ | ✅ | ❌ |
-| Audit trail / provenance | ✅ | ❌ | ⚠️ partial | ❌ |
-| Knowledge graph (auto-extracted) | ✅ | ⚠️ | ✅ | ❌ |
-| MCP-native | ✅ | ✅ | ✅ | ⚠️ |
-| OSS license | Apache 2.0 | Apache 2.0 | Apache 2.0 | Apache 2.0 |
+| Capability | MemClaw | Mem0 | Zep | Letta | Cognee |
+|---|---|---|---|---|---|
+| Multi-fleet support | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Agent trust tiers + keystone policies | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Cross-vendor memory sharing | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Contradiction detection + supersession | ✅ | ❌ | ❌ | ❌ | ❌ |
+| Per-agent retrieval tuning | ✅ | ❌ | ❌ | ❌ | ❌ |
+| PII detection & flagging | ✅ | ❌ | ✅ | ❌ | ❌ |
+| Audit trail / provenance | ✅ | ❌ | ⚠️ partial | ❌ | ✅ |
+| Knowledge graph (auto-extracted) | ✅ | ⚠️ | ✅ | ❌ | ✅ |
+| MCP-native | ✅ | ✅ | ✅ | ⚠️ | ✅ |
+| OSS license | Apache 2.0 | Apache 2.0 | Apache 2.0 | Apache 2.0 | Apache 2.0 |
 
-Mem0, Zep, and Letta are solid projects for single-agent memory. MemClaw's
-lane is **governed memory across agent fleets** — multiple agents, teams,
-and vendors on one auditable memory plane. Comparison reflects our reading
-of public docs as of June 2026 — corrections welcome via issue or PR.
+Mem0, Zep, and Letta are solid projects for single-agent memory; Cognee is a
+deep, ontology-grounded knowledge-graph engine for document-centric apps.
+MemClaw's lane is **governed memory across agent fleets** — multiple agents,
+teams, and vendors on one auditable memory plane. Comparison reflects our
+reading of public docs as of June 2026 — corrections welcome via issue or PR.
 
 ---
 

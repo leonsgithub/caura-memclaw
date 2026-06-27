@@ -52,3 +52,4 @@ reports/
 !core-storage-api/uv.lock
 !core-worker/uv.lock
 !core-operations/uv.lock
+.hypothesis/
