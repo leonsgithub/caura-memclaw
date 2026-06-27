@@ -83,7 +83,13 @@ async def create_memories_bulk(request: Request) -> list[dict]:
     body: list[dict] = await request.json()
     for item in body:
         _parse_datetimes(item)
-    return await _svc.memory_add_all(body)
+    try:
+        return await _svc.memory_add_all(body)
+    except ValueError as exc:
+        # Per-item contract violation (e.g. a missing client_request_id).
+        # Surface a clean 422 instead of an opaque 500 — matches the
+        # ValueError→4xx convention used by the documents/keystones routes.
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 # ------------------------------------------------------------------
@@ -762,9 +768,13 @@ async def get_lifecycle_candidates(tenant_id: str) -> dict:
 
 @router.get("/count")
 async def count_memories(
-    tenant_id: str,
+    tenant_id: str | None = None,
     fleet_id: str | None = None,
 ) -> dict:
+    # ``tenant_id`` is optional: omitted ⇒ global count (the public
+    # marketing-site footprint tile); supplied ⇒ that tenant's active
+    # rows. Required-param signature previously made the global path —
+    # which the body already implements — unreachable (422).
     if not tenant_id:
         count = await _svc.memory_count_all()
     else:

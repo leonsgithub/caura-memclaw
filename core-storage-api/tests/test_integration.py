@@ -158,7 +158,7 @@ class TestMemories:
 
         resp = await client.patch(
             f"{PREFIX}/memories/{memory_id}",
-            json={"status": "archived"},
+            json={"tenant_id": tenant_id, "status": "archived"},
         )
         assert resp.status_code == 200
         assert resp.json()["ok"] is True
@@ -203,12 +203,15 @@ class TestMemories:
 
         resp = await client.patch(
             f"{PREFIX}/memories/{memory_id}",
-            json={"metadata_patch": {"embedding_pending": False, "summary": "done"}},
+            json={
+                "tenant_id": tenant_id,
+                "metadata_patch": {"embedding_pending": False, "summary": "done"},
+            },
         )
         assert resp.status_code == 200, resp.text
 
         updated = (await client.get(f"{PREFIX}/memories/{memory_id}")).json()
-        md = updated["metadata"]
+        md = updated["metadata_"]
         # Patched keys reflect the new values.
         assert md["embedding_pending"] is False
         assert md["summary"] == "done"
@@ -245,6 +248,7 @@ class TestMemories:
         resp = await client.patch(
             f"{PREFIX}/memories/{memory_id}",
             json={
+                "tenant_id": tenant_id,
                 "ts_valid_start": "2026-09-14T00:00:00+00:00",
                 "ts_valid_end": "2026-10-15T23:59:59+00:00",
             },
@@ -278,7 +282,7 @@ class TestMemories:
 
         resp = await client.patch(
             f"{PREFIX}/memories/{memory_id}",
-            json={"ts_valid_start": "tomorrow"},  # not a valid ISO string
+            json={"tenant_id": tenant_id, "ts_valid_start": "tomorrow"},  # not a valid ISO string
         )
         assert resp.status_code == 422, resp.text
         body = resp.json()
@@ -296,9 +300,10 @@ class TestMemories:
         m1 = (await client.post(f"{PREFIX}/memories", json=p1)).json()
         m2 = (await client.post(f"{PREFIX}/memories", json=p2)).json()
 
-        resp = await client.patch(
-            f"{PREFIX}/memories/batch-status",
+        resp = await client.post(
+            f"{PREFIX}/memories/batch-update-status",
             json={
+                "tenant_id": tenant_id,
                 "updates": [
                     {"memory_id": m1["id"], "status": "archived"},
                     {"memory_id": m2["id"], "status": "archived"},
@@ -359,7 +364,11 @@ class TestMemories:
         # route must surface 404.
         resp = await client.patch(
             f"{PREFIX}/memories/{memory_id}",
-            json={"status": "active", "metadata_patch": {"resurrect_attempt": True}},
+            json={
+                "tenant_id": tenant_id,
+                "status": "active",
+                "metadata_patch": {"resurrect_attempt": True},
+            },
         )
         assert resp.status_code == 404, resp.text
 
@@ -373,6 +382,7 @@ class TestMemories:
     async def test_patch_on_nonexistent_memory_returns_404(
         self,
         client: AsyncClient,
+        tenant_id: str,
     ) -> None:
         """PATCH on a memory_id that never existed must surface 404 too,
         not the legacy ``200 {"ok": True}`` silent success.
@@ -385,7 +395,7 @@ class TestMemories:
         fake_id = str(uuid.uuid4())
         resp = await client.patch(
             f"{PREFIX}/memories/{fake_id}",
-            json={"status": "active"},
+            json={"tenant_id": tenant_id, "status": "active"},
         )
         assert resp.status_code == 404, resp.text
 
@@ -448,9 +458,9 @@ class TestMemories:
         bypass it (CAURA-602)."""
         payload = _memory_payload(tenant_id, fleet_id)  # no client_request_id
         resp = await client.post(f"{PREFIX}/memories/bulk", json=[payload])
-        # Storage-writer surfaces the ValueError as 500; core-api would
-        # be the layer that returns a clean 4xx — but at this layer the
-        # important assertion is "no row was inserted."
+        # The bulk route maps the per-item contract ValueError to a clean
+        # 422 (ValueError→4xx convention); the key assertion is that the
+        # write is rejected, not silently accepted.
         assert resp.status_code >= 400
 
     async def test_find_by_content_hash(
@@ -479,8 +489,9 @@ class TestMemories:
         )
         assert resp.status_code == 200
         body = resp.json()
-        assert body["memory"] is not None
-        assert body["memory"]["content_hash"] == content_hash
+        # Route returns the bare memory dict (404 when absent), not a
+        # ``{"memory": ...}`` envelope.
+        assert body["content_hash"] == content_hash
 
     async def test_find_by_content_hash_not_found(
         self,
@@ -491,8 +502,7 @@ class TestMemories:
             f"{PREFIX}/memories/by-content-hash",
             params={"tenant_id": tenant_id, "content_hash": "nonexistent"},
         )
-        assert resp.status_code == 200
-        assert resp.json()["memory"] is None
+        assert resp.status_code == 404
 
     async def test_get_stats(
         self,
@@ -916,7 +926,7 @@ class TestEntities:
         await client.post(f"{PREFIX}/entities", json=payload)
 
         resp = await client.get(
-            f"{PREFIX}/entities/by-name",
+            f"{PREFIX}/entities/exact",
             params={
                 "tenant_id": tenant_id,
                 "name": name,
@@ -925,9 +935,8 @@ class TestEntities:
             },
         )
         assert resp.status_code == 200
-        body = resp.json()
-        assert body["entity"] is not None
-        assert body["entity"]["canonical_name"] == name
+        # Route returns the bare entity dict (404 when absent).
+        assert resp.json()["canonical_name"] == name
 
     async def test_find_exact_entity_not_found(
         self,
@@ -935,15 +944,14 @@ class TestEntities:
         tenant_id: str,
     ) -> None:
         resp = await client.get(
-            f"{PREFIX}/entities/by-name",
+            f"{PREFIX}/entities/exact",
             params={
                 "tenant_id": tenant_id,
                 "name": "NoSuchEntity",
                 "entity_type": "person",
             },
         )
-        assert resp.status_code == 200
-        assert resp.json()["entity"] is None
+        assert resp.status_code == 404
 
     async def test_create_relation(
         self,
@@ -1087,7 +1095,7 @@ class TestEntities:
         memory_id = mem["id"]
 
         link_resp = await client.post(
-            f"{PREFIX}/entities/memory-links/create",
+            f"{PREFIX}/entities/links",
             json={
                 "memory_id": memory_id,
                 "entity_id": entity_id,
@@ -1098,7 +1106,7 @@ class TestEntities:
 
         # Get entity with linked memories
         resp = await client.get(
-            f"{PREFIX}/entities/linked-memories/{entity_id}",
+            f"{PREFIX}/entities/{entity_id}/with-memories",
             params={"tenant_id": tenant_id},
         )
         assert resp.status_code == 200
@@ -1191,7 +1199,7 @@ class TestAgents:
         )
 
         resp = await client.patch(
-            f"{PREFIX}/agents/{agent_id}/trust",
+            f"{PREFIX}/agents/{agent_id}/trust-level",
             json={
                 "tenant_id": tenant_id,
                 "trust_level": 3,
@@ -1251,8 +1259,8 @@ class TestDocuments:
 
         # GET by doc_id
         resp2 = await client.get(
-            f"{PREFIX}/documents/{doc_id}",
-            params={"tenant_id": tenant_id, "collection": collection},
+            f"{PREFIX}/documents/{collection}/{doc_id}",
+            params={"tenant_id": tenant_id},
         )
         assert resp2.status_code == 200
         assert resp2.json()["doc_id"] == doc_id
@@ -1384,16 +1392,16 @@ class TestDocuments:
         )
 
         resp = await client.delete(
-            f"{PREFIX}/documents/{doc_id}",
-            params={"tenant_id": tenant_id, "collection": collection},
+            f"{PREFIX}/documents/{collection}/{doc_id}",
+            params={"tenant_id": tenant_id},
         )
         assert resp.status_code == 200
         assert "deleted_id" in resp.json()
 
         # Verify deleted
         resp2 = await client.get(
-            f"{PREFIX}/documents/{doc_id}",
-            params={"tenant_id": tenant_id, "collection": collection},
+            f"{PREFIX}/documents/{collection}/{doc_id}",
+            params={"tenant_id": tenant_id},
         )
         assert resp2.status_code == 404
 
@@ -1403,8 +1411,8 @@ class TestDocuments:
         tenant_id: str,
     ) -> None:
         resp = await client.get(
-            f"{PREFIX}/documents/nonexistent-doc",
-            params={"tenant_id": tenant_id, "collection": "nope"},
+            f"{PREFIX}/documents/nope/nonexistent-doc",
+            params={"tenant_id": tenant_id},
         )
         assert resp.status_code == 404
 
@@ -1538,8 +1546,8 @@ class TestFleet:
             )
 
         resp = await client.get(
-            f"{PREFIX}/fleet/commands/pending/{node_name}",
-            params={"tenant_id": tenant_id},
+            f"{PREFIX}/fleet/commands/pending",
+            params={"tenant_id": tenant_id, "node_name": node_name},
         )
         assert resp.status_code == 200
         pending = resp.json()

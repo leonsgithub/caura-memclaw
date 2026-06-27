@@ -664,7 +664,7 @@ class TestMigrationChain:
     def test_single_head(self):
         chain = self._load()
         heads = set(chain) - {dr for dr in chain.values() if dr is not None}
-        assert heads == {"029"}, f"Expected single head '029', got {sorted(heads)}"
+        assert heads == {"030"}, f"Expected single head '030', got {sorted(heads)}"
 
     def test_skill_factory_chain_links(self):
         chain = self._load()
